@@ -81,6 +81,9 @@
 - 게임 내부 Power가 긍정 효과인지 부정 효과인지 확실하면 `buffs` 또는 `debuffs`로 나눈다.
 - 분류가 애매하면 `buffs`에 억지로 넣지 않는다. `powers_unknown` 확장 필드에 둔다.
 - LLM 판단에 중요한 효과는 `description`을 넣는다.
+- 현재 구현은 `Power`, `StatusEffect`, `Buff`, `Debuff`, `Effect` 계열 런타임 객체를 수집한다.
+- `isBuff`, `isDebuff`, `powerType`, `category`, `id`, `name`, 타입 이름을 근거로 분류한다.
+- 분류 근거가 부족하면 전투 판단을 오염시키지 않기 위해 `powers_unknown`에 남긴다.
 
 ## relics
 

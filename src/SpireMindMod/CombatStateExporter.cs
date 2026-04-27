@@ -13,6 +13,53 @@ internal static class CombatStateExporter
     private const int ExportIntervalMs = 250;
     private const int MaxSearchDepth = 5;
     private const int MaxVisitedObjects = 600;
+    private static readonly string[] PowerSourceMemberNames =
+    {
+        "powers",
+        "powerList",
+        "statusEffects",
+        "statusEffectList",
+        "effects",
+        "buffs",
+        "debuffs"
+    };
+
+    private static readonly string[] BuffPowerKeywords =
+    {
+        "strength",
+        "dexterity",
+        "artifact",
+        "barricade",
+        "buffer",
+        "focus",
+        "regen",
+        "regeneration",
+        "ritual",
+        "metallicize",
+        "plated",
+        "thorns",
+        "intangible",
+        "invincible"
+    };
+
+    private static readonly string[] DebuffPowerKeywords =
+    {
+        "vulnerable",
+        "weak",
+        "frail",
+        "poison",
+        "lockon",
+        "lock_on",
+        "constricted",
+        "entangled",
+        "hex",
+        "confused",
+        "shackled",
+        "no_draw",
+        "nodraw",
+        "drawdown"
+    };
+
     private static readonly SpireMindLogger Logger = new("SpireMind.R2.Export");
     private static readonly Stopwatch ExportTimer = Stopwatch.StartNew();
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -259,6 +306,8 @@ internal static class CombatStateExporter
 
     private static Dictionary<string, object?> BuildPlayer(object? player)
     {
+        PowerGroups powerGroups = BuildPowerGroups(player, recentPlayer, FindMemberValue(recentPlayer, "Creature", "creature"));
+
         return new Dictionary<string, object?>
         {
             ["id"] = "player_0",
@@ -267,9 +316,11 @@ internal static class CombatStateExporter
             ["block"] = ReadInt(player, "block", "currentBlock", "shield"),
             ["energy"] = ReadInt(player, "energy", "currentEnergy"),
             ["max_energy"] = ReadInt(player, "maxEnergy", "energyMax"),
-            ["buffs"] = Array.Empty<object>(),
-            ["debuffs"] = Array.Empty<object>(),
-            ["powers_unknown"] = BuildPowersUnknown(player)
+            ["gold"] = ReadInt(player, "gold", "currentGold")
+                ?? ReadInt(recentPlayer, "gold", "currentGold"),
+            ["buffs"] = powerGroups.Buffs,
+            ["debuffs"] = powerGroups.Debuffs,
+            ["powers_unknown"] = powerGroups.Unknown
         };
     }
 
@@ -317,7 +368,12 @@ internal static class CombatStateExporter
                 ["cost"] = ReadInt(card, "cost", "currentCost", "energyCost"),
                 ["base_cost"] = ReadInt(card, "baseCost", "baseEnergyCost"),
                 ["upgraded"] = ReadBool(card, "upgraded", "isUpgraded"),
-                ["playable"] = ReadBool(card, "playable", "canPlay", "isPlayable")
+                ["playable"] = ReadBool(card, "playable", "canPlay", "isPlayable"),
+                ["target_type"] = ReadString(card, "targetType", "target", "cardTarget"),
+                ["damage"] = ReadInt(card, "damage", "baseDamage", "currentDamage", "attackDamage"),
+                ["block"] = ReadInt(card, "block", "baseBlock", "currentBlock"),
+                ["hits"] = ReadInt(card, "hits", "times", "attackCount", "repeatCount"),
+                ["description"] = ReadString(card, "description", "desc", "rawDescription", "text")
             });
             index++;
         }
@@ -599,6 +655,8 @@ internal static class CombatStateExporter
         int index = 0;
         foreach (object enemy in enemies)
         {
+            PowerGroups powerGroups = BuildPowerGroups(enemy, FindMemberValue(enemy, "Creature", "creature"));
+
             result.Add(new Dictionary<string, object?>
             {
                 ["id"] = ReadString(enemy, "id", "enemyId", "monsterId") ?? $"enemy_{index}",
@@ -606,9 +664,9 @@ internal static class CombatStateExporter
                 ["hp"] = ReadInt(enemy, "hp", "currentHp", "currentHealth", "health"),
                 ["max_hp"] = ReadInt(enemy, "maxHp", "maxHealth"),
                 ["block"] = ReadInt(enemy, "block", "currentBlock", "shield"),
-                ["buffs"] = Array.Empty<object>(),
-                ["debuffs"] = Array.Empty<object>(),
-                ["powers_unknown"] = BuildPowersUnknown(enemy),
+                ["buffs"] = powerGroups.Buffs,
+                ["debuffs"] = powerGroups.Debuffs,
+                ["powers_unknown"] = powerGroups.Unknown,
                 ["intent"] = BuildIntent(enemy)
             });
             index++;
@@ -617,32 +675,192 @@ internal static class CombatStateExporter
         return result;
     }
 
-    private static List<Dictionary<string, object?>> BuildPowersUnknown(object? owner)
+    private static PowerGroups BuildPowerGroups(params object?[] owners)
     {
-        object? powersSource = FindMemberValue(
-            owner,
-            "powers",
-            "powerList",
-            "statusEffects",
-            "statusEffectList",
-            "effects",
-            "buffs",
-            "debuffs");
+        List<Dictionary<string, object?>> buffs = new();
+        List<Dictionary<string, object?>> debuffs = new();
+        List<Dictionary<string, object?>> unknown = new();
+        HashSet<object> seen = new(ReferenceEqualityComparer.Instance);
 
-        List<Dictionary<string, object?>> powers = new();
-        foreach (object power in EnumerateObjects(powersSource))
+        foreach (object? owner in owners)
         {
-            string fallbackName = GetReadableName(power);
-            powers.Add(new Dictionary<string, object?>
+            foreach (PowerCandidate candidate in EnumeratePowerCandidates(owner))
             {
-                ["id"] = ReadString(power, "id", "powerId", "key") ?? fallbackName,
-                ["name"] = ReadString(power, "name", "displayName", "title") ?? fallbackName,
-                ["amount"] = ReadInt(power, "amount", "stacks", "stack", "value", "counter", "count"),
-                ["type_name"] = power.GetType().FullName ?? power.GetType().Name
-            });
+                if (!seen.Add(candidate.Power))
+                {
+                    continue;
+                }
+
+                Dictionary<string, object?> snapshot = BuildPowerSnapshot(candidate.Power);
+                PowerPolarity polarity = ClassifyPower(candidate);
+                if (polarity == PowerPolarity.Buff)
+                {
+                    buffs.Add(snapshot);
+                }
+                else if (polarity == PowerPolarity.Debuff)
+                {
+                    debuffs.Add(snapshot);
+                }
+                else
+                {
+                    unknown.Add(snapshot);
+                }
+            }
         }
 
-        return powers;
+        return new PowerGroups(buffs, debuffs, unknown);
+    }
+
+    private static IEnumerable<PowerCandidate> EnumeratePowerCandidates(object? owner)
+    {
+        if (owner is null)
+        {
+            yield break;
+        }
+
+        foreach (MemberInfo member in GetReadableMembers(owner.GetType()))
+        {
+            if (!PowerSourceMemberNames.Any(name => member.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            object? source = ReadMember(owner, member);
+            foreach (object power in EnumeratePowerObjects(source))
+            {
+                yield return new PowerCandidate(power, member.Name);
+            }
+        }
+    }
+
+    private static IEnumerable<object> EnumeratePowerObjects(object? source)
+    {
+        return EnumeratePowerObjects(source, 0, new HashSet<object>(ReferenceEqualityComparer.Instance));
+    }
+
+    private static IEnumerable<object> EnumeratePowerObjects(object? source, int depth, HashSet<object> seenContainers)
+    {
+        foreach (object item in EnumerateObjects(source))
+        {
+            object? value = ReadNamedValue(item, "Value", "value");
+            object candidate = value is not null && !IsScalar(value.GetType())
+                ? value
+                : item;
+
+            if (IsPowerContainerLike(candidate))
+            {
+                if (depth >= 3 || !seenContainers.Add(candidate))
+                {
+                    continue;
+                }
+
+                foreach (object nested in EnumeratePowerObjects(FindPowerContainerContents(candidate), depth + 1, seenContainers))
+                {
+                    yield return nested;
+                }
+
+                continue;
+            }
+
+            if (!IsScalar(candidate.GetType()) && IsPowerLike(candidate))
+            {
+                yield return candidate;
+            }
+        }
+    }
+
+    private static bool IsPowerLike(object value)
+    {
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        string readableName = GetReadableName(value);
+        return ContainsAny(typeName, "Power", "StatusEffect", "Buff", "Debuff", "Effect")
+            || ContainsAny(readableName, "Power", "StatusEffect", "Buff", "Debuff", "Effect")
+            || ReadString(value, "id", "powerId", "key") is not null;
+    }
+
+    private static bool IsPowerContainerLike(object value)
+    {
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return ContainsAny(typeName, "List", "Collection", "Dictionary", "Manager", "Inventory", "Set", "Pile");
+    }
+
+    private static object? FindPowerContainerContents(object container)
+    {
+        return FindMemberValue(
+            container,
+            "Items",
+            "items",
+            "Values",
+            "values",
+            "List",
+            "list",
+            "Contents",
+            "contents",
+            "Powers",
+            "powers",
+            "_items",
+            "_values",
+            "_powers");
+    }
+
+    private static Dictionary<string, object?> BuildPowerSnapshot(object power)
+    {
+        string fallbackName = GetReadableName(power);
+        return new Dictionary<string, object?>
+        {
+            ["id"] = ReadString(power, "id", "powerId", "key") ?? fallbackName,
+            ["name"] = ReadString(power, "name", "displayName", "title") ?? fallbackName,
+            ["amount"] = ReadInt(power, "amount", "stacks", "stack", "value", "counter", "count"),
+            ["description"] = ReadString(power, "description", "desc", "tooltip", "toolTip"),
+            ["source_type"] = "power",
+            ["type_name"] = power.GetType().FullName ?? power.GetType().Name
+        };
+    }
+
+    private static PowerPolarity ClassifyPower(PowerCandidate candidate)
+    {
+        if (candidate.SourceMemberName.Equals("buffs", StringComparison.OrdinalIgnoreCase))
+        {
+            return PowerPolarity.Buff;
+        }
+
+        if (candidate.SourceMemberName.Equals("debuffs", StringComparison.OrdinalIgnoreCase))
+        {
+            return PowerPolarity.Debuff;
+        }
+
+        bool? explicitDebuff = ReadBool(candidate.Power, "isDebuff", "debuff", "negative", "isNegative", "isBad");
+        if (explicitDebuff == true)
+        {
+            return PowerPolarity.Debuff;
+        }
+
+        bool? explicitBuff = ReadBool(candidate.Power, "isBuff", "buff", "positive", "isPositive", "beneficial", "isGood");
+        if (explicitBuff == true)
+        {
+            return PowerPolarity.Buff;
+        }
+
+        string classificationText = string.Join(
+            " ",
+            ReadString(candidate.Power, "type", "powerType", "kind", "category", "polarity") ?? string.Empty,
+            ReadString(candidate.Power, "id", "powerId", "key") ?? string.Empty,
+            ReadString(candidate.Power, "name", "displayName", "title") ?? string.Empty,
+            candidate.Power.GetType().FullName ?? candidate.Power.GetType().Name);
+
+        if (ContainsAny(classificationText, "debuff", "negative", "detrimental", "curse")
+            || ContainsAny(NormalizePowerText(classificationText), DebuffPowerKeywords))
+        {
+            return PowerPolarity.Debuff;
+        }
+
+        if (ContainsAny(classificationText, "buff", "positive", "beneficial")
+            || ContainsAny(NormalizePowerText(classificationText), BuffPowerKeywords))
+        {
+            return PowerPolarity.Buff;
+        }
+
+        return PowerPolarity.Unknown;
     }
 
     private static Dictionary<string, object?> BuildIntent(object enemy)
@@ -660,17 +878,83 @@ internal static class CombatStateExporter
             totalDamage = damage.Value * hits.Value;
         }
 
+        int damageValue = damage ?? 0;
+        int hitsValue = hits ?? (damageValue > 0 ? 1 : 0);
+        int totalDamageValue = totalDamage ?? (damageValue > 0 && hitsValue > 0 ? damageValue * hitsValue : 0);
+        int blockValue = ReadInt(intent, "block", "Block", "baseBlock", "BaseBlock", "shield")
+            ?? ReadInt(enemy, "intentBlock", "moveBlock", "blockGain")
+            ?? 0;
+        string? rawIntent = intent is null ? null : GetReadableName(intent);
+
         return new Dictionary<string, object?>
         {
-            ["raw_intent"] = intent is null ? null : GetReadableName(intent),
-            ["damage"] = damage,
-            ["hits"] = hits,
-            ["total_damage"] = totalDamage,
+            ["type"] = InferIntentType(intent, rawIntent, damageValue, blockValue),
+            ["raw_intent"] = rawIntent,
+            ["damage"] = damageValue,
+            ["hits"] = hitsValue,
+            ["total_damage"] = totalDamageValue,
+            ["block"] = blockValue,
+            ["applied_powers"] = BuildIntentAppliedPowers(intent),
+            ["description"] = ReadString(intent, "description", "desc", "tooltip", "toolTip"),
             ["damage_is_adjusted"] = null,
             ["damage_source"] = damage is null && hits is null && totalDamage is null
                 ? "unavailable"
                 : "reflected_candidate_fields"
         };
+    }
+
+    private static string InferIntentType(object? intent, string? rawIntent, int damage, int block)
+    {
+        string text = string.Join(
+            " ",
+            rawIntent ?? string.Empty,
+            ReadString(intent, "type", "intentType", "kind", "category") ?? string.Empty);
+
+        if (ContainsAny(text, "attack") && ContainsAny(text, "debuff"))
+        {
+            return "attack_debuff";
+        }
+
+        if (ContainsAny(text, "attack") || damage > 0)
+        {
+            return "attack";
+        }
+
+        if (ContainsAny(text, "defend", "block") || block > 0)
+        {
+            return "defend";
+        }
+
+        if (ContainsAny(text, "debuff"))
+        {
+            return "debuff";
+        }
+
+        if (ContainsAny(text, "buff"))
+        {
+            return "buff";
+        }
+
+        return "unknown";
+    }
+
+    private static List<Dictionary<string, object?>> BuildIntentAppliedPowers(object? intent)
+    {
+        PowerGroups powerGroups = BuildPowerGroups(intent);
+        List<Dictionary<string, object?>> powers = new();
+        powers.AddRange(powerGroups.Buffs.Select(power => AddPowerTarget(power, null)));
+        powers.AddRange(powerGroups.Debuffs.Select(power => AddPowerTarget(power, null)));
+        powers.AddRange(powerGroups.Unknown.Select(power => AddPowerTarget(power, null)));
+        return powers;
+    }
+
+    private static Dictionary<string, object?> AddPowerTarget(Dictionary<string, object?> power, string? target)
+    {
+        Dictionary<string, object?> result = new(power)
+        {
+            ["target"] = target
+        };
+        return result;
     }
 
     private static List<Dictionary<string, object?>> BuildRelics(object? relicsSource, ObjectGraph graph)
@@ -692,7 +976,10 @@ internal static class CombatStateExporter
             result.Add(new Dictionary<string, object?>
             {
                 ["id"] = ReadString(relic, "id", "relicId", "key") ?? fallbackName,
-                ["name"] = ReadString(relic, "name", "displayName", "title") ?? fallbackName
+                ["name"] = ReadString(relic, "name", "displayName", "title") ?? fallbackName,
+                ["description"] = ReadString(relic, "description", "desc", "tooltip", "toolTip"),
+                ["rarity"] = ReadString(relic, "rarity", "relicRarity"),
+                ["counter"] = ReadInt(relic, "counter", "count", "charges", "uses", "value")
             });
         }
 
@@ -776,6 +1063,11 @@ internal static class CombatStateExporter
         }
 
         return null;
+    }
+
+    private static object? ReadNamedValue(object? source, params string[] names)
+    {
+        return FindMemberValue(source, names);
     }
 
     private static int? ReadInt(object? source, params string[] names)
@@ -908,6 +1200,38 @@ internal static class CombatStateExporter
 
         return value.GetType().Name;
     }
+
+    private static string NormalizePowerText(string text)
+    {
+        StringBuilder builder = new(text.Length);
+        foreach (char character in text)
+        {
+            if (char.IsLetterOrDigit(character))
+            {
+                builder.Append(char.ToLowerInvariant(character));
+            }
+            else if (character is '_' or '-' or ' ')
+            {
+                builder.Append('_');
+            }
+        }
+
+        return builder.ToString();
+    }
+
+    private enum PowerPolarity
+    {
+        Unknown,
+        Buff,
+        Debuff
+    }
+
+    private sealed record PowerCandidate(object Power, string SourceMemberName);
+
+    private sealed record PowerGroups(
+        List<Dictionary<string, object?>> Buffs,
+        List<Dictionary<string, object?>> Debuffs,
+        List<Dictionary<string, object?>> Unknown);
 
     private sealed class ObjectGraph
     {
