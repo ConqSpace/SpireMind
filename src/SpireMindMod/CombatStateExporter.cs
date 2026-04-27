@@ -537,6 +537,7 @@ internal static class CombatStateExporter
             string fallbackName = GetReadableName(card);
             object? cardStats = FindMemberValue(card, "cardStats", "_cardStats", "stats", "_stats");
             object? cardInfo = FindMemberValue(card, "cardInfo", "_cardInfo", "info", "_info", "baseCard", "_baseCard");
+            object? cardModel = FindMemberValue(card, "Model", "model", "_model", "cardModel", "_cardModel");
             bool isAttack = IsCardObjectType(card, "attack");
             bool gainsBlock = ReadBool(card, "GainsBlock", "gainsBlock", "_gainsBlock") == true;
             int? dynamicVarValue = ReadSingleDynamicVarInt(card);
@@ -564,12 +565,157 @@ internal static class CombatStateExporter
                 ["damage"] = damage,
                 ["block"] = block,
                 ["hits"] = hits,
-                ["description"] = ReadFirstString(new[] { card, cardInfo, cardStats }, "description", "Description", "_description", "desc", "_desc", "rawDescription", "_rawDescription", "text", "_text", "descriptionLoc", "_descriptionLoc", "descriptionText", "_descriptionText")
+                ["description"] = BuildCardDescription(pileName, card, cardModel, cardInfo, cardStats)
             });
             index++;
         }
 
         return cards;
+    }
+
+    private static string? BuildCardDescription(string pileName, params object?[] cardSources)
+    {
+        foreach (object? source in cardSources)
+        {
+            string? description = TryGetDescriptionForPile(source, pileName);
+            if (!string.IsNullOrWhiteSpace(description))
+            {
+                return description;
+            }
+        }
+
+        foreach (object? source in cardSources)
+        {
+            string? description = TryReadFormattedDescription(source);
+            if (!string.IsNullOrWhiteSpace(description))
+            {
+                return description;
+            }
+        }
+
+        return ReadFirstString(
+            cardSources,
+            "description",
+            "Description",
+            "_description",
+            "desc",
+            "_desc",
+            "rawDescription",
+            "_rawDescription",
+            "text",
+            "_text",
+            "descriptionLoc",
+            "_descriptionLoc",
+            "descriptionText",
+            "_descriptionText");
+    }
+
+    private static string? TryGetDescriptionForPile(object? source, string pileName)
+    {
+        if (source is null)
+        {
+            return null;
+        }
+
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        foreach (MethodInfo method in source.GetType().GetMethods(flags)
+            .Where(candidate => candidate.Name.Equals("GetDescriptionForPile", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(candidate => candidate.GetParameters().Length))
+        {
+            object?[]? args = BuildGetDescriptionForPileArgs(method, pileName);
+            if (args is null)
+            {
+                continue;
+            }
+
+            object? value = TryInvokeMethod(source, method, args);
+            if (value is string text && !string.IsNullOrWhiteSpace(text))
+            {
+                return text;
+            }
+        }
+
+        return null;
+    }
+
+    private static object?[]? BuildGetDescriptionForPileArgs(MethodInfo method, string pileName)
+    {
+        ParameterInfo[] parameters = method.GetParameters();
+        if (parameters.Length is < 1 or > 2)
+        {
+            return null;
+        }
+
+        object? pileType = CreatePileTypeValue(parameters[0].ParameterType, pileName);
+        if (pileType is null)
+        {
+            return null;
+        }
+
+        if (parameters.Length == 1)
+        {
+            return new[] { pileType };
+        }
+
+        return new[] { pileType, null };
+    }
+
+    private static object? CreatePileTypeValue(Type pileType, string pileName)
+    {
+        if (!pileType.IsEnum)
+        {
+            return null;
+        }
+
+        string enumName = pileName switch
+        {
+            "draw" => "Draw",
+            "hand" => "Hand",
+            "discard" => "Discard",
+            "exhaust" => "Exhaust",
+            "play" => "Play",
+            _ => "None"
+        };
+
+        try
+        {
+            return Enum.Parse(pileType, enumName, ignoreCase: true);
+        }
+        catch
+        {
+            return Enum.GetValues(pileType).Cast<object>().FirstOrDefault();
+        }
+    }
+
+    private static string? TryReadFormattedDescription(object? source)
+    {
+        object? description = FindMemberValue(
+            source,
+            "Description",
+            "description",
+            "_description",
+            "descriptionLoc",
+            "_descriptionLoc",
+            "descriptionText",
+            "_descriptionText");
+        if (description is null)
+        {
+            return null;
+        }
+
+        string? formatted = TryInvokeMethod(description, "GetFormattedText") as string;
+        if (!string.IsNullOrWhiteSpace(formatted))
+        {
+            return formatted;
+        }
+
+        string? raw = TryInvokeMethod(description, "GetRawText") as string;
+        if (!string.IsNullOrWhiteSpace(raw))
+        {
+            return raw;
+        }
+
+        return ReadObjectString(description);
     }
 
     private static List<Dictionary<string, object?>> BuildLegalActions(
@@ -1468,6 +1614,23 @@ internal static class CombatStateExporter
                 candidate.Name.Equals(methodName, StringComparison.OrdinalIgnoreCase)
                 && candidate.GetParameters().Length == args.Length);
         if (method is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return method.Invoke(source, args);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static object? TryInvokeMethod(object? source, MethodInfo method, params object?[] args)
+    {
+        if (source is null)
         {
             return null;
         }
