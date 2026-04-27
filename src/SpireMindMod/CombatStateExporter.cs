@@ -13,6 +13,7 @@ internal static class CombatStateExporter
     private const int ExportIntervalMs = 250;
     private const int MaxSearchDepth = 5;
     private const int MaxVisitedObjects = 600;
+    private static readonly bool EnableUnsafeUiHandDebug = false;
     private static readonly string[] PowerSourceMemberNames =
     {
         "powers",
@@ -286,9 +287,79 @@ internal static class CombatStateExporter
             ["first_enemy_members"] = BuildMemberDebug(firstEnemy),
             ["first_enemy_intent_members"] = BuildMemberDebug(firstEnemyIntent),
             ["first_enemy_intent_child_members"] = BuildChildMemberDebug(firstEnemyIntent, "move", "_move", "Move", "nextMove", "_nextMove", "NextMove", "damageCalc", "_damageCalc", "repeatCalc", "_repeatCalc"),
+            ["pile_candidates"] = BuildPileDebug(combatRoot, player, graph),
             ["intent_like_graph_nodes"] = BuildIntentGraphDebug(graph),
             ["room_like_graph_nodes"] = BuildRoomGraphDebug(graph)
         };
+    }
+
+    private static List<Dictionary<string, object?>> BuildPileDebug(object combatRoot, object? player, ObjectGraph graph)
+    {
+        List<Dictionary<string, object?>> result = new();
+        object? modelHandSource = FindPile(combatRoot, player, graph, "hand", "cardsInHand");
+        List<object> modelHandCards = EnumerateCards(modelHandSource).Take(12).ToList();
+        result.Add(BuildPileCandidateDebug("model_hand", modelHandSource, modelHandCards));
+        result.Add(BuildUiHandDebug(graph));
+
+        foreach ((string label, string[] names) in new[]
+        {
+            ("draw", new[] { "drawPile", "draw_pile", "draw" }),
+            ("discard", new[] { "discardPile", "discard_pile", "discard" }),
+            ("exhaust", new[] { "exhaustPile", "exhaust_pile", "exhaust" })
+        })
+        {
+            object? source = FindPile(combatRoot, player, graph, names);
+            List<object> cards = EnumerateCards(source).Take(12).ToList();
+            result.Add(BuildPileCandidateDebug(label, source, cards));
+        }
+
+        return result;
+    }
+
+    private static Dictionary<string, object?> BuildPileCandidateDebug(string label, object? source, List<object> cards)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["pile"] = label,
+            ["source_type"] = source?.GetType().FullName ?? source?.GetType().Name,
+            ["count_sample"] = cards.Count,
+            ["names_sample"] = cards
+                .Take(8)
+                .Select(card => ReadCardName(card, FindMemberValue(card, "Model", "model", "_model", "cardModel", "_cardModel")))
+                .ToArray()
+        };
+    }
+
+    private static Dictionary<string, object?> BuildUiHandDebug(ObjectGraph graph)
+    {
+        if (!EnableUnsafeUiHandDebug)
+        {
+            return new Dictionary<string, object?>
+            {
+                ["pile"] = "ui_hand",
+                ["source_type"] = null,
+                ["count_sample"] = 0,
+                ["names_sample"] = Array.Empty<string?>(),
+                ["disabled_reason"] = "전투 진입 크래시 방지를 위해 UI 노드 직접 접근을 기본 비활성화했습니다."
+            };
+        }
+
+        try
+        {
+            List<object> uiHandCards = FindUiHandCards(graph).Take(12).ToList();
+            return BuildPileCandidateDebug("ui_hand", uiHandCards, uiHandCards);
+        }
+        catch (Exception exception)
+        {
+            return new Dictionary<string, object?>
+            {
+                ["pile"] = "ui_hand",
+                ["source_type"] = null,
+                ["count_sample"] = 0,
+                ["names_sample"] = Array.Empty<string?>(),
+                ["error"] = $"{exception.GetType().Name}: {exception.Message}"
+            };
+        }
     }
 
     private static List<Dictionary<string, object?>> BuildIntentGraphDebug(ObjectGraph graph)
@@ -504,19 +575,162 @@ internal static class CombatStateExporter
     {
         return new Dictionary<string, object?>
         {
-            ["hand"] = BuildCards("hand", FindPile(combatRoot, player, graph, "hand", "cardsInHand")),
+            ["hand"] = BuildCards("hand", SelectHandSource(combatRoot, player, graph)),
             ["draw_pile"] = BuildCards("draw", FindPile(combatRoot, player, graph, "drawPile", "draw_pile", "draw")),
             ["discard_pile"] = BuildCards("discard", FindPile(combatRoot, player, graph, "discardPile", "discard_pile", "discard")),
             ["exhaust_pile"] = BuildCards("exhaust", FindPile(combatRoot, player, graph, "exhaustPile", "exhaust_pile", "exhaust"))
         };
     }
 
+    private static object? SelectHandSource(object combatRoot, object? player, ObjectGraph graph)
+    {
+        // 전투 진입 중 Godot UI 노드에 접근하면 준비 전 생명주기와 충돌할 수 있습니다.
+        // 안정성을 우선해 실제 추출은 모델 더미만 사용하고, UI 손패는 별도 안전 경로가 확인될 때 다시 켭니다.
+        return FindPile(combatRoot, player, graph, "hand", "cardsInHand");
+    }
+
+    private static IEnumerable<object> FindUiHandCards(ObjectGraph graph)
+    {
+        foreach (object holder in FindUiHandHolders(graph))
+        {
+            object? card = FindMemberValue(holder, "CardModel", "cardModel")
+                ?? FindMemberValue(FindMemberValue(holder, "CardNode", "cardNode"), "Model", "model", "_model");
+            if (card is not null)
+            {
+                yield return card;
+            }
+        }
+    }
+
+    private static IEnumerable<object> FindUiHandHolders(ObjectGraph graph)
+    {
+        HashSet<object> yielded = new(ReferenceEqualityComparer.Instance);
+
+        foreach (object hand in FindUiHandNodes(graph))
+        {
+            foreach (object holder in EnumerateObjects(FindMemberValue(hand, "ActiveHolders", "Holders")))
+            {
+                if (IsHandCardHolderLike(holder) && yielded.Add(holder))
+                {
+                    yield return holder;
+                }
+            }
+
+            object? selectedContainer = FindMemberValue(hand, "_selectedHandCardContainer", "SelectedHandCardContainer", "selectedHandCardContainer");
+            foreach (object holder in EnumerateObjects(FindMemberValue(selectedContainer, "Holders")))
+            {
+                if (IsHandCardHolderLike(holder) && yielded.Add(holder))
+                {
+                    yield return holder;
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<object> FindUiHandNodes(ObjectGraph graph)
+    {
+        object? staticInstance = GetStaticPropertyValue("MegaCrit.Sts2.Core.Nodes.Combat.NPlayerHand", "Instance");
+        if (staticInstance is not null)
+        {
+            yield return staticInstance;
+        }
+
+        foreach (object? handNode in graph.Nodes
+            .Select(node => node.Value)
+            .Where(value => value is not null && IsPlayerHandNodeLike(value.GetType())))
+        {
+            if (handNode is not null)
+            {
+                yield return handNode;
+            }
+        }
+    }
+
+    private static object? GetStaticPropertyValue(string typeName, string propertyName)
+    {
+        Type? type = AppDomain.CurrentDomain.GetAssemblies()
+            .Select(assembly => assembly.GetType(typeName, throwOnError: false))
+            .FirstOrDefault(candidate => candidate is not null);
+        if (type is null)
+        {
+            return null;
+        }
+
+        const BindingFlags flags = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+        try
+        {
+            return type.GetProperty(propertyName, flags)?.GetValue(null);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool IsPlayerHandNodeLike(Type type)
+    {
+        string typeName = type.FullName ?? type.Name;
+        return typeName.Contains("NPlayerHand", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsHandCardHolderLike(object value)
+    {
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return typeName.Contains("HandCardHolder", StringComparison.OrdinalIgnoreCase)
+            || typeName.Contains("NCardHolder", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static object? FindPile(object combatRoot, object? player, ObjectGraph graph, params string[] names)
     {
-        return FindMemberValue(player, names)
+        object? playerCombatState = ResolvePlayerCombatState(player, graph);
+        return FindMemberValue(playerCombatState, names)
+            ?? FindMemberValue(player, names)
             ?? FindMemberValue(combatRoot, names)
             ?? FindFirstEnumerable(graph, names)
             ?? FindRecentCardPile(names);
+    }
+
+    private static object? ResolvePlayerCombatState(object? player, ObjectGraph graph)
+    {
+        if (player is not null && IsPlayerCombatStateType(player.GetType()))
+        {
+            return player;
+        }
+
+        object? directCombatState = FindMemberValue(
+            player,
+            "PlayerCombatState",
+            "playerCombatState",
+            "_playerCombatState");
+        if (directCombatState is not null)
+        {
+            return directCombatState;
+        }
+
+        directCombatState = FindMemberValue(
+            recentPlayer,
+            "PlayerCombatState",
+            "playerCombatState",
+            "_playerCombatState");
+        if (directCombatState is not null)
+        {
+            return directCombatState;
+        }
+
+        if (recentPlayerCombatState is not null)
+        {
+            return recentPlayerCombatState;
+        }
+
+        return graph.Nodes
+            .Select(node => node.Value)
+            .FirstOrDefault(value => value is not null && IsPlayerCombatStateType(value.GetType()));
+    }
+
+    private static bool IsPlayerCombatStateType(Type type)
+    {
+        string typeName = type.FullName ?? type.Name;
+        return typeName.Contains("PlayerCombatState", StringComparison.OrdinalIgnoreCase);
     }
 
     private static object? FindRecentCardPile(params string[] names)
@@ -538,30 +752,35 @@ internal static class CombatStateExporter
             object? cardStats = FindMemberValue(card, "cardStats", "_cardStats", "stats", "_stats");
             object? cardInfo = FindMemberValue(card, "cardInfo", "_cardInfo", "info", "_info", "baseCard", "_baseCard");
             object? cardModel = FindMemberValue(card, "Model", "model", "_model", "cardModel", "_cardModel");
+            object? energyCost = FindMemberValue(card, "EnergyCost", "energyCost", "_energyCost")
+                ?? FindMemberValue(cardModel, "EnergyCost", "energyCost", "_energyCost")
+                ?? FindMemberValue(cardInfo, "EnergyCost", "energyCost", "_energyCost");
             bool isAttack = IsCardObjectType(card, "attack");
             bool gainsBlock = ReadBool(card, "GainsBlock", "gainsBlock", "_gainsBlock") == true;
             int? dynamicVarValue = ReadSingleDynamicVarInt(card);
-            int? damage = ReadFirstInt(new[] { card, cardStats, cardInfo }, "damage", "_damage", "baseDamage", "_baseDamage", "currentDamage", "_currentDamage", "attackDamage", "_attackDamage", "damageVar", "_damageVar", "calculatedDamage", "_calculatedDamage", "calculatedDamageVar", "_calculatedDamageVar")
+            int? damage = ReadFirstInt(new[] { card, cardModel, cardStats, cardInfo }, "damage", "_damage", "baseDamage", "_baseDamage", "currentDamage", "_currentDamage", "attackDamage", "_attackDamage", "damageVar", "_damageVar", "calculatedDamage", "_calculatedDamage", "calculatedDamageVar", "_calculatedDamageVar")
                 ?? ReadDynamicVarInt(card, "damage", "dmg", "attack", "calculateddamage")
                 ?? (isAttack ? dynamicVarValue : null);
-            int? block = ReadFirstInt(new[] { card, cardStats, cardInfo }, "block", "_block", "baseBlock", "_baseBlock", "currentBlock", "_currentBlock", "blockVar", "_blockVar", "calculatedBlock", "_calculatedBlock")
+            int? block = ReadFirstInt(new[] { card, cardModel, cardStats, cardInfo }, "block", "_block", "baseBlock", "_baseBlock", "currentBlock", "_currentBlock", "blockVar", "_blockVar", "calculatedBlock", "_calculatedBlock")
                 ?? ReadDynamicVarInt(card, "block", "blk", "shield", "calculatedblock")
                 ?? (gainsBlock ? dynamicVarValue : null);
-            int? hits = ReadFirstInt(new[] { card, cardStats, cardInfo }, "hits", "_hits", "times", "_times", "attackCount", "_attackCount", "repeatCount", "_repeatCount", "hitCount", "_hitCount", "calculatedHits", "_calculatedHits", "calculatedHitsKey", "_calculatedHitsKey")
+            int? hits = ReadFirstInt(new[] { card, cardModel, cardStats, cardInfo }, "hits", "_hits", "times", "_times", "attackCount", "_attackCount", "repeatCount", "_repeatCount", "hitCount", "_hitCount", "calculatedHits", "_calculatedHits", "calculatedHitsKey", "_calculatedHitsKey")
                 ?? ReadDynamicVarInt(card, "hits", "hit", "repeat", "times", "calculatedhits")
                 ?? (damage is not null ? 1 : null);
 
+            string cardName = ReadCardName(card, cardModel, cardInfo) ?? fallbackName;
+
             cards.Add(new Dictionary<string, object?>
             {
-                ["instance_id"] = $"{pileName}_{index}",
-                ["card_id"] = ReadFirstString(new[] { card, cardInfo }, "id", "_id", "cardId", "_cardId", "key", "_key") ?? fallbackName,
-                ["name"] = ReadFirstString(new[] { card, cardInfo }, "name", "_name", "displayName", "_displayName", "title", "_title") ?? fallbackName,
-                ["type"] = ReadFirstString(new[] { card, cardInfo, cardStats }, "type", "_type", "cardType", "_cardType"),
-                ["cost"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "cost", "_cost", "currentCost", "_currentCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost", "calculatedEnergy", "_calculatedEnergy", "calculatedEnergyKey", "_calculatedEnergyKey"),
-                ["base_cost"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "baseCost", "_baseCost", "baseEnergyCost", "_baseEnergyCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost"),
+                ["instance_id"] = BuildCardInstanceId(pileName, index, cardName, card, cardInfo, cardModel),
+                ["card_id"] = ReadFirstString(new[] { card, cardModel, cardInfo }, "id", "_id", "cardId", "_cardId", "key", "_key") ?? fallbackName,
+                ["name"] = cardName,
+                ["type"] = ReadFirstString(new[] { card, cardModel, cardInfo, cardStats }, "type", "_type", "cardType", "_cardType"),
+                ["cost"] = ReadFirstInt(new[] { card, cardModel, cardStats, cardInfo, energyCost }, "cost", "_cost", "currentCost", "_currentCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost", "calculatedEnergy", "_calculatedEnergy", "calculatedEnergyKey", "_calculatedEnergyKey"),
+                ["base_cost"] = ReadFirstInt(new[] { card, cardModel, cardStats, cardInfo, energyCost }, "baseCost", "_baseCost", "baseEnergyCost", "_baseEnergyCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost"),
                 ["upgraded"] = ReadBool(card, "upgraded", "isUpgraded"),
                 ["playable"] = ReadBool(card, "playable", "canPlay", "isPlayable"),
-                ["target_type"] = ReadFirstString(new[] { card, cardInfo, cardStats }, "targetType", "_targetType", "target", "_target", "cardTarget", "_cardTarget"),
+                ["target_type"] = ReadFirstString(new[] { card, cardModel, cardInfo, cardStats }, "targetType", "_targetType", "target", "_target", "cardTarget", "_cardTarget"),
                 ["damage"] = damage,
                 ["block"] = block,
                 ["hits"] = hits,
@@ -571,6 +790,45 @@ internal static class CombatStateExporter
         }
 
         return cards;
+    }
+
+    private static string? ReadCardName(params object?[] sources)
+    {
+        return ReadFirstString(
+            sources,
+            "name",
+            "_name",
+            "displayName",
+            "_displayName",
+            "title",
+            "_title",
+            "Title");
+    }
+
+    private static string BuildCardInstanceId(string pileName, int index, string cardName, params object?[] sources)
+    {
+        string? runtimeId = ReadFirstString(
+            sources,
+            "instanceId",
+            "_instanceId",
+            "instance_id",
+            "_instance_id",
+            "uuid",
+            "_uuid",
+            "guid",
+            "_guid",
+            "runtimeId",
+            "_runtimeId",
+            "entityId",
+            "_entityId",
+            "uniqueId",
+            "_uniqueId");
+        if (!string.IsNullOrWhiteSpace(runtimeId))
+        {
+            return SanitizeActionId($"{pileName}_{runtimeId}");
+        }
+
+        return SanitizeActionId($"{pileName}_{index}_{cardName}");
     }
 
     private static string? BuildCardDescription(string pileName, params object?[] cardSources)

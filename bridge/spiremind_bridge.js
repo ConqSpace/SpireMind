@@ -197,6 +197,219 @@ function getLegalActionById(stateObject, actionId) {
   return null;
 }
 
+function getLegalActions(stateObject) {
+  const legalActions = isPlainObject(stateObject) ? stateObject.legal_actions : null;
+  return Array.isArray(legalActions) ? legalActions.filter(isPlainObject) : [];
+}
+
+function getHandCards(stateObject) {
+  const piles = isPlainObject(stateObject) ? stateObject.piles : null;
+  const hand = isPlainObject(piles) ? piles.hand : null;
+  return Array.isArray(hand) ? hand.filter(isPlainObject) : [];
+}
+
+function getLiveEnemies(stateObject) {
+  const enemies = isPlainObject(stateObject) ? stateObject.enemies : null;
+  if (!Array.isArray(enemies)) {
+    return [];
+  }
+
+  return enemies.filter((enemy) => {
+    if (!isPlainObject(enemy)) {
+      return false;
+    }
+
+    const hp = Number(enemy.hp);
+    return !Number.isFinite(hp) || hp > 0;
+  });
+}
+
+function readTrimmedString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeOptionalTargetId(value) {
+  const targetId = readTrimmedString(value);
+  return targetId === "" ? null : targetId;
+}
+
+function findHandCardForAction(stateObject, actionObject) {
+  const hand = getHandCards(stateObject);
+  const directCardId = readTrimmedString(actionObject.card_id || actionObject.card_instance_id || actionObject.instance_id);
+  if (directCardId !== "") {
+    const card = hand.find((candidate) => {
+      return readTrimmedString(candidate.instance_id) === directCardId
+        || readTrimmedString(candidate.card_instance_id) === directCardId;
+    });
+    if (!card) {
+      return {
+        ok: false,
+        error: `현재 손패에서 card_id '${directCardId}'와 일치하는 instance_id를 찾지 못했습니다.`
+      };
+    }
+
+    return {
+      ok: true,
+      card,
+      cardInstanceId: readTrimmedString(card.instance_id || card.card_instance_id)
+    };
+  }
+
+  const indexCandidate = Object.prototype.hasOwnProperty.call(actionObject, "hand_index")
+    ? actionObject.hand_index
+    : actionObject.card_index;
+  const cardIndex = Number(indexCandidate);
+  if (!Number.isInteger(cardIndex) || cardIndex < 0 || cardIndex >= hand.length) {
+    return {
+      ok: false,
+      error: "play_card에는 card_id 또는 유효한 hand_index/card_index가 필요합니다."
+    };
+  }
+
+  const card = hand[cardIndex];
+  const cardInstanceId = readTrimmedString(card.instance_id || card.card_instance_id);
+  if (cardInstanceId === "") {
+    return {
+      ok: false,
+      error: `손패 ${cardIndex}번 카드에 instance_id가 없습니다.`
+    };
+  }
+
+  return {
+    ok: true,
+    card,
+    cardInstanceId
+  };
+}
+
+function resolveTargetIdForAction(stateObject, actionObject) {
+  const explicitTargetId = normalizeOptionalTargetId(actionObject.target_id);
+  if (explicitTargetId !== null) {
+    return {
+      ok: true,
+      targetId: explicitTargetId
+    };
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(actionObject, "target_index")
+    || actionObject.target_index === null
+    || actionObject.target_index === undefined) {
+    return {
+      ok: true,
+      targetId: null
+    };
+  }
+
+  const targetIndex = Number(actionObject.target_index);
+  const liveEnemies = getLiveEnemies(stateObject);
+  if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= liveEnemies.length) {
+    return {
+      ok: false,
+      error: `target_index ${actionObject.target_index}가 현재 적 목록 범위를 벗어났습니다.`
+    };
+  }
+
+  const targetId = readTrimmedString(liveEnemies[targetIndex].id);
+  if (targetId === "") {
+    return {
+      ok: false,
+      error: `target_index ${targetIndex}의 적에 id가 없습니다.`
+    };
+  }
+
+  return {
+    ok: true,
+    targetId
+  };
+}
+
+function validateCardEnergy(stateObject, card) {
+  const player = isPlainObject(stateObject) ? stateObject.player : null;
+  const energy = isPlainObject(player) ? Number(player.energy) : Number.NaN;
+  const cost = Number(card.cost);
+  if (Number.isFinite(energy) && Number.isFinite(cost) && cost > energy) {
+    return {
+      ok: false,
+      error: `에너지가 부족합니다. 필요 ${cost}, 현재 ${energy}.`
+    };
+  }
+
+  return {
+    ok: true
+  };
+}
+
+function resolveLegalActionForPlannedStep(stateObject, actionObject) {
+  if (!isPlainObject(stateObject)) {
+    return {
+      ok: false,
+      error: "현재 전투 상태가 없어 행동을 검증할 수 없습니다."
+    };
+  }
+
+  if (!isPlainObject(actionObject)) {
+    return {
+      ok: false,
+      error: "actions 배열의 각 항목은 JSON 객체여야 합니다."
+    };
+  }
+
+  const actionType = readTrimmedString(actionObject.type);
+  if (actionType === "end_turn") {
+    const legalAction = getLegalActions(stateObject).find((candidate) => readTrimmedString(candidate.type) === "end_turn");
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: "현재 legal_actions에서 end_turn을 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType !== "play_card") {
+    return {
+      ok: false,
+      error: `지원하지 않는 행동 타입입니다: ${actionType || "<empty>"}`
+    };
+  }
+
+  const cardResult = findHandCardForAction(stateObject, actionObject);
+  if (!cardResult.ok) {
+    return cardResult;
+  }
+
+  const energyResult = validateCardEnergy(stateObject, cardResult.card);
+  if (!energyResult.ok) {
+    return energyResult;
+  }
+
+  const targetResult = resolveTargetIdForAction(stateObject, actionObject);
+  if (!targetResult.ok) {
+    return targetResult;
+  }
+
+  const legalAction = getLegalActions(stateObject).find((candidate) => {
+    return readTrimmedString(candidate.type) === "play_card"
+      && readTrimmedString(candidate.card_instance_id) === cardResult.cardInstanceId
+      && normalizeOptionalTargetId(candidate.target_id) === targetResult.targetId;
+  });
+  if (!legalAction) {
+    return {
+      ok: false,
+      error: `현재 legal_actions에서 카드 ${cardResult.cardInstanceId}, 대상 ${targetResult.targetId || "없음"} 조합을 찾지 못했습니다.`
+    };
+  }
+
+  return {
+    ok: true,
+    legalAction
+  };
+}
+
 function getLatestStateSummary(stateEnvelope) {
   if (!stateEnvelope) {
     return null;
@@ -234,6 +447,7 @@ function createServerState(runDirectory, httpHost, httpPort) {
     currentStateId: "",
     legalActionIds: [],
     latestAction: null,
+    actionPlan: null,
     httpServer: null
   };
 
@@ -295,6 +509,7 @@ function updateCurrentState(state, nextState) {
     state_id: envelope.state_id,
     legal_action_count: envelope.legal_action_ids.length
   });
+  advanceActionPlanAfterStateUpdate(state);
   return envelope;
 }
 
@@ -307,6 +522,180 @@ function setLatestAction(state, actionObject) {
     state_id: actionObject.state_id,
     selected_action_id: actionObject.selected_action_id,
     valid: actionObject.valid
+  });
+}
+
+function createActionSubmissionFromLegalAction(state, legalAction, actionArguments) {
+  const selectedActionId = readTrimmedString(legalAction.action_id || legalAction.actionId);
+  return createActionSubmission(state, {
+    selected_action_id: selectedActionId,
+    expected_state_version: state.stateVersion,
+    source: actionArguments.source,
+    note: actionArguments.note
+  });
+}
+
+function createActionPlanSubmission(state, actionArguments) {
+  if (!Array.isArray(actionArguments.actions) || actionArguments.actions.length === 0) {
+    return {
+      ok: false,
+      status: "invalid",
+      error: "actions는 비어 있지 않은 배열이어야 합니다."
+    };
+  }
+
+  if (state.latestAction
+    && state.latestAction.result === null
+    && state.latestAction.execution_status !== "invalid"
+    && state.latestAction.execution_status !== "failed"
+    && state.latestAction.execution_status !== "stale"
+    && state.latestAction.execution_status !== "unsupported") {
+    return {
+      ok: false,
+      status: "busy",
+      error: "아직 처리 중인 행동이 있어 새 행동 묶음을 받을 수 없습니다."
+    };
+  }
+
+  const firstStep = actionArguments.actions[0];
+  const resolved = resolveLegalActionForPlannedStep(state.currentState, firstStep);
+  const plan = {
+    plan_id: crypto.randomUUID(),
+    submitted_at: toIsoString(new Date()),
+    status: resolved.ok ? "running" : "failed",
+    state_version_started: state.stateVersion,
+    state_id_started: state.currentStateId,
+    reason: typeof actionArguments.reason === "string" ? actionArguments.reason.trim() : null,
+    source: typeof actionArguments.source === "string" ? actionArguments.source.trim() : null,
+    actions: actionArguments.actions,
+    current_index: 0,
+    completed: [],
+    failure: resolved.ok ? null : {
+      action_index: 0,
+      reason: resolved.error
+    }
+  };
+  state.actionPlan = plan;
+
+  if (!resolved.ok) {
+    appendEvent(state, "action_plan_failed", {
+      plan_id: plan.plan_id,
+      action_index: 0,
+      reason: resolved.error
+    });
+
+    return {
+      ok: false,
+      status: "invalid",
+      action_plan: plan,
+      error: resolved.error
+    };
+  }
+
+  const submission = createActionSubmissionFromLegalAction(state, resolved.legalAction, {
+    source: actionArguments.source,
+    note: actionArguments.reason || actionArguments.note
+  });
+  submission.plan_id = plan.plan_id;
+  submission.plan_action_index = 0;
+  submission.planned_action = firstStep;
+  setLatestAction(state, submission);
+  appendEvent(state, "action_plan_started", {
+    plan_id: plan.plan_id,
+    action_count: plan.actions.length,
+    first_submission_id: submission.submission_id,
+    selected_action_id: submission.selected_action_id
+  });
+
+  return {
+    ok: true,
+    status: "queued",
+    action_plan: plan,
+    latest_action: submission
+  };
+}
+
+function advanceActionPlanAfterStateUpdate(state) {
+  const plan = state.actionPlan;
+  if (!plan || plan.status !== "running") {
+    return;
+  }
+
+  const latestAction = state.latestAction;
+  if (!latestAction || latestAction.plan_id !== plan.plan_id) {
+    return;
+  }
+
+  if (latestAction.result === null) {
+    return;
+  }
+
+  if (latestAction.result !== "applied") {
+    plan.status = "failed";
+    plan.failure = {
+      action_index: latestAction.plan_action_index,
+      submission_id: latestAction.submission_id,
+      result: latestAction.result,
+      reason: latestAction.result_note || "이전 행동이 적용되지 않아 남은 행동을 중단했습니다."
+    };
+    appendEvent(state, "action_plan_failed", {
+      plan_id: plan.plan_id,
+      action_index: latestAction.plan_action_index,
+      submission_id: latestAction.submission_id,
+      result: latestAction.result
+    });
+    return;
+  }
+
+  const completedIndex = Number(latestAction.plan_action_index);
+  if (!plan.completed.some((item) => item.submission_id === latestAction.submission_id)) {
+    plan.completed.push({
+      action_index: completedIndex,
+      submission_id: latestAction.submission_id,
+      selected_action_id: latestAction.selected_action_id,
+      applied_at_state_version: state.stateVersion
+    });
+  }
+
+  const nextIndex = completedIndex + 1;
+  plan.current_index = nextIndex;
+  if (nextIndex >= plan.actions.length) {
+    plan.status = "completed";
+    appendEvent(state, "action_plan_completed", {
+      plan_id: plan.plan_id,
+      completed_count: plan.completed.length
+    });
+    return;
+  }
+
+  const resolved = resolveLegalActionForPlannedStep(state.currentState, plan.actions[nextIndex]);
+  if (!resolved.ok) {
+    plan.status = "failed";
+    plan.failure = {
+      action_index: nextIndex,
+      reason: resolved.error
+    };
+    appendEvent(state, "action_plan_failed", {
+      plan_id: plan.plan_id,
+      action_index: nextIndex,
+      reason: resolved.error
+    });
+    return;
+  }
+
+  const submission = createActionSubmissionFromLegalAction(state, resolved.legalAction, {
+    source: plan.source,
+    note: plan.reason
+  });
+  submission.plan_id = plan.plan_id;
+  submission.plan_action_index = nextIndex;
+  submission.planned_action = plan.actions[nextIndex];
+  setLatestAction(state, submission);
+  appendEvent(state, "action_plan_step_submitted", {
+    plan_id: plan.plan_id,
+    action_index: nextIndex,
+    submission_id: submission.submission_id,
+    selected_action_id: submission.selected_action_id
   });
 }
 
@@ -531,6 +920,20 @@ function createActionResult(state, resultArguments) {
   latestAction.result_observed_state_id = observedStateId || null;
   latestAction.result_observed_state_version = observedStateVersion >= 0 ? observedStateVersion : null;
   latestAction.result_note = note || null;
+
+  if (state.actionPlan
+    && state.actionPlan.status === "running"
+    && latestAction.plan_id === state.actionPlan.plan_id
+    && result !== "applied") {
+    state.actionPlan.status = "failed";
+    state.actionPlan.failure = {
+      action_index: latestAction.plan_action_index,
+      submission_id: latestAction.submission_id,
+      result,
+      reason: note || "행동 실행 결과가 applied가 아니어서 남은 행동을 중단했습니다."
+    };
+  }
+
   updateLatestAction(state, "action_result_reported", {
     submission_id: latestAction.submission_id,
     claim_token: latestAction.claim_token,
@@ -543,7 +946,8 @@ function createActionResult(state, resultArguments) {
   return {
     ok: true,
     status: result,
-    latest_action: latestAction
+    latest_action: latestAction,
+    action_plan: state.actionPlan
   };
 }
 
@@ -554,7 +958,8 @@ function getCurrentStatePayload(state) {
     state_id: state.currentStateId,
     legal_action_ids: state.legalActionIds,
     state: state.currentState,
-    latest_action: state.latestAction
+    latest_action: state.latestAction,
+    action_plan: state.actionPlan
   };
 }
 
@@ -638,7 +1043,8 @@ function startHttpServer(state) {
       if (req.method === "GET" && requestUrl.pathname === "/action/latest") {
         sendJson(res, 200, {
           ok: true,
-          latest_action: state.latestAction
+          latest_action: state.latestAction,
+          action_plan: state.actionPlan
         });
         return;
       }
@@ -676,6 +1082,12 @@ function startHttpServer(state) {
             ok: false,
             error: "행동 제출 본문은 JSON 객체여야 합니다."
           });
+          return;
+        }
+
+        if (Array.isArray(body.actions)) {
+          const planSubmission = createActionPlanSubmission(state, body);
+          sendJson(res, planSubmission.ok ? 200 : 400, planSubmission);
           return;
         }
 

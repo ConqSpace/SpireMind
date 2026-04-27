@@ -63,8 +63,8 @@ internal static class CombatStateHarmonyPatch
         AddMethod(targets, "MegaCrit.Sts2.Core.Combat.CombatState", "RemoveCreature");
         AddPropertySetter(targets, "MegaCrit.Sts2.Core.Combat.CombatState", "CurrentSide");
         AddPropertySetter(targets, "MegaCrit.Sts2.Core.Combat.CombatState", "RoundNumber");
-        AddPropertySetter(targets, "MegaCrit.Sts2.Core.Combat.PlayerCombatState", "Energy");
-        AddEnergySetterCandidates(targets, "MegaCrit.Sts2.Core.Combat.PlayerCombatState");
+        // PlayerCombatState 에너지 setter는 전투 진입 시점 패치 대상을 늘려 안정성 위험을 키웁니다.
+        // CardPile 변경 관찰만으로도 상태 갱신은 이어지므로, 크래시 방지를 우선해 직접 패치는 비활성화합니다.
         AddMethod(targets, "MegaCrit.Sts2.Core.Entities.Cards.CardPile", "InvokeContentsChanged");
 
         return targets;

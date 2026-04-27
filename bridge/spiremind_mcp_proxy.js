@@ -285,11 +285,49 @@ function createToolsList() {
       inputSchema: {
         type: "object",
         additionalProperties: false,
-        required: ["selected_action_id"],
         properties: {
           selected_action_id: {
             type: "string",
             description: "고른 행동의 action_id다."
+          },
+          actions: {
+            type: "array",
+            minItems: 1,
+            description: "현재 상태 기준으로 한 단계씩 검증해 실행할 행동 묶음입니다.",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["type"],
+              properties: {
+                type: {
+                  type: "string",
+                  enum: ["play_card", "end_turn"]
+                },
+                card_id: {
+                  type: "string",
+                  description: "combat_state.json 손패 카드의 instance_id입니다."
+                },
+                hand_index: {
+                  type: "integer",
+                  minimum: 0
+                },
+                card_index: {
+                  type: "integer",
+                  minimum: 0
+                },
+                target_index: {
+                  type: "integer",
+                  minimum: 0
+                },
+                target_id: {
+                  type: "string"
+                }
+              }
+            }
+          },
+          reason: {
+            type: "string",
+            description: "행동 묶음을 선택한 이유입니다."
           },
           source: {
             type: "string",
