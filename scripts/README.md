@@ -61,3 +61,13 @@
 상주 브리지 서버는 `bridge/spiremind_bridge.js`에 있다.
 
 실행과 Codex MCP 등록 방법은 [bridge_architecture.md](../docs/bridge_architecture.md)를 따른다.
+
+## 브리지 전송
+
+`runtime_smoke_check.ps1`는 여전히 `combat_state.json`이 생성되고 갱신되는지 확인합니다. 이제 exporter는 같은 JSON을 로컬 브리지에도 보낼 수 있습니다.
+
+- 기본 브리지 주소는 `http://127.0.0.1:17832`입니다.
+- 전송 설정 파일은 `%APPDATA%\SlayTheSpire2\SpireMind\bridge_config.json`입니다.
+- 전송을 끄려면 설정 파일의 `enabled`를 `false`로 두거나 `SPIREMIND_BRIDGE_ENABLED=false` 환경 변수를 사용합니다.
+- 브리지 주소를 바꾸려면 설정 파일의 `state_url` 또는 `SPIREMIND_BRIDGE_STATE_URL` 환경 변수를 사용합니다.
+- 브리지 전송 실패는 게임 실행을 멈추게 하지 않습니다.

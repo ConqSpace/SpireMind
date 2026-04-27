@@ -63,6 +63,7 @@ internal static class CombatStateExporter
             string outputPath = GetOutputPath();
             Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
             File.WriteAllText(outputPath, json);
+            CombatStateBridgePoster.TryPost(json);
 
             if (!hasLoggedOutputPath)
             {

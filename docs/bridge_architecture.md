@@ -214,3 +214,14 @@ SpireMind 브리지의 wait_for_decision_request로 새 상태를 기다려라.
 - MCP 도구는 최소 계약만 제공한다.
 - STS2 모드에서 `/state`로 직접 전송하는 코드는 아직 없다. 현재는 테스트나 외부 스크립트가 상태를 보낼 수 있다.
 - R5에서 모드가 행동을 가져가 실행하는 경로를 추가해야 한다.
+
+## STS2 exporter 직접 전송
+
+이제 STS2 모드의 `CombatStateExporter`도 같은 `combat_state.json`을 로컬 브리지 `http://127.0.0.1:17832/state`로 보냅니다.
+
+- 파일 출력은 그대로 유지합니다.
+- 브리지 전송은 짧은 timeout으로 처리합니다.
+- 같은 상태는 너무 자주 보내지 않도록 막습니다.
+- 실패해도 게임은 멈추지 않습니다.
+- 전송 설정은 `%APPDATA%\SlayTheSpire2\SpireMind\bridge_config.json`에서 바꿀 수 있습니다.
+- 환경 변수 `SPIREMIND_BRIDGE_ENABLED`, `SPIREMIND_BRIDGE_STATE_URL`이 있으면 설정 파일보다 우선합니다.

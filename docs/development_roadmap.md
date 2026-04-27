@@ -215,3 +215,14 @@ R7은 한 번에 모든 비전투 선택을 열지 않는다. 보상 선택, 지
 - 전체 카드 평가 시스템
 - 사람 플레이 데이터를 대규모 수집하는 기능
 - 자동 순위표 기록
+
+## R4.5: combat_state.json 직접 전송
+
+R4.5에서는 `CombatStateExporter`가 `combat_state.json`을 쓴 뒤 같은 JSON을 로컬 브리지 `http://127.0.0.1:17832/state`로도 보냅니다.
+
+- 기존 파일 출력은 그대로 유지합니다.
+- 브리지 전송은 `%APPDATA%\SlayTheSpire2\SpireMind\bridge_config.json`이나 `SPIREMIND_BRIDGE_ENABLED` 환경 변수로 끌 수 있습니다.
+- 브리지 주소는 `bridge_config.json`의 `state_url`이나 `SPIREMIND_BRIDGE_STATE_URL` 환경 변수로 바꿀 수 있습니다.
+- 브리지가 꺼져 있거나 전송이 실패해도 게임 흐름은 멈추지 않습니다.
+- 전송은 짧은 timeout과 중복 방어를 둡니다.
+- 이번 범위는 상태 전송까지만 포함하고, 게임 행동 실행은 포함하지 않습니다.
