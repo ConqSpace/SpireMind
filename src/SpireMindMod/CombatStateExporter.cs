@@ -1,6 +1,7 @@
 using System.Collections;
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -217,6 +218,8 @@ internal static class CombatStateExporter
         object? relicsSource = FindMemberValue(combatRoot, "relics")
             ?? FindMemberValue(player, "relics");
 
+        CardMovementObserver.ObserveContext(combatRoot, player);
+
         Dictionary<string, object?> playerState = BuildPlayer(player);
         Dictionary<string, object?> piles = BuildPiles(combatRoot, player, graph);
         List<Dictionary<string, object?>> enemies = BuildEnemies(enemiesSource, graph);
@@ -270,7 +273,10 @@ internal static class CombatStateExporter
         ObjectGraph graph)
     {
         object? handSource = FindPile(combatRoot, player, graph, "hand", "cardsInHand");
-        object? firstCard = EnumerateCards(handSource).FirstOrDefault();
+        List<object> modelHandCards = EnumerateCards(handSource).ToList();
+        List<object> observedHandCards = CardMovementObserver.GetObservedHandCards().ToList();
+        List<object> mergedHandCards = MergeHandCardObjects(modelHandCards, observedHandCards);
+        object? firstCard = modelHandCards.FirstOrDefault();
         object? firstEnemy = EnumerateObjects(enemiesSource).FirstOrDefault()
             ?? graph.Nodes
                 .Select(node => node.Value)
@@ -287,6 +293,9 @@ internal static class CombatStateExporter
             ["first_enemy_members"] = BuildMemberDebug(firstEnemy),
             ["first_enemy_intent_members"] = BuildMemberDebug(firstEnemyIntent),
             ["first_enemy_intent_child_members"] = BuildChildMemberDebug(firstEnemyIntent, "move", "_move", "Move", "nextMove", "_nextMove", "NextMove", "damageCalc", "_damageCalc", "repeatCalc", "_repeatCalc"),
+            ["model_hand"] = BuildHandMergeDebug(modelHandCards),
+            ["observed_hand"] = BuildHandMergeDebug(observedHandCards),
+            ["merged_hand"] = BuildHandMergeDebug(mergedHandCards),
             ["pile_candidates"] = BuildPileDebug(combatRoot, player, graph),
             ["intent_like_graph_nodes"] = BuildIntentGraphDebug(graph),
             ["room_like_graph_nodes"] = BuildRoomGraphDebug(graph)
@@ -325,6 +334,18 @@ internal static class CombatStateExporter
             ["count_sample"] = cards.Count,
             ["names_sample"] = cards
                 .Take(8)
+                .Select(card => ReadCardName(card, FindMemberValue(card, "Model", "model", "_model", "cardModel", "_cardModel")))
+                .ToArray()
+        };
+    }
+
+    private static Dictionary<string, object?> BuildHandMergeDebug(List<object> cards)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["count"] = cards.Count,
+            ["names"] = cards
+                .Take(10)
                 .Select(card => ReadCardName(card, FindMemberValue(card, "Model", "model", "_model", "cardModel", "_cardModel")))
                 .ToArray()
         };
@@ -575,11 +596,45 @@ internal static class CombatStateExporter
     {
         return new Dictionary<string, object?>
         {
-            ["hand"] = BuildCards("hand", SelectHandSource(combatRoot, player, graph)),
+            ["hand"] = BuildCards("hand", SelectMergedHandSource(combatRoot, player, graph)),
             ["draw_pile"] = BuildCards("draw", FindPile(combatRoot, player, graph, "drawPile", "draw_pile", "draw")),
             ["discard_pile"] = BuildCards("discard", FindPile(combatRoot, player, graph, "discardPile", "discard_pile", "discard")),
             ["exhaust_pile"] = BuildCards("exhaust", FindPile(combatRoot, player, graph, "exhaustPile", "exhaust_pile", "exhaust"))
         };
+    }
+
+    private static List<object> SelectMergedHandSource(object combatRoot, object? player, ObjectGraph graph)
+    {
+        List<object> modelHandCards = EnumerateCards(SelectHandSource(combatRoot, player, graph)).ToList();
+        List<object> observedHandCards = CardMovementObserver.GetObservedHandCards().ToList();
+        return MergeHandCardObjects(modelHandCards, observedHandCards);
+    }
+
+    private static List<object> MergeHandCardObjects(List<object> modelHandCards, List<object> observedHandCards)
+    {
+        if (modelHandCards.Count >= observedHandCards.Count)
+        {
+            return modelHandCards;
+        }
+
+        List<object> merged = new(modelHandCards);
+        HashSet<object> seenReferences = new(modelHandCards, ReferenceEqualityComparer.Instance);
+        HashSet<string> seenRuntimeIds = modelHandCards
+            .Select(BuildCardRuntimeMergeKey)
+            .ToHashSet(StringComparer.Ordinal);
+
+        foreach (object observedCard in observedHandCards)
+        {
+            string runtimeId = BuildCardRuntimeMergeKey(observedCard);
+            if (!seenReferences.Add(observedCard) || !seenRuntimeIds.Add(runtimeId))
+            {
+                continue;
+            }
+
+            merged.Add(observedCard);
+        }
+
+        return merged;
     }
 
     private static object? SelectHandSource(object combatRoot, object? player, ObjectGraph graph)
@@ -829,6 +884,31 @@ internal static class CombatStateExporter
         }
 
         return SanitizeActionId($"{pileName}_{index}_{cardName}");
+    }
+
+    private static string BuildCardRuntimeMergeKey(object card)
+    {
+        object? cardModel = FindMemberValue(card, "Model", "model", "_model", "cardModel", "_cardModel");
+        object? cardInfo = FindMemberValue(card, "cardInfo", "_cardInfo", "info", "_info", "baseCard", "_baseCard");
+        string? runtimeId = ReadFirstString(
+            new[] { card, cardModel, cardInfo },
+            "instanceId",
+            "_instanceId",
+            "instance_id",
+            "_instance_id",
+            "uuid",
+            "_uuid",
+            "guid",
+            "_guid",
+            "runtimeId",
+            "_runtimeId",
+            "entityId",
+            "_entityId",
+            "uniqueId",
+            "_uniqueId");
+        return string.IsNullOrWhiteSpace(runtimeId)
+            ? $"ref:{RuntimeHelpers.GetHashCode(card)}"
+            : $"id:{runtimeId}";
     }
 
     private static string? BuildCardDescription(string pileName, params object?[] cardSources)
