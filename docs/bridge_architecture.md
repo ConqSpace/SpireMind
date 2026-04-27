@@ -13,6 +13,7 @@ STS2 모드
 -> Codex 세션
 -> 행동 선택
 -> 브리지 검증
+-> R5에서 모드가 claim 후 실행
 ```
 
 ## 책임
@@ -31,6 +32,7 @@ STS2 모드
 - 최신 상태 조회용 `GET /state/current`를 제공한다.
 - 행동 제출용 `POST /action/submit`를 제공한다.
 - 제출된 `selected_action_id`를 최신 `legal_actions`와 비교한다.
+- R5에서는 실행 claim과 실행 결과 보고를 받는다.
 - 상태 수신과 행동 제출을 로그에 남긴다.
 
 ### Codex MCP 프록시
@@ -99,6 +101,31 @@ Codex가 고른 행동을 브리지에 저장한다.
 
 검증 결과는 `latest_action`으로 저장한다. 실패해도 기록은 남긴다.
 
+### R5 예정: `POST /action/claim`
+
+STS2 모드가 실행할 행동을 확보한다. 단순 조회가 아니라 claim을 쓰는 이유는 같은 `submission_id`를 여러 번 실행하지 않기 위해서다.
+
+claim은 아래 조건을 만족할 때만 성공한다.
+
+- 최신 행동이 `valid: true`다.
+- 아직 실행 결과가 보고되지 않았다.
+- 모드가 보낸 `observed_state_id`와 `observed_state_version`이 행동의 상태와 맞다.
+- 모드가 해당 행동 타입을 지원한다.
+
+### R5 예정: `POST /action/result`
+
+STS2 모드가 실행 결과를 보고한다.
+
+결과 값은 다음 중 하나다.
+
+- `applied`
+- `stale`
+- `unsupported`
+- `failed`
+- `ignored_duplicate`
+
+브리지는 결과를 `latest_action.json`, `events.jsonl`, `bridge.log`에 남긴다.
+
 ## MCP 도구
 
 ### `wait_for_decision_request`
@@ -146,7 +173,7 @@ codex mcp add spiremind-bridge -- node F:\Antigravity\STSAutoplay\bridge\spiremi
 
 - R4는 행동 실행을 하지 않는다.
 - MCP 프록시는 상태 조회와 행동 제출만 담당한다.
-- 게임 행동을 실제로 실행하는 경로는 R5에서 따로 만든다.
+- 게임 행동을 실제로 실행하는 경로는 R5에서 `claim -> 실행 -> result` 흐름으로 만든다.
 
 ## 나중에 열어둘 에이전트 구조
 

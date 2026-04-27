@@ -97,6 +97,30 @@ Codex의 선택은 `submit_action` 호출로 표현한다.
 
 검증 결과는 `latest_action.json`과 `events.jsonl`에 남긴다.
 
+## R5 실행 소비 규칙
+
+R5부터는 Codex가 고른 행동을 STS2 모드가 실제로 실행한다. 이때 `latest_action`은 실행 명령 전체가 아니라 실행 후보의 참조값이다.
+
+실행 가능 조건:
+
+- `latest_action.valid`가 `true`다.
+- `submission_id`가 이전에 실행된 적이 없다.
+- `latest_action.state_id`가 모드가 보고 있는 최신 상태와 맞다.
+- `latest_action.state_version`이 모드가 보고 있는 최신 상태 버전과 맞다.
+- `selected_action_id`가 현재 `state.legal_actions` 안에 다시 존재한다.
+- 현재 `legal_actions`에서 찾은 항목의 `type`을 모드가 지원한다.
+
+중요한 규칙:
+
+- 모드는 `latest_action.selected_action_id`만 실행 입력으로 삼지 않는다.
+- 모드는 현재 `legal_actions`에서 같은 `action_id`를 다시 찾아 `type`, `card_instance_id`, `target_id`, `energy_cost`를 읽는다.
+- 같은 `submission_id`는 성공, 실패, 무시 여부와 관계없이 다시 실행하지 않는다.
+- 상태가 맞지 않으면 실행하지 않고 `stale`로 보고한다.
+- 지원하지 않는 행동이면 실행하지 않고 `unsupported`로 보고한다.
+- 실행 예외가 발생하면 `failed`로 보고하고 다음 상태를 기다린다.
+
+R5.1에서는 `end_turn`만 실행한다. `play_card`는 대상 없는 카드, 대상 있는 카드 순서로 나중에 연다.
+
 ## 나중에 추가할 행동 종류
 
 아래 행동은 1차 자동 전투가 안정화된 뒤 추가한다.
