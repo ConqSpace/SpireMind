@@ -232,7 +232,7 @@ internal static class CombatStateExporter
             ["enemies"] = enemies,
             ["legal_actions"] = BuildLegalActions(piles, enemies, playerState),
             ["relics"] = BuildRelics(relicsSource, graph),
-            ["debug"] = BuildDebug(currentRoot)
+            ["debug"] = BuildDebug(currentRoot, combatRoot, player, enemiesSource, graph)
         };
     }
 
@@ -261,13 +261,132 @@ internal static class CombatStateExporter
         roots.Add(root);
     }
 
-    private static Dictionary<string, object?> BuildDebug(object currentRoot)
+    private static Dictionary<string, object?> BuildDebug(
+        object currentRoot,
+        object combatRoot,
+        object? player,
+        object? enemiesSource,
+        ObjectGraph graph)
     {
+        object? handSource = FindPile(combatRoot, player, graph, "hand", "cardsInHand");
+        object? firstCard = EnumerateCards(handSource).FirstOrDefault();
+        object? firstEnemy = EnumerateObjects(enemiesSource).FirstOrDefault()
+            ?? graph.Nodes
+                .Select(node => node.Value)
+                .FirstOrDefault(value => value is not null && IsEnemyLike(value.GetType()));
+        object? firstEnemyIntent = FindIntentCandidate(firstEnemy);
+
         return new Dictionary<string, object?>
         {
             ["root_type"] = currentRoot.GetType().FullName ?? currentRoot.GetType().Name,
-            ["last_observed_types"] = LastObservedTypes.ToArray()
+            ["last_observed_types"] = LastObservedTypes.ToArray(),
+            ["first_card_members"] = BuildMemberDebug(firstCard),
+            ["first_card_child_members"] = BuildChildMemberDebug(firstCard, "cardStats", "_cardStats", "cardInfo", "_cardInfo", "baseCard", "_baseCard"),
+            ["first_enemy_members"] = BuildMemberDebug(firstEnemy),
+            ["first_enemy_intent_members"] = BuildMemberDebug(firstEnemyIntent),
+            ["first_enemy_intent_child_members"] = BuildChildMemberDebug(firstEnemyIntent, "move", "_move", "Move", "nextMove", "_nextMove", "NextMove", "damageCalc", "_damageCalc", "repeatCalc", "_repeatCalc")
         };
+    }
+
+    private static object? FindIntentCandidate(object? enemy)
+    {
+        return FindMemberValue(
+            enemy,
+            "intent",
+            "_intent",
+            "Intent",
+            "currentIntent",
+            "_currentIntent",
+            "move",
+            "_move",
+            "Move",
+            "currentMove",
+            "_currentMove",
+            "nextMove",
+            "_nextMove",
+            "NextMove",
+            "cardIntent",
+            "_cardIntent",
+            "CardIntent");
+    }
+
+    private static List<Dictionary<string, object?>> BuildChildMemberDebug(object? source, params string[] childNames)
+    {
+        List<Dictionary<string, object?>> result = new();
+        foreach (string childName in childNames)
+        {
+            object? child = FindMemberValue(source, childName);
+            if (child is null)
+            {
+                continue;
+            }
+
+            result.Add(new Dictionary<string, object?>
+            {
+                ["name"] = childName,
+                ["type_name"] = child.GetType().FullName ?? child.GetType().Name,
+                ["members"] = BuildMemberDebug(child)
+            });
+        }
+
+        return result;
+    }
+
+    private static List<Dictionary<string, object?>> BuildMemberDebug(object? source)
+    {
+        List<Dictionary<string, object?>> members = new();
+        if (source is null)
+        {
+            return members;
+        }
+
+        foreach (MemberInfo member in GetReadableMembers(source.GetType()).Take(80))
+        {
+            object? value = ReadMember(source, member);
+            members.Add(new Dictionary<string, object?>
+            {
+                ["name"] = member.Name,
+                ["member_kind"] = member.MemberType.ToString(),
+                ["value_type"] = value is null ? null : value.GetType().FullName ?? value.GetType().Name,
+                ["value"] = FormatDebugValue(value)
+            });
+        }
+
+        return members;
+    }
+
+    private static object? FormatDebugValue(object? value)
+    {
+        if (value is null)
+        {
+            return null;
+        }
+
+        Type type = value.GetType();
+        if (IsScalar(type))
+        {
+            return value;
+        }
+
+        if (value is IEnumerable enumerable and not string)
+        {
+            int count = 0;
+            foreach (object? _ in enumerable)
+            {
+                count++;
+                if (count > 20)
+                {
+                    break;
+                }
+            }
+
+            return $"Enumerable<{type.FullName ?? type.Name}> count_sample={count}";
+        }
+
+        string? text = ReadObjectString(value);
+        return string.IsNullOrWhiteSpace(text)
+            ? type.FullName ?? type.Name
+            : text;
     }
 
     private static string ComputeStateFingerprint(Dictionary<string, object?> state)
