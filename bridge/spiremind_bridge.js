@@ -10,7 +10,6 @@ const path = require("path");
 const DEFAULT_HTTP_HOST = "127.0.0.1";
 const DEFAULT_HTTP_PORT = 17832;
 const MAX_HTTP_BODY_BYTES = 5 * 1024 * 1024;
-const MCP_PROTOCOL_VERSION = "2024-11-05";
 
 function parseArgs(argv) {
   const options = {
@@ -213,7 +212,6 @@ function createServerState(runDirectory, httpHost, httpPort) {
     currentStateId: "",
     legalActionIds: [],
     latestAction: null,
-    waiters: [],
     httpServer: null
   };
 
@@ -275,8 +273,6 @@ function updateCurrentState(state, nextState) {
     state_id: envelope.state_id,
     legal_action_count: envelope.legal_action_ids.length
   });
-  notifyWaiters(state);
-
   return envelope;
 }
 
@@ -292,64 +288,34 @@ function setLatestAction(state, actionObject) {
   });
 }
 
-function notifyWaiters(state) {
-  if (state.waiters.length === 0) {
-    return;
-  }
+function createActionSubmission(state, actionArguments) {
+  const selectedActionId = typeof actionArguments.selected_action_id === "string" ? actionArguments.selected_action_id.trim() : "";
+  const expectedStateVersion = normalizeStateVersion(actionArguments.expected_state_version, state.stateVersion);
+  const source = typeof actionArguments.source === "string" ? actionArguments.source.trim() : "";
+  const note = typeof actionArguments.note === "string" ? actionArguments.note.trim() : "";
+  const legalActionIds = state.legalActionIds.slice();
+  const stateEnvelope = buildStateEnvelope(state);
+  const hasExpectedStateVersion = Object.prototype.hasOwnProperty.call(actionArguments, "expected_state_version");
+  const stateVersionMatches = !hasExpectedStateVersion || expectedStateVersion === stateEnvelope.state_version;
+  const actionIdExists = selectedActionId !== "" && legalActionIds.includes(selectedActionId);
+  const isValid = actionIdExists && stateVersionMatches;
 
-  const readyWaiters = [];
-  const remainingWaiters = [];
-
-  for (let index = 0; index < state.waiters.length; index += 1) {
-    const waiter = state.waiters[index];
-    if (state.stateVersion > waiter.lastSeenVersion) {
-      readyWaiters.push(waiter);
-    } else {
-      remainingWaiters.push(waiter);
-    }
-  }
-
-  state.waiters = remainingWaiters;
-
-  for (let index = 0; index < readyWaiters.length; index += 1) {
-    const waiter = readyWaiters[index];
-    clearTimeout(waiter.timeoutHandle);
-    waiter.resolve({
-      status: "ready",
-      ...getCurrentStatePayload(state)
-    });
-  }
-}
-
-function waitForDecisionRequest(state, lastSeenVersion, timeoutMs) {
-  if (state.stateVersion > lastSeenVersion) {
-    return Promise.resolve({
-      status: "ready",
-      ...getCurrentStatePayload(state)
-    });
-  }
-
-  return new Promise((resolve) => {
-    const timeoutHandle = setTimeout(() => {
-      state.waiters = state.waiters.filter((waiter) => waiter.timeoutHandle !== timeoutHandle);
-      resolve({
-        status: "timeout",
-        state_version: state.stateVersion,
-        has_state: state.currentState !== null,
-        received_at: state.currentStateReceivedAt,
-        state_id: state.currentStateId,
-        legal_action_ids: state.legalActionIds,
-        latest_action: state.latestAction,
-        timeout_ms: timeoutMs
-      });
-    }, timeoutMs);
-
-    state.waiters.push({
-      lastSeenVersion,
-      timeoutHandle,
-      resolve
-    });
-  });
+  return {
+    submission_id: crypto.randomUUID(),
+    submitted_at: toIsoString(new Date()),
+    state_version: stateEnvelope.state_version,
+    expected_state_version: expectedStateVersion,
+    state_version_matches: stateVersionMatches,
+    state_id: stateEnvelope.state_id,
+    selected_action_id: selectedActionId,
+    legal_action_ids: legalActionIds,
+    valid: isValid,
+    source: source || null,
+    note: note || null,
+    reason: isValid
+      ? "최신 state_version의 legal_actions 안에 있습니다."
+      : "selected_action_id가 없거나, expected_state_version이 최신 state_version과 다릅니다."
+  };
 }
 
 function getCurrentStatePayload(state) {
@@ -363,13 +329,12 @@ function getCurrentStatePayload(state) {
   };
 }
 
-function normalizeTimeoutMs(value, defaultValue) {
-  const parsedValue = Number(value);
-  if (!Number.isFinite(parsedValue) || parsedValue <= 0) {
-    return defaultValue;
-  }
-
-  return Math.min(Math.trunc(parsedValue), 10 * 60 * 1000);
+function getCurrentStateHttpPayload(state) {
+  return {
+    ok: true,
+    status: state.currentState === null ? "empty" : "ready",
+    ...getCurrentStatePayload(state)
+  };
 }
 
 function normalizeStateVersion(value, defaultValue) {
@@ -449,6 +414,11 @@ function startHttpServer(state) {
         return;
       }
 
+      if (req.method === "GET" && requestUrl.pathname === "/state/current") {
+        sendJson(res, 200, getCurrentStateHttpPayload(state));
+        return;
+      }
+
       if (req.method === "POST" && requestUrl.pathname === "/state") {
         const body = await readJsonRequestBody(req, MAX_HTTP_BODY_BYTES);
         if (!isPlainObject(body)) {
@@ -466,6 +436,25 @@ function startHttpServer(state) {
           received_at: envelope.received_at,
           state_id: envelope.state_id,
           legal_action_count: envelope.legal_action_ids.length
+        });
+        return;
+      }
+
+      if (req.method === "POST" && requestUrl.pathname === "/action/submit") {
+        const body = await readJsonRequestBody(req, MAX_HTTP_BODY_BYTES);
+        if (!isPlainObject(body)) {
+          sendJson(res, 400, {
+            ok: false,
+            error: "행동 제출 본문은 JSON 객체여야 합니다."
+          });
+          return;
+        }
+
+        const submission = createActionSubmission(state, body);
+        setLatestAction(state, submission);
+        sendJson(res, 200, {
+          ok: true,
+          latest_action: submission
         });
         return;
       }
@@ -500,361 +489,16 @@ function startHttpServer(state) {
   state.httpServer = server;
 }
 
-function createJsonRpcTransport() {
-  let buffer = Buffer.alloc(0);
-
-  function writeMessage(messageObject) {
-    process.stdout.write(`${JSON.stringify(messageObject)}\n`);
-  }
-
-  async function handleMessage(messageObject) {
-    if (!isPlainObject(messageObject)) {
-      return;
-    }
-
-    const requestId = Object.prototype.hasOwnProperty.call(messageObject, "id") ? messageObject.id : undefined;
-    const methodName = typeof messageObject.method === "string" ? messageObject.method : "";
-    const paramsObject = isPlainObject(messageObject.params) ? messageObject.params : {};
-
-    try {
-      if (methodName === "initialize") {
-        appendEvent(serverState, "mcp_initialize", {
-          client_name: isPlainObject(paramsObject.clientInfo) && typeof paramsObject.clientInfo.name === "string" ? paramsObject.clientInfo.name : "",
-          client_version: isPlainObject(paramsObject.clientInfo) && typeof paramsObject.clientInfo.version === "string" ? paramsObject.clientInfo.version : "",
-          protocol_version: typeof paramsObject.protocolVersion === "string" ? paramsObject.protocolVersion : ""
-        });
-
-        if (requestId !== undefined) {
-          writeMessage({
-            jsonrpc: "2.0",
-            id: requestId,
-            result: {
-              protocolVersion: MCP_PROTOCOL_VERSION,
-              serverInfo: {
-                name: "spiremind-bridge",
-                version: "r4"
-              },
-              capabilities: {
-                tools: {}
-              }
-            }
-          });
-        }
-        return;
-      }
-
-      if (methodName === "notifications/initialized") {
-        appendEvent(serverState, "mcp_initialized", {});
-        return;
-      }
-
-      if (methodName === "tools/list") {
-        if (requestId === undefined) {
-          return;
-        }
-
-        writeMessage({
-          jsonrpc: "2.0",
-          id: requestId,
-          result: {
-            tools: [
-              {
-                name: "wait_for_decision_request",
-                description: "새 전투 상태나 판단 요청이 들어올 때까지 기다린다. 지정한 버전보다 새 상태가 있으면 바로 돌려준다.",
-                inputSchema: {
-                  type: "object",
-                  additionalProperties: false,
-                  properties: {
-                    last_seen_state_version: {
-                      type: "integer",
-                      minimum: 0,
-                      description: "이 버전보다 새 상태가 들어오면 즉시 반환한다."
-                    },
-                    timeout_ms: {
-                      type: "integer",
-                      minimum: 1,
-                      maximum: 600000,
-                      description: "기다릴 최대 시간이다. 기본값은 30000이다."
-                    }
-                  }
-                }
-              },
-              {
-                name: "get_current_state",
-                description: "현재 브리지에 들어온 전투 상태와 최근 제출 행동을 돌려준다.",
-                inputSchema: {
-                  type: "object",
-                  additionalProperties: false,
-                  properties: {}
-                }
-              },
-              {
-                name: "submit_action",
-                description: "최근 전투 상태의 legal_actions 안에 있는 행동을 제출하고 로그에 남긴다.",
-                inputSchema: {
-                  type: "object",
-                  additionalProperties: false,
-                  required: ["selected_action_id"],
-                  properties: {
-                    selected_action_id: {
-                      type: "string",
-                      description: "선택한 행동의 action_id다."
-                    },
-                    source: {
-                      type: "string",
-                      description: "행동 제출 주체를 적는 선택 항목이다."
-                    },
-                    note: {
-                      type: "string",
-                      description: "추가 메모를 남길 수 있다."
-                    },
-                    expected_state_version: {
-                      type: "integer",
-                      minimum: 0,
-                      description: "선택 사항이다. 넣으면 현재 상태 버전과 대조할 수 있다."
-                    }
-                  }
-                }
-              }
-            ]
-          }
-        });
-        return;
-      }
-
-      if (methodName === "tools/call") {
-        const toolName = typeof paramsObject.name === "string" ? paramsObject.name : "";
-        const toolArguments = isPlainObject(paramsObject.arguments) ? paramsObject.arguments : {};
-
-        if (toolName === "wait_for_decision_request") {
-          const lastSeenVersion = normalizeStateVersion(toolArguments.last_seen_state_version, 0);
-          const timeoutMs = normalizeTimeoutMs(toolArguments.timeout_ms, 30000);
-          const result = await waitForDecisionRequest(serverState, lastSeenVersion, timeoutMs);
-
-          if (requestId !== undefined) {
-            writeMessage({
-              jsonrpc: "2.0",
-              id: requestId,
-              result: {
-                content: [
-                  {
-                    type: "text",
-                    text: `${JSON.stringify(result, null, 2)}\n`
-                  }
-                ]
-              }
-            });
-          }
-          return;
-        }
-
-        if (toolName === "get_current_state") {
-          const result = {
-            status: serverState.currentState === null ? "empty" : "ready",
-            ...getCurrentStatePayload(serverState)
-          };
-
-          if (requestId !== undefined) {
-            writeMessage({
-              jsonrpc: "2.0",
-              id: requestId,
-              result: {
-                content: [
-                  {
-                    type: "text",
-                    text: `${JSON.stringify(result, null, 2)}\n`
-                  }
-                ]
-              }
-            });
-          }
-          return;
-        }
-
-        if (toolName === "submit_action") {
-          const selectedActionId = typeof toolArguments.selected_action_id === "string" ? toolArguments.selected_action_id.trim() : "";
-          const expectedStateVersion = normalizeStateVersion(toolArguments.expected_state_version, serverState.stateVersion);
-          const source = typeof toolArguments.source === "string" ? toolArguments.source.trim() : "";
-          const note = typeof toolArguments.note === "string" ? toolArguments.note.trim() : "";
-          const legalActionIds = serverState.legalActionIds.slice();
-          const stateEnvelope = buildStateEnvelope(serverState);
-          const hasExpectedStateVersion = Object.prototype.hasOwnProperty.call(toolArguments, "expected_state_version");
-          const stateVersionMatches = !hasExpectedStateVersion || expectedStateVersion === stateEnvelope.state_version;
-          const actionIdExists = selectedActionId !== "" && legalActionIds.includes(selectedActionId);
-          const isValid = actionIdExists && stateVersionMatches;
-          const submission = {
-            submission_id: crypto.randomUUID(),
-            submitted_at: toIsoString(new Date()),
-            state_version: stateEnvelope.state_version,
-            expected_state_version: expectedStateVersion,
-            state_version_matches: stateVersionMatches,
-            state_id: stateEnvelope.state_id,
-            selected_action_id: selectedActionId,
-            legal_action_ids: legalActionIds,
-            valid: isValid,
-            source: source || null,
-            note: note || null,
-            reason: isValid
-              ? "최신 state_version의 legal_actions 안에 있습니다."
-              : "selected_action_id가 없거나, expected_state_version이 최신 state_version과 다릅니다."
-          };
-
-          setLatestAction(serverState, submission);
-
-          if (requestId !== undefined) {
-            writeMessage({
-              jsonrpc: "2.0",
-              id: requestId,
-              result: {
-                content: [
-                  {
-                    type: "text",
-                    text: `${JSON.stringify(submission, null, 2)}\n`
-                  }
-                ]
-              }
-            });
-          }
-          return;
-        }
-
-        if (requestId !== undefined) {
-          writeMessage({
-            jsonrpc: "2.0",
-            id: requestId,
-            error: {
-              code: -32601,
-              message: `알 수 없는 도구입니다: ${toolName}`
-            }
-          });
-        }
-        return;
-      }
-
-      if (methodName === "shutdown") {
-        if (requestId !== undefined) {
-          writeMessage({
-            jsonrpc: "2.0",
-            id: requestId,
-            result: null
-          });
-        }
-        return;
-      }
-
-      if (methodName === "exit") {
-        process.exit(0);
-      }
-
-      if (requestId !== undefined) {
-        writeMessage({
-          jsonrpc: "2.0",
-          id: requestId,
-          error: {
-            code: -32601,
-            message: `알 수 없는 메서드입니다: ${methodName}`
-          }
-        });
-      }
-    } catch (error) {
-      appendEvent(serverState, "mcp_error", {
-        method: methodName,
-        message: error instanceof Error ? error.message : String(error)
-      });
-
-      if (requestId !== undefined) {
-        writeMessage({
-          jsonrpc: "2.0",
-          id: requestId,
-          error: {
-            code: -32000,
-            message: error instanceof Error ? error.message : "요청 처리 중 오류가 발생했습니다."
-          }
-        });
-      }
-    }
-  }
-
-  function parseBuffer() {
-    while (true) {
-      const headerSeparatorIndex = buffer.indexOf("\r\n\r\n");
-      if (headerSeparatorIndex !== -1) {
-        const headerText = buffer.slice(0, headerSeparatorIndex).toString("utf8");
-        const headerLines = headerText.split(/\r\n/);
-        const headerMap = {};
-
-        for (let index = 0; index < headerLines.length; index += 1) {
-          const line = headerLines[index];
-          const colonIndex = line.indexOf(":");
-          if (colonIndex === -1) {
-            continue;
-          }
-
-          const headerName = line.slice(0, colonIndex).trim().toLowerCase();
-          const headerValue = line.slice(colonIndex + 1).trim();
-          headerMap[headerName] = headerValue;
-        }
-
-        const contentLength = Number.parseInt(headerMap["content-length"] || "", 10);
-        if (Number.isFinite(contentLength) && contentLength >= 0) {
-          const bodyStartIndex = headerSeparatorIndex + 4;
-          const bodyEndIndex = bodyStartIndex + contentLength;
-          if (buffer.length < bodyEndIndex) {
-            return;
-          }
-
-          const bodyText = buffer.slice(bodyStartIndex, bodyEndIndex).toString("utf8");
-          buffer = buffer.slice(bodyEndIndex);
-
-          const messageObject = safeJsonParse(bodyText);
-          if (messageObject !== null) {
-            void handleMessage(messageObject);
-          }
-          continue;
-        }
-
-        buffer = buffer.slice(headerSeparatorIndex + 4);
-        continue;
-      }
-
-      const newlineIndex = buffer.indexOf("\n");
-      if (newlineIndex === -1) {
-        return;
-      }
-
-      const lineText = buffer.slice(0, newlineIndex).toString("utf8").trim();
-      buffer = buffer.slice(newlineIndex + 1);
-
-      if (lineText === "") {
-        continue;
-      }
-
-      const messageObject = safeJsonParse(lineText);
-      if (messageObject !== null) {
-        void handleMessage(messageObject);
-      }
-    }
-  }
-
-  process.stdin.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    parseBuffer();
-  });
-
-  process.stdin.on("end", () => {
-    process.exit(0);
-  });
-}
-
 function printUsage() {
   process.stdout.write([
     "사용법:",
     "  node bridge/spiremind_bridge.js [--http-host 127.0.0.1] [--http-port 17832] [--run-root <경로>]",
     "",
     "설명:",
-    "  - stdin/stdout에서는 MCP(JSON-RPC)를 처리한다.",
-    "  - 로컬 HTTP 서버는 게임과 테스트가 전투 상태를 보내는 데 쓴다.",
-    "  - /state, /action/latest, /health를 지원한다."
+    "  - 로컬 HTTP 서버만 실행한다.",
+    "  - MCP 처리는 bridge/spiremind_mcp_proxy.js가 담당한다.",
+    "  - 게임과 테스트가 전투 상태를 보내는 데 쓴다.",
+    "  - /state, /state/current, /action/submit, /action/latest, /health를 지원한다."
   ].join("\n"));
 }
 
@@ -872,7 +516,6 @@ const runDirectory = makeRunDirectory(runRoot);
 const serverState = createServerState(runDirectory, options.httpHost, options.httpPort);
 
 startHttpServer(serverState);
-createJsonRpcTransport();
 
 process.on("SIGINT", () => {
   appendEvent(serverState, "shutdown", { signal: "SIGINT" });

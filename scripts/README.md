@@ -60,6 +60,8 @@
 
 상주 브리지 서버는 `bridge/spiremind_bridge.js`에 있다.
 
+Codex가 붙는 MCP 서버는 `bridge/spiremind_mcp_proxy.js`다. 이 프록시는 자체 HTTP 서버를 열지 않고, `bridge/spiremind_bridge.js`의 HTTP 서버로만 요청을 전달한다.
+
 실행과 Codex MCP 등록 방법은 [bridge_architecture.md](../docs/bridge_architecture.md)를 따른다.
 
 ## 브리지 전송
@@ -71,3 +73,32 @@
 - 전송을 끄려면 설정 파일의 `enabled`를 `false`로 두거나 `SPIREMIND_BRIDGE_ENABLED=false` 환경 변수를 사용합니다.
 - 브리지 주소를 바꾸려면 설정 파일의 `state_url` 또는 `SPIREMIND_BRIDGE_STATE_URL` 환경 변수를 사용합니다.
 - 브리지 전송 실패는 게임 실행을 멈추게 하지 않습니다.
+
+## Codex 등록 예시
+
+브리지와 분리된 MCP 프록시를 Codex에 등록한다.
+
+```powershell
+codex mcp add spiremind-bridge -- node F:\Antigravity\STSAutoplay\bridge\spiremind_mcp_proxy.js --bridge-url http://127.0.0.1:17832
+```
+
+환경 변수로 기본 주소를 바꿀 수도 있다.
+
+```powershell
+$env:SPIREMIND_BRIDGE_URL = "http://127.0.0.1:17832"
+codex mcp add spiremind-bridge -- node F:\Antigravity\STSAutoplay\bridge\spiremind_mcp_proxy.js
+```
+
+## 브리지 프록시 검사
+
+HTTP 브리지와 MCP 프록시 왕복을 한 번에 확인한다.
+
+```powershell
+.\scripts\bridge_proxy_smoke_check.ps1
+```
+
+이미 떠 있는 브리지만 사용하고 싶을 때:
+
+```powershell
+.\scripts\bridge_proxy_smoke_check.ps1 -UseExistingBridge
+```

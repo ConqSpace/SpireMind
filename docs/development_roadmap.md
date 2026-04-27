@@ -38,7 +38,7 @@
 | R1 | S0 | STS2 모드 골격 | C# 모드 프로젝트, 빌드/배포 스크립트 | 완료 |
 | R2 | S0 | 전투 상태 추출 | `combat_state.v1` JSON exporter | 완료 |
 | R3 | S0 | 행동 후보 생성 | `legal_actions` 생성기 | 완료 |
-| R4 | S1 | 상주 브리지와 Codex 연결 | MCP/HTTP 브리지, 판단 요청 큐, 검증 로그 | 진행 중 |
+| R4 | S1 | 상주 브리지와 Codex 연결 | HTTP 브리지, MCP 프록시, 판단 요청 큐, 검증 로그 | 진행 중 |
 | R5 | S1 | 전투 행동 실행 | 카드 사용, 대상 지정, 턴 종료 실행 | 예정 |
 | R6 | S1/S4 일부 | 실험 러너 | 시드 반복, 지표 집계 | 예정 |
 | R7 | S2/S3 | 범위 확장 | 보상/지도/상점 선택 | 예정 |
@@ -103,14 +103,14 @@ STS2에서 로드되는 최소 C# 모드를 만든다.
 
 ### 목표
 
-Codex CLI를 매 행동마다 새로 실행하지 않는다. 대신 Codex 세션은 상주 브리지의 도구만 보고, 브리지 서버가 STS2 모드와 통신한다.
+Codex CLI를 매 행동마다 새로 실행하지 않는다. 실제 게임 상태는 상주 HTTP 브리지가 보관하고, Codex는 별도의 MCP 프록시를 통해 그 상태를 읽고 행동을 제출한다.
 
 ```text
 STS2 모드
--> 브리지 HTTP endpoint
--> 브리지 MCP 도구
+-> 브리지 HTTP 서버
+-> Codex MCP 프록시
 -> Codex 세션
--> submit_action
+-> 행동 선택
 -> 브리지 검증과 로그 저장
 ```
 
@@ -118,24 +118,27 @@ STS2 모드
 
 - 브리지 서버를 상주 프로세스로 실행한다.
 - 게임 또는 테스트가 `POST /state`로 최신 `combat_state`를 보낸다.
-- Codex는 MCP 도구 `wait_for_decision_request`로 새 판단 요청을 기다린다.
+- 브리지는 `GET /state/current`로 최신 상태를 돌려준다.
+- 브리지는 `POST /action/submit`로 행동 제출을 저장하고 검증한다.
+- Codex는 MCP 프록시의 `wait_for_decision_request`로 새 판단 요청을 기다린다.
 - Codex는 `legal_actions` 중 하나를 고른 뒤 `submit_action`을 호출한다.
-- 브리지는 `selected_action_id`가 최신 `legal_actions` 안에 있는지 검증한다.
+- 프록시는 브리지 HTTP 서버로만 요청을 전달한다.
 - 모든 상태 수신과 행동 제출을 로그로 남긴다.
 
 ### 산출물
 
 - `bridge/spiremind_bridge.js`
+- `bridge/spiremind_mcp_proxy.js`
 - `docs/bridge_architecture.md`
 - 브리지 실행 로그
 - Codex MCP 등록 방법
 
 ### 완료 기준
 
-- 브리지 서버가 HTTP와 MCP를 동시에 처리한다.
-- `POST /state`로 들어온 상태가 판단 요청으로 전환된다.
-- Codex가 호출할 수 있는 도구 목록이 제공된다.
-- `submit_action`은 없는 `action_id`를 실패로 기록한다.
+- 브리지 서버가 상태 수신과 최신 상태 조회, 행동 제출 저장을 처리한다.
+- MCP 프록시는 자체 HTTP 서버 없이 stdin/stdout MCP 서버로 동작한다.
+- `wait_for_decision_request`는 `GET /state/current`를 폴링해 새 상태를 찾는다.
+- `submit_action`은 `POST /action/submit`로 전달되고 검증 결과가 저장된다.
 - 게임 행동 실행은 하지 않는다.
 
 ### 주요 위험
@@ -147,13 +150,13 @@ STS2 모드
 ### 대응
 
 - `state_version`을 두고 Codex가 본 버전과 제출 시점의 버전을 비교한다.
-- Codex에는 브리지 MCP 도구만 제공한다.
+- Codex에는 MCP 프록시만 등록하고, 실제 상태는 브리지 HTTP 서버에서 읽는다.
 - R4에서는 행동 실행을 금지하고, 선택 결과만 로그에 남긴다.
-- MCP가 전투 진행 속도나 세션 안정성의 병목으로 확인되면, 같은 검증 규칙을 유지한 채 전용 WebSocket, SSE, 또는 stdio 기반 상주 에이전트로 바꿀 수 있다.
+- 프록시와 브리지의 연결이 병목으로 확인되면, 같은 검증 규칙을 유지한 채 전용 WebSocket, SSE, 또는 stdio 기반 상주 에이전트로 바꿀 수 있다.
 
 ### 나중에 열어둘 선택지
 
-R4의 MCP 구조는 표준 연결 방식이다. 최종 구조로 고정하지 않는다.
+R4의 MCP 프록시 구조는 표준 연결 방식이다. 최종 구조로 고정하지 않는다.
 
 전용 상주 에이전트를 검토하는 조건은 다음과 같다.
 
