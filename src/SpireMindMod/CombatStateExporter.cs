@@ -282,10 +282,12 @@ internal static class CombatStateExporter
             ["last_observed_types"] = LastObservedTypes.ToArray(),
             ["first_card_members"] = BuildMemberDebug(firstCard),
             ["first_card_child_members"] = BuildChildMemberDebug(firstCard, "cardStats", "_cardStats", "cardInfo", "_cardInfo", "baseCard", "_baseCard"),
+            ["first_card_dynamic_vars"] = BuildDynamicVarsDebug(firstCard),
             ["first_enemy_members"] = BuildMemberDebug(firstEnemy),
             ["first_enemy_intent_members"] = BuildMemberDebug(firstEnemyIntent),
             ["first_enemy_intent_child_members"] = BuildChildMemberDebug(firstEnemyIntent, "move", "_move", "Move", "nextMove", "_nextMove", "NextMove", "damageCalc", "_damageCalc", "repeatCalc", "_repeatCalc"),
-            ["intent_like_graph_nodes"] = BuildIntentGraphDebug(graph)
+            ["intent_like_graph_nodes"] = BuildIntentGraphDebug(graph),
+            ["room_like_graph_nodes"] = BuildRoomGraphDebug(graph)
         };
     }
 
@@ -308,6 +310,26 @@ internal static class CombatStateExporter
         string typeName = value.GetType().FullName ?? value.GetType().Name;
         return ContainsAny(typeName, "Intent", "Move")
             && !ContainsAny(typeName, "Tween", "Animation", "StateMachine", "Input", "Command", "History");
+    }
+
+    private static List<Dictionary<string, object?>> BuildRoomGraphDebug(ObjectGraph graph)
+    {
+        return graph.Nodes
+            .Where(node => node.Value is not null && IsRoomOrCombatNodeLike(node.Value))
+            .Take(8)
+            .Select(node => new Dictionary<string, object?>
+            {
+                ["path"] = node.Path,
+                ["type_name"] = node.Value!.GetType().FullName ?? node.Value.GetType().Name,
+                ["members"] = BuildMemberDebug(node.Value)
+            })
+            .ToList();
+    }
+
+    private static bool IsRoomOrCombatNodeLike(object value)
+    {
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return ContainsAny(typeName, "NCombatRoom", "CombatRoom", "IntentContainer", "CreatureNode");
     }
 
     private static object? FindIntentCandidate(object? enemy)
@@ -352,6 +374,19 @@ internal static class CombatStateExporter
         }
 
         return result;
+    }
+
+    private static List<Dictionary<string, object?>> BuildDynamicVarsDebug(object? card)
+    {
+        return EnumerateDynamicVars(card)
+            .Take(12)
+            .Select(dynamicVar => new Dictionary<string, object?>
+            {
+                ["type_name"] = dynamicVar.GetType().FullName ?? dynamicVar.GetType().Name,
+                ["summary"] = FormatDebugValue(dynamicVar),
+                ["members"] = BuildMemberDebug(dynamicVar)
+            })
+            .ToList();
     }
 
     private static List<Dictionary<string, object?>> BuildMemberDebug(object? source)
@@ -502,6 +537,19 @@ internal static class CombatStateExporter
             string fallbackName = GetReadableName(card);
             object? cardStats = FindMemberValue(card, "cardStats", "_cardStats", "stats", "_stats");
             object? cardInfo = FindMemberValue(card, "cardInfo", "_cardInfo", "info", "_info", "baseCard", "_baseCard");
+            bool isAttack = IsCardObjectType(card, "attack");
+            bool gainsBlock = ReadBool(card, "GainsBlock", "gainsBlock", "_gainsBlock") == true;
+            int? dynamicVarValue = ReadSingleDynamicVarInt(card);
+            int? damage = ReadFirstInt(new[] { card, cardStats, cardInfo }, "damage", "_damage", "baseDamage", "_baseDamage", "currentDamage", "_currentDamage", "attackDamage", "_attackDamage", "damageVar", "_damageVar", "calculatedDamage", "_calculatedDamage", "calculatedDamageVar", "_calculatedDamageVar")
+                ?? ReadDynamicVarInt(card, "damage", "dmg", "attack", "calculateddamage")
+                ?? (isAttack ? dynamicVarValue : null);
+            int? block = ReadFirstInt(new[] { card, cardStats, cardInfo }, "block", "_block", "baseBlock", "_baseBlock", "currentBlock", "_currentBlock", "blockVar", "_blockVar", "calculatedBlock", "_calculatedBlock")
+                ?? ReadDynamicVarInt(card, "block", "blk", "shield", "calculatedblock")
+                ?? (gainsBlock ? dynamicVarValue : null);
+            int? hits = ReadFirstInt(new[] { card, cardStats, cardInfo }, "hits", "_hits", "times", "_times", "attackCount", "_attackCount", "repeatCount", "_repeatCount", "hitCount", "_hitCount", "calculatedHits", "_calculatedHits", "calculatedHitsKey", "_calculatedHitsKey")
+                ?? ReadDynamicVarInt(card, "hits", "hit", "repeat", "times", "calculatedhits")
+                ?? (damage is not null ? 1 : null);
+
             cards.Add(new Dictionary<string, object?>
             {
                 ["instance_id"] = $"{pileName}_{index}",
@@ -513,9 +561,9 @@ internal static class CombatStateExporter
                 ["upgraded"] = ReadBool(card, "upgraded", "isUpgraded"),
                 ["playable"] = ReadBool(card, "playable", "canPlay", "isPlayable"),
                 ["target_type"] = ReadFirstString(new[] { card, cardInfo, cardStats }, "targetType", "_targetType", "target", "_target", "cardTarget", "_cardTarget"),
-                ["damage"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "damage", "_damage", "baseDamage", "_baseDamage", "currentDamage", "_currentDamage", "attackDamage", "_attackDamage", "damageVar", "_damageVar", "calculatedDamage", "_calculatedDamage", "calculatedDamageVar", "_calculatedDamageVar"),
-                ["block"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "block", "_block", "baseBlock", "_baseBlock", "currentBlock", "_currentBlock", "blockVar", "_blockVar", "calculatedBlock", "_calculatedBlock"),
-                ["hits"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "hits", "_hits", "times", "_times", "attackCount", "_attackCount", "repeatCount", "_repeatCount", "hitCount", "_hitCount", "calculatedHits", "_calculatedHits", "calculatedHitsKey", "_calculatedHitsKey"),
+                ["damage"] = damage,
+                ["block"] = block,
+                ["hits"] = hits,
                 ["description"] = ReadFirstString(new[] { card, cardInfo, cardStats }, "description", "Description", "_description", "desc", "_desc", "rawDescription", "_rawDescription", "text", "_text", "descriptionLoc", "_descriptionLoc", "descriptionText", "_descriptionText")
             });
             index++;
@@ -698,6 +746,129 @@ internal static class CombatStateExporter
                 ? character
                 : '_').ToArray();
         return new string(chars);
+    }
+
+    private static bool IsCardObjectType(object card, string expectedType)
+    {
+        string? cardType = ReadFirstString(new[] { card }, "type", "Type", "_type", "cardType", "_cardType");
+        return !string.IsNullOrWhiteSpace(cardType)
+            && cardType.Contains(expectedType, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int? ReadSingleDynamicVarInt(object card)
+    {
+        List<int> values = EnumerateDynamicVars(card)
+            .Select(ReadDynamicVarNumericValue)
+            .Where(value => value is not null)
+            .Select(value => value!.Value)
+            .Distinct()
+            .Take(2)
+            .ToList();
+
+        return values.Count == 1 ? values[0] : null;
+    }
+
+    private static int? ReadDynamicVarInt(object card, params string[] hints)
+    {
+        foreach (object dynamicVar in EnumerateDynamicVars(card))
+        {
+            string text = NormalizePowerText(BuildDynamicVarText(dynamicVar));
+            if (!ContainsAny(text, hints))
+            {
+                continue;
+            }
+
+            int? value = ReadDynamicVarNumericValue(dynamicVar);
+            if (value is not null)
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<object> EnumerateDynamicVars(params object?[] sources)
+    {
+        HashSet<object> seen = new(ReferenceEqualityComparer.Instance);
+        foreach (object? source in sources)
+        {
+            foreach (object dynamicSource in EnumerateDynamicVarSources(source))
+            {
+                foreach (object item in EnumerateObjects(dynamicSource))
+                {
+                    if (item is null || IsScalar(item.GetType()) || !seen.Add(item))
+                    {
+                        continue;
+                    }
+
+                    yield return item;
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<object> EnumerateDynamicVarSources(object? source)
+    {
+        if (source is null)
+        {
+            yield break;
+        }
+
+        foreach (string memberName in new[] { "DynamicVars", "dynamicVars", "_dynamicVars", "CanonicalVars", "canonicalVars", "_canonicalVars", "Vars", "vars", "_vars" })
+        {
+            object? value = FindMemberValue(source, memberName);
+            if (value is not null)
+            {
+                yield return value;
+            }
+        }
+    }
+
+    private static int? ReadDynamicVarNumericValue(object dynamicVar)
+    {
+        return ReadInt(
+            dynamicVar,
+            "CurrentValue",
+            "currentValue",
+            "_currentValue",
+            "Value",
+            "value",
+            "_value",
+            "BaseValue",
+            "baseValue",
+            "_baseValue",
+            "Amount",
+            "amount",
+            "_amount",
+            "Number",
+            "number",
+            "_number");
+    }
+
+    private static string BuildDynamicVarText(object dynamicVar)
+    {
+        return string.Join(
+            " ",
+            GetReadableName(dynamicVar),
+            ReadFirstString(
+                new[] { dynamicVar },
+                "Key",
+                "key",
+                "_key",
+                "Id",
+                "id",
+                "_id",
+                "Name",
+                "name",
+                "_name",
+                "Title",
+                "title",
+                "_title",
+                "Token",
+                "token",
+                "_token") ?? string.Empty,
+            dynamicVar.GetType().FullName ?? dynamicVar.GetType().Name);
     }
 
     private static List<Dictionary<string, object?>> ReadDictionaryList(Dictionary<string, object?> source, string key)
