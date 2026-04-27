@@ -20,6 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Lib.Harmony" Version="2.3.6" ExcludeAssets="runtime" PrivateAssets="all" />
     <None Include="SpireMind.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

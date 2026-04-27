@@ -198,6 +198,15 @@ STS2에서 로드되는 최소 C# 모드를 만든다.
 - 분류가 애매한 Power는 `powers_unknown`으로 보낸다.
 - 원본 의도 타입과 계산된 피해량을 함께 저장한다.
 
+### R2 구현 상태
+
+- `CombatStateHarmonyPatch`를 추가해 STS2 로더의 `Harmony.PatchAll` 경로에서 전투 방 타입을 찾는다.
+- STS2 타입 직접 참조 없이 리플렉션으로 플레이어, 카드 더미, 적, 의도 원문, 유물 후보를 읽어 `combat_state.v1` JSON을 쓴다.
+- 출력 경로는 `%APPDATA%\SlayTheSpire2\SpireMind\combat_state.json`이다.
+- 반자동 런타임 검증은 `scripts/runtime_smoke_check.ps1`로 수행한다. `-LaunchGame`의 기본 실행은 Steam URL `steam://rungameid/2868840`을 사용하며, exe 직접 실행이 필요하면 `-LaunchMode Exe`를 명시한다. 사용자가 직접 전투에 들어가 카드 1장을 사용하고 턴 종료까지 진행한 뒤, 스크립트가 JSON 생성/갱신과 주요 필드를 반복 확인한다.
+- `legal_actions`, LLM 호출, 자동 행동 실행은 R2 범위에서 제외했다.
+- 미검증 항목: STS2 런타임에서 실제 패치 대상 메서드가 잡히는지, 내부 필드명이 추출 휴리스틱과 맞는지, 화면의 카드 더미/적 의도와 JSON 값이 일치하는지 확인해야 한다.
+
 ## R3: 행동 후보 생성
 
 ### 목표
