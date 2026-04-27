@@ -306,18 +306,18 @@ internal static class CombatStateExporter
 
     private static Dictionary<string, object?> BuildPlayer(object? player)
     {
-        PowerGroups powerGroups = BuildPowerGroups(player, recentPlayer, FindMemberValue(recentPlayer, "Creature", "creature"));
+        object? runtimeCreature = FindMemberValue(recentPlayer, "Creature", "creature", "_creature");
+        PowerGroups powerGroups = BuildPowerGroups(player, recentPlayer, runtimeCreature);
 
         return new Dictionary<string, object?>
         {
             ["id"] = "player_0",
-            ["hp"] = ReadInt(player, "hp", "currentHp", "currentHealth", "health"),
-            ["max_hp"] = ReadInt(player, "maxHp", "maxHealth"),
-            ["block"] = ReadInt(player, "block", "currentBlock", "shield"),
-            ["energy"] = ReadInt(player, "energy", "currentEnergy"),
-            ["max_energy"] = ReadInt(player, "maxEnergy", "energyMax"),
-            ["gold"] = ReadInt(player, "gold", "currentGold")
-                ?? ReadInt(recentPlayer, "gold", "currentGold"),
+            ["hp"] = ReadFirstInt(new[] { player, recentPlayer, runtimeCreature }, "hp", "_hp", "currentHp", "_currentHp", "currentHealth", "_currentHealth", "health", "_health"),
+            ["max_hp"] = ReadFirstInt(new[] { player, recentPlayer, runtimeCreature }, "maxHp", "_maxHp", "maxHealth", "_maxHealth"),
+            ["block"] = ReadFirstInt(new[] { player, recentPlayer, runtimeCreature }, "block", "_block", "currentBlock", "_currentBlock", "shield", "_shield"),
+            ["energy"] = ReadFirstInt(new[] { player, recentPlayer }, "energy", "_energy", "currentEnergy", "_currentEnergy"),
+            ["max_energy"] = ReadFirstInt(new[] { player, recentPlayer }, "maxEnergy", "_maxEnergy", "energyMax", "_energyMax"),
+            ["gold"] = ReadFirstInt(new[] { player, recentPlayer }, "gold", "_gold", "currentGold", "_currentGold"),
             ["buffs"] = powerGroups.Buffs,
             ["debuffs"] = powerGroups.Debuffs,
             ["powers_unknown"] = powerGroups.Unknown
@@ -364,16 +364,16 @@ internal static class CombatStateExporter
                 ["instance_id"] = $"{pileName}_{index}",
                 ["card_id"] = ReadString(card, "id", "cardId", "key") ?? fallbackName,
                 ["name"] = ReadString(card, "name", "displayName", "title") ?? fallbackName,
-                ["type"] = ReadString(card, "type", "cardType"),
-                ["cost"] = ReadInt(card, "cost", "currentCost", "energyCost"),
-                ["base_cost"] = ReadInt(card, "baseCost", "baseEnergyCost"),
+                ["type"] = ReadString(card, "type", "cardType", "_cardType"),
+                ["cost"] = ReadInt(card, "cost", "_cost", "currentCost", "_currentCost", "energyCost", "_energyCost"),
+                ["base_cost"] = ReadInt(card, "baseCost", "_baseCost", "baseEnergyCost", "_baseEnergyCost"),
                 ["upgraded"] = ReadBool(card, "upgraded", "isUpgraded"),
                 ["playable"] = ReadBool(card, "playable", "canPlay", "isPlayable"),
-                ["target_type"] = ReadString(card, "targetType", "target", "cardTarget"),
-                ["damage"] = ReadInt(card, "damage", "baseDamage", "currentDamage", "attackDamage"),
-                ["block"] = ReadInt(card, "block", "baseBlock", "currentBlock"),
-                ["hits"] = ReadInt(card, "hits", "times", "attackCount", "repeatCount"),
-                ["description"] = ReadString(card, "description", "desc", "rawDescription", "text")
+                ["target_type"] = ReadString(card, "targetType", "_targetType", "target", "_target", "cardTarget", "_cardTarget"),
+                ["damage"] = ReadInt(card, "damage", "_damage", "baseDamage", "_baseDamage", "currentDamage", "_currentDamage", "attackDamage", "_attackDamage"),
+                ["block"] = ReadInt(card, "block", "_block", "baseBlock", "_baseBlock", "currentBlock", "_currentBlock"),
+                ["hits"] = ReadInt(card, "hits", "_hits", "times", "_times", "attackCount", "_attackCount", "repeatCount", "_repeatCount", "hitCount", "_hitCount"),
+                ["description"] = ReadString(card, "description", "_description", "desc", "_desc", "rawDescription", "_rawDescription", "text", "_text", "descriptionLoc", "_descriptionLoc")
             });
             index++;
         }
@@ -1088,6 +1088,20 @@ internal static class CombatStateExporter
         }
     }
 
+    private static int? ReadFirstInt(IEnumerable<object?> sources, params string[] names)
+    {
+        foreach (object? source in sources)
+        {
+            int? value = ReadInt(source, names);
+            if (value is not null)
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
     private static bool? ReadBool(object? source, params string[] names)
     {
         object? value = FindMemberValue(source, names);
@@ -1106,8 +1120,37 @@ internal static class CombatStateExporter
         {
             null => null,
             string text => text,
-            _ => value.ToString()
+            _ => ReadObjectString(value)
         };
+    }
+
+    private static string? ReadObjectString(object value)
+    {
+        string? nestedText = ReadNestedStringValue(value);
+        if (!string.IsNullOrWhiteSpace(nestedText))
+        {
+            return nestedText;
+        }
+
+        string? text = value.ToString();
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return string.Equals(text, typeName, StringComparison.Ordinal)
+            ? null
+            : text;
+    }
+
+    private static string? ReadNestedStringValue(object value)
+    {
+        foreach (string memberName in new[] { "Text", "text", "_text", "Value", "value", "_value", "Key", "key", "_key", "Id", "id", "_id" })
+        {
+            object? nested = FindMemberValue(value, memberName);
+            if (nested is string text && !string.IsNullOrWhiteSpace(text))
+            {
+                return text;
+            }
+        }
+
+        return null;
     }
 
     private static IEnumerable<object> EnumerateObjects(object? source)
