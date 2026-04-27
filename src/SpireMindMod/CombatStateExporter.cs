@@ -1179,7 +1179,8 @@ internal static class CombatStateExporter
 
     private static Dictionary<string, object?> BuildIntent(object enemy)
     {
-        object? intent = FindMemberValue(
+        object? monster = FindMemberValue(enemy, "monster", "_monster", "Monster");
+        object? directIntent = FindMemberValue(
             enemy,
             "intent",
             "_intent",
@@ -1197,14 +1198,26 @@ internal static class CombatStateExporter
             "cardIntent",
             "_cardIntent",
             "CardIntent");
-        object? move = FindMemberValue(intent, "move", "_move", "Move", "nextMove", "_nextMove", "NextMove")
+        object? move = FindMemberValue(monster, "nextMove", "_nextMove", "NextMove")
+            ?? FindMemberValue(directIntent, "move", "_move", "Move", "nextMove", "_nextMove", "NextMove")
             ?? FindMemberValue(enemy, "move", "_move", "Move", "nextMove", "_nextMove", "NextMove");
+        List<object> intents = EnumerateObjects(FindMemberValue(move, "intents", "_intents", "Intents")).ToList();
+        if (!intents.Any() && directIntent is not null && IsIntentLike(directIntent))
+        {
+            intents.Add(directIntent);
+        }
+
+        object? intent = intents.FirstOrDefault(IsAttackIntentLike)
+            ?? intents.FirstOrDefault()
+            ?? directIntent;
+        object? targets = FindIntentTargets(enemy);
         object? damageCalc = FindMemberValue(intent, "damageCalc", "_damageCalc", "DamageCalc", "damage", "_damage")
             ?? FindMemberValue(move, "damageCalc", "_damageCalc", "DamageCalc", "damage", "_damage");
         object? repeatCalc = FindMemberValue(intent, "repeatCalc", "_repeatCalc", "RepeatCalc", "repeat", "_repeat", "hits", "_hits")
             ?? FindMemberValue(move, "repeatCalc", "_repeatCalc", "RepeatCalc", "repeat", "_repeat", "hits", "_hits");
 
-        int? damage = ReadFirstInt(
+        int? damage = TryInvokeInt(intent, "GetSingleDamage", targets, enemy)
+            ?? ReadFirstInt(
             new[] { intent, move, damageCalc, enemy },
             "damage",
             "_damage",
@@ -1225,7 +1238,8 @@ internal static class CombatStateExporter
             "_intentDamage",
             "moveDamage",
             "_moveDamage");
-        int? hits = ReadFirstInt(
+        int? hits = TryReadIntProperty(intent, "Repeats", "repeats", "_repeats")
+            ?? ReadFirstInt(
             new[] { intent, move, repeatCalc, enemy },
             "hits",
             "_hits",
@@ -1243,7 +1257,8 @@ internal static class CombatStateExporter
             "_intentHits",
             "moveHits",
             "_moveHits");
-        int? totalDamage = ReadFirstInt(
+        int? totalDamage = TryInvokeInt(intent, "GetTotalDamage", targets, enemy)
+            ?? ReadFirstInt(
             new[] { intent, move, enemy },
             "totalDamage",
             "_totalDamage",
@@ -1281,25 +1296,69 @@ internal static class CombatStateExporter
             "blockAmount",
             "_blockAmount")
             ?? 0;
-        string? rawIntent = intent is null
-            ? (move is null ? null : GetReadableName(move))
-            : GetReadableName(intent);
+        string? moveId = ReadString(move, "id", "_id", "Id", "stateId", "_stateId", "StateId");
+        List<string> rawIntents = intents
+            .Select(candidate => GetIntentLabelText(candidate, targets, enemy) ?? GetReadableName(candidate))
+            .Where(text => !string.IsNullOrWhiteSpace(text))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        string? rawIntent = rawIntents.Any()
+            ? string.Join(", ", rawIntents)
+            : (intent is null ? (move is null ? null : GetReadableName(move)) : GetReadableName(intent));
 
         return new Dictionary<string, object?>
         {
-            ["type"] = InferIntentType(intent, rawIntent, damageValue, blockValue),
+            ["type"] = InferIntentType(intents, intent, rawIntent, damageValue, blockValue),
+            ["move_id"] = moveId,
             ["raw_intent"] = rawIntent,
             ["damage"] = damageValue,
             ["hits"] = hitsValue,
             ["total_damage"] = totalDamageValue,
             ["block"] = blockValue,
             ["applied_powers"] = BuildIntentAppliedPowers(intent),
-            ["description"] = ReadFirstString(new[] { intent, move }, "description", "_description", "desc", "_desc", "tooltip", "_tooltip", "toolTip", "_toolTip", "moveName", "_moveName"),
+            ["description"] = GetIntentLabelText(intent, targets, enemy) ?? ReadFirstString(new[] { intent, move }, "description", "_description", "desc", "_desc", "tooltip", "_tooltip", "toolTip", "_toolTip", "moveName", "_moveName"),
             ["damage_is_adjusted"] = null,
             ["damage_source"] = damage is null && hits is null && totalDamage is null
                 ? "unavailable"
-                : "reflected_candidate_fields"
+                : "sts2_intent_methods_or_reflected_candidate_fields"
         };
+    }
+
+    private static string InferIntentType(List<object> intents, object? intent, string? rawIntent, int damage, int block)
+    {
+        List<string> intentTypes = intents
+            .Select(candidate => ReadString(candidate, "intentType", "_intentType", "IntentType", "type", "_type", "Type") ?? GetReadableName(candidate))
+            .Where(text => !string.IsNullOrWhiteSpace(text))
+            .ToList();
+        bool hasAttack = intentTypes.Any(text => ContainsAny(text, "attack")) || damage > 0;
+        bool hasDebuff = intentTypes.Any(text => ContainsAny(text, "debuff"));
+
+        if (hasAttack && hasDebuff)
+        {
+            return "attack_debuff";
+        }
+
+        if (hasAttack)
+        {
+            return "attack";
+        }
+
+        if (intentTypes.Any(text => ContainsAny(text, "defend", "block")) || block > 0)
+        {
+            return "defend";
+        }
+
+        if (hasDebuff)
+        {
+            return "debuff";
+        }
+
+        if (intentTypes.Any(text => ContainsAny(text, "buff")))
+        {
+            return "buff";
+        }
+
+        return InferIntentType(intent, rawIntent, damage, block);
     }
 
     private static string InferIntentType(object? intent, string? rawIntent, int damage, int block)
@@ -1335,6 +1394,92 @@ internal static class CombatStateExporter
         }
 
         return "unknown";
+    }
+
+    private static bool IsIntentLike(object value)
+    {
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return typeName.Contains("Intent", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsAttackIntentLike(object value)
+    {
+        string text = string.Join(
+            " ",
+            value.GetType().FullName ?? value.GetType().Name,
+            ReadString(value, "intentType", "_intentType", "IntentType") ?? string.Empty);
+        return ContainsAny(text, "attack");
+    }
+
+    private static object? FindIntentTargets(object enemy)
+    {
+        object? combatState = FindMemberValue(enemy, "combatState", "_combatState", "CombatState");
+        return FindMemberValue(combatState, "playerCreatures", "_playerCreatures", "PlayerCreatures")
+            ?? FindMemberValue(combatState, "allies", "_allies", "Allies");
+    }
+
+    private static string? GetIntentLabelText(object? intent, object? targets, object enemy)
+    {
+        object? label = TryInvokeMethod(intent, "GetIntentLabel", targets, enemy);
+        object? formattedText = TryInvokeMethod(label, "GetFormattedText");
+        return formattedText as string;
+    }
+
+    private static int? TryReadIntProperty(object? source, params string[] names)
+    {
+        object? value = FindMemberValue(source, names);
+        return ConvertToInt(value);
+    }
+
+    private static int? TryInvokeInt(object? source, string methodName, params object?[] args)
+    {
+        object? value = TryInvokeMethod(source, methodName, args);
+        return ConvertToInt(value);
+    }
+
+    private static int? ConvertToInt(object? value)
+    {
+        if (value is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return Convert.ToInt32(value);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static object? TryInvokeMethod(object? source, string methodName, params object?[] args)
+    {
+        if (source is null)
+        {
+            return null;
+        }
+
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        MethodInfo? method = source.GetType()
+            .GetMethods(flags)
+            .FirstOrDefault(candidate =>
+                candidate.Name.Equals(methodName, StringComparison.OrdinalIgnoreCase)
+                && candidate.GetParameters().Length == args.Length);
+        if (method is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return method.Invoke(source, args);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static List<Dictionary<string, object?>> BuildIntentAppliedPowers(object? intent)
