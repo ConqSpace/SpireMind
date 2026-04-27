@@ -284,8 +284,30 @@ internal static class CombatStateExporter
             ["first_card_child_members"] = BuildChildMemberDebug(firstCard, "cardStats", "_cardStats", "cardInfo", "_cardInfo", "baseCard", "_baseCard"),
             ["first_enemy_members"] = BuildMemberDebug(firstEnemy),
             ["first_enemy_intent_members"] = BuildMemberDebug(firstEnemyIntent),
-            ["first_enemy_intent_child_members"] = BuildChildMemberDebug(firstEnemyIntent, "move", "_move", "Move", "nextMove", "_nextMove", "NextMove", "damageCalc", "_damageCalc", "repeatCalc", "_repeatCalc")
+            ["first_enemy_intent_child_members"] = BuildChildMemberDebug(firstEnemyIntent, "move", "_move", "Move", "nextMove", "_nextMove", "NextMove", "damageCalc", "_damageCalc", "repeatCalc", "_repeatCalc"),
+            ["intent_like_graph_nodes"] = BuildIntentGraphDebug(graph)
         };
+    }
+
+    private static List<Dictionary<string, object?>> BuildIntentGraphDebug(ObjectGraph graph)
+    {
+        return graph.Nodes
+            .Where(node => node.Value is not null && IsIntentOrMoveLike(node.Value))
+            .Take(12)
+            .Select(node => new Dictionary<string, object?>
+            {
+                ["path"] = node.Path,
+                ["type_name"] = node.Value!.GetType().FullName ?? node.Value.GetType().Name,
+                ["members"] = BuildMemberDebug(node.Value)
+            })
+            .ToList();
+    }
+
+    private static bool IsIntentOrMoveLike(object value)
+    {
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return ContainsAny(typeName, "Intent", "Move")
+            && !ContainsAny(typeName, "Tween", "Animation", "StateMachine", "Input", "Command", "History");
     }
 
     private static object? FindIntentCandidate(object? enemy)
@@ -486,15 +508,15 @@ internal static class CombatStateExporter
                 ["card_id"] = ReadFirstString(new[] { card, cardInfo }, "id", "_id", "cardId", "_cardId", "key", "_key") ?? fallbackName,
                 ["name"] = ReadFirstString(new[] { card, cardInfo }, "name", "_name", "displayName", "_displayName", "title", "_title") ?? fallbackName,
                 ["type"] = ReadFirstString(new[] { card, cardInfo, cardStats }, "type", "_type", "cardType", "_cardType"),
-                ["cost"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "cost", "_cost", "currentCost", "_currentCost", "energyCost", "_energyCost", "calculatedEnergy", "_calculatedEnergy", "calculatedEnergyKey", "_calculatedEnergyKey"),
-                ["base_cost"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "baseCost", "_baseCost", "baseEnergyCost", "_baseEnergyCost", "energyCost", "_energyCost"),
+                ["cost"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "cost", "_cost", "currentCost", "_currentCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost", "calculatedEnergy", "_calculatedEnergy", "calculatedEnergyKey", "_calculatedEnergyKey"),
+                ["base_cost"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "baseCost", "_baseCost", "baseEnergyCost", "_baseEnergyCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost"),
                 ["upgraded"] = ReadBool(card, "upgraded", "isUpgraded"),
                 ["playable"] = ReadBool(card, "playable", "canPlay", "isPlayable"),
                 ["target_type"] = ReadFirstString(new[] { card, cardInfo, cardStats }, "targetType", "_targetType", "target", "_target", "cardTarget", "_cardTarget"),
                 ["damage"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "damage", "_damage", "baseDamage", "_baseDamage", "currentDamage", "_currentDamage", "attackDamage", "_attackDamage", "damageVar", "_damageVar", "calculatedDamage", "_calculatedDamage", "calculatedDamageVar", "_calculatedDamageVar"),
                 ["block"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "block", "_block", "baseBlock", "_baseBlock", "currentBlock", "_currentBlock", "blockVar", "_blockVar", "calculatedBlock", "_calculatedBlock"),
                 ["hits"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "hits", "_hits", "times", "_times", "attackCount", "_attackCount", "repeatCount", "_repeatCount", "hitCount", "_hitCount", "calculatedHits", "_calculatedHits", "calculatedHitsKey", "_calculatedHitsKey"),
-                ["description"] = ReadFirstString(new[] { card, cardInfo, cardStats }, "description", "_description", "desc", "_desc", "rawDescription", "_rawDescription", "text", "_text", "descriptionLoc", "_descriptionLoc", "descriptionText", "_descriptionText")
+                ["description"] = ReadFirstString(new[] { card, cardInfo, cardStats }, "description", "Description", "_description", "desc", "_desc", "rawDescription", "_rawDescription", "text", "_text", "descriptionLoc", "_descriptionLoc", "descriptionText", "_descriptionText")
             });
             index++;
         }
