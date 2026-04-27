@@ -19,6 +19,7 @@
 - [experiment_protocol.md](./experiment_protocol.md): 성능 측정 조건, 지표, 비교 기준
 - [failure_policy.md](./failure_policy.md): 잘못된 응답, 지연, 상태 변경, 예외 처리 규칙
 - [development_roadmap.md](./development_roadmap.md): 구현 단계, 산출물, 검증 기준, 주요 위험
+- [strategic_roadmap.md](./strategic_roadmap.md): 연구 방향, 장기 단계, 의사결정 지점
 
 ## 현재 잠글 범위
 
