@@ -14,6 +14,8 @@ internal static class CombatStateHarmonyPatch
 
     public static IEnumerable<MethodBase> TargetMethods()
     {
+        CombatActionExecutor.StartBackgroundPolling();
+
         List<MethodBase> targets = new();
         targets.AddRange(GetDirectSts2TargetMethods());
 

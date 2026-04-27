@@ -7,6 +7,7 @@ internal static class CombatActionRuntimeContext
     private static readonly object SyncRoot = new();
     private static object? latestCombatRoot;
     private static string latestStateId = string.Empty;
+    private static string latestCombatStateJson = string.Empty;
     private static List<LegalActionSnapshot> latestLegalActions = new();
 
     public static void UpdateFromExport(object combatRoot, string combatStateJson)
@@ -22,6 +23,7 @@ internal static class CombatActionRuntimeContext
             {
                 latestCombatRoot = combatRoot;
                 latestStateId = stateId;
+                latestCombatStateJson = combatStateJson;
                 latestLegalActions = legalActions;
             }
         }
@@ -38,6 +40,7 @@ internal static class CombatActionRuntimeContext
             return new CombatActionContextSnapshot(
                 latestCombatRoot,
                 latestStateId,
+                latestCombatStateJson,
                 latestLegalActions.ToList());
         }
     }
@@ -94,6 +97,7 @@ internal static class CombatActionRuntimeContext
 internal sealed record CombatActionContextSnapshot(
     object? CombatRoot,
     string StateId,
+    string CombatStateJson,
     IReadOnlyList<LegalActionSnapshot> LegalActions)
 {
     public LegalActionSnapshot? FindAction(string actionId)

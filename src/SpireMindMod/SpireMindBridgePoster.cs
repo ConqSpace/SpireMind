@@ -239,6 +239,20 @@ internal static class CombatStateBridgePoster
         _ = PostStateAsync(json, settings);
     }
 
+    public static void ForcePost(string json)
+    {
+        long nowMs = Environment.TickCount64;
+        SpireMindBridgeSettings.BridgeSettingsSnapshot settings = SpireMindBridgeSettings.GetSnapshot(nowMs);
+        if (!settings.Enabled || string.IsNullOrWhiteSpace(json))
+        {
+            return;
+        }
+
+        lastAttemptAtMs = nowMs;
+        lastAttemptedJson = json;
+        _ = PostStateAsync(json, settings);
+    }
+
     internal static async Task<bool> PostStateAsync(
         string json,
         SpireMindBridgeSettings.BridgeSettingsSnapshot? settings = null,

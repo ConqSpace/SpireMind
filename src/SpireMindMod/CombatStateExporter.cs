@@ -41,6 +41,11 @@ internal static class CombatStateExporter
         TryExport(instance);
     }
 
+    internal static object? GetLatestRuntimePlayer()
+    {
+        return recentPlayer;
+    }
+
     private static void TryExport(object combatRoot)
     {
 
@@ -97,8 +102,7 @@ internal static class CombatStateExporter
         string typeName = instance.GetType().FullName ?? instance.GetType().Name;
         RememberObservedType(typeName);
 
-        if (typeName.EndsWith(".Player", StringComparison.OrdinalIgnoreCase)
-            || typeName.Contains(".Entities.Players.Player", StringComparison.OrdinalIgnoreCase))
+        if (IsRuntimePlayerType(typeName))
         {
             recentPlayer = instance;
         }
@@ -120,9 +124,16 @@ internal static class CombatStateExporter
         }
 
         ObjectGraph shallowGraph = ObjectGraph.Collect(instance, 2, 80);
-        recentPlayer ??= FindFirst(shallowGraph, "Player");
+        recentPlayer ??= FindFirstRuntimePlayer(shallowGraph);
         recentCombatState ??= FindFirstCombatState(shallowGraph);
         recentPlayerCombatState ??= FindFirst(shallowGraph, "PlayerCombatState");
+    }
+
+    private static bool IsRuntimePlayerType(string typeName)
+    {
+        return (typeName.EndsWith(".Player", StringComparison.OrdinalIgnoreCase)
+                || typeName.Contains(".Entities.Players.Player", StringComparison.OrdinalIgnoreCase))
+            && !typeName.Contains("PlayerCombatState", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void RememberObservedType(string typeName)
@@ -700,6 +711,22 @@ internal static class CombatStateExporter
             .Where(node => ContainsAny(node.Path, hints) || ContainsAny(node.Value?.GetType().Name, hints))
             .Select(node => node.Value)
             .FirstOrDefault(value => value is not null && !IsScalar(value.GetType()));
+    }
+
+    private static object? FindFirstRuntimePlayer(ObjectGraph graph)
+    {
+        return graph.Nodes
+            .Select(node => node.Value)
+            .FirstOrDefault(value =>
+            {
+                if (value is null || IsScalar(value.GetType()))
+                {
+                    return false;
+                }
+
+                string typeName = value.GetType().FullName ?? value.GetType().Name;
+                return IsRuntimePlayerType(typeName);
+            });
     }
 
     private static object? FindFirstCombatState(ObjectGraph graph)

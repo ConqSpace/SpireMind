@@ -8,6 +8,9 @@ namespace SpireMindMod;
 internal static class CombatActionExecutor
 {
     private const int ClaimCooldownMs = 500;
+    private const int BackgroundPollIntervalMs = 250;
+    private const int DiagnosticLogIntervalMs = 5000;
+    private const int ClaimInFlightWatchdogMs = 3000;
     private const int MaxExecutedHistory = 128;
 
     private static readonly SpireMindLogger Logger = new("SpireMind.R5.Execute");
@@ -15,9 +18,41 @@ internal static class CombatActionExecutor
     private static readonly Queue<string> ExecutedOrder = new();
     private static readonly HashSet<string> ExecutedSubmissionIds = new(StringComparer.Ordinal);
 
+    private static Timer? backgroundPollTimer;
     private static int claimInFlight;
+    private static int backgroundPollingStarted;
     private static long lastClaimAttemptAtMs;
+    private static long claimStartedAtMs;
+    private static long lastDiagnosticLogAtMs;
     private static PendingClaim? pendingClaim;
+
+    public static void StartBackgroundPolling()
+    {
+        if (Interlocked.Exchange(ref backgroundPollingStarted, 1) == 1)
+        {
+            return;
+        }
+
+        backgroundPollTimer = new Timer(
+            _ => TickSafely(),
+            null,
+            BackgroundPollIntervalMs,
+            BackgroundPollIntervalMs);
+
+        Logger.Info("전투 액션 claim 백그라운드 확인을 시작했습니다.");
+    }
+
+    public static void StopBackgroundPolling()
+    {
+        if (Interlocked.Exchange(ref backgroundPollingStarted, 0) == 0)
+        {
+            return;
+        }
+
+        Timer? timer = Interlocked.Exchange(ref backgroundPollTimer, null);
+        timer?.Dispose();
+        Logger.Info("전투 액션 claim 백그라운드 확인을 중지했습니다.");
+    }
 
     public static void Tick()
     {
@@ -25,14 +60,34 @@ internal static class CombatActionExecutor
         TryStartClaimRequest();
     }
 
+    private static void TickSafely()
+    {
+        try
+        {
+            Tick();
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"액션 확인 중 예외가 발생했습니다. 다음 주기에서 다시 시도합니다. {exception.GetType().Name}: {exception.Message}");
+        }
+    }
+
     private static void TryStartClaimRequest()
     {
+        long nowMs = Environment.TickCount64;
         if (Volatile.Read(ref claimInFlight) == 1)
         {
+            long startedAtMs = Interlocked.Read(ref claimStartedAtMs);
+            if (startedAtMs > 0 && nowMs - startedAtMs > ClaimInFlightWatchdogMs)
+            {
+                Volatile.Write(ref claimInFlight, 0);
+                Interlocked.Exchange(ref claimStartedAtMs, 0);
+                Logger.Warning("이전 claim 요청이 너무 오래 끝나지 않아 대기 상태를 해제했습니다.");
+            }
+
             return;
         }
 
-        long nowMs = Environment.TickCount64;
         if (nowMs - lastClaimAttemptAtMs < ClaimCooldownMs)
         {
             return;
@@ -41,16 +96,25 @@ internal static class CombatActionExecutor
         CombatStateBridgePoster.PostedStateSnapshot? postedState = CombatStateBridgePoster.GetLatestPostedState();
         if (postedState is null)
         {
+            LogDiagnostic("claim 대기: 브리지에 성공적으로 게시된 전투 상태가 아직 없습니다.");
             return;
         }
 
         CombatActionContextSnapshot context = CombatActionRuntimeContext.GetSnapshot();
         if (context.CombatRoot is null || context.StateId != postedState.StateId)
         {
+            if (context.CombatRoot is not null && !string.IsNullOrWhiteSpace(context.CombatStateJson))
+            {
+                CombatStateBridgePoster.ForcePost(context.CombatStateJson);
+            }
+
+            LogDiagnostic(
+                $"claim 대기: 현재 전투 상태와 브리지 게시 상태가 다릅니다. 현재 상태를 다시 게시했습니다. current={context.StateId ?? "<none>"} posted={postedState.StateId}");
             return;
         }
 
         lastClaimAttemptAtMs = nowMs;
+        Interlocked.Exchange(ref claimStartedAtMs, nowMs);
         Volatile.Write(ref claimInFlight, 1);
 
         _ = Task.Run(async () =>
@@ -61,6 +125,15 @@ internal static class CombatActionExecutor
                 ActionClaimResponse? response = await CombatActionBridgeClient.TryClaimAsync(
                     postedState,
                     cancellation.Token).ConfigureAwait(false);
+
+                if (response is null)
+                {
+                    LogDiagnostic("claim 응답 없음: 브리지 설정이 비활성화되어 있거나 요청이 생략되었습니다.");
+                }
+                else if (response.Status == "none")
+                {
+                    LogDiagnostic($"claim 응답: 실행할 액션이 없습니다. state_version={postedState.StateVersion}");
+                }
 
                 if (response?.Status == "claimed" && response.Action is not null)
                 {
@@ -82,9 +155,23 @@ internal static class CombatActionExecutor
             }
             finally
             {
+                Interlocked.Exchange(ref claimStartedAtMs, 0);
                 Volatile.Write(ref claimInFlight, 0);
             }
         });
+    }
+
+    private static void LogDiagnostic(string message)
+    {
+        long nowMs = Environment.TickCount64;
+        long previousMs = Interlocked.Read(ref lastDiagnosticLogAtMs);
+        if (nowMs - previousMs < DiagnosticLogIntervalMs)
+        {
+            return;
+        }
+
+        Interlocked.Exchange(ref lastDiagnosticLogAtMs, nowMs);
+        Logger.Info(message);
     }
 
     private static void TryExecutePendingClaim()
@@ -202,10 +289,14 @@ internal static class CombatActionExecutor
     {
         try
         {
-            Type? localContextType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Context.LocalContext");
-            object? player = localContextType is null
-                ? null
-                : AccessTools.Method(localContextType, "GetMe")?.Invoke(null, Array.Empty<object>());
+            object? player = CombatStateExporter.GetLatestRuntimePlayer();
+            if (player is null)
+            {
+                Type? localContextType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Context.LocalContext");
+                player = localContextType is null
+                    ? null
+                    : InvokeStaticNoArgMethod(localContextType, "GetMe");
+            }
             if (player is null)
             {
                 detail = "LocalContext.GetMe()에서 플레이어를 찾지 못했습니다.";
@@ -451,6 +542,28 @@ internal static class CombatActionExecutor
                 PropertyInfo property when property.GetMethod is not null => property.GetValue(null),
                 _ => null
             };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static object? InvokeStaticNoArgMethod(Type type, string methodName)
+    {
+        MethodInfo? method = type.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+            .Where(candidate => candidate.Name.Equals(methodName, StringComparison.OrdinalIgnoreCase))
+            .Where(candidate => candidate.GetParameters().Length == 0)
+            .OrderBy(candidate => candidate.ReturnType == typeof(void))
+            .FirstOrDefault();
+        if (method is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return method.Invoke(null, Array.Empty<object>());
         }
         catch
         {
