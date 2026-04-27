@@ -1,0 +1,12 @@
+{
+  "id": "spiremind",
+  "name": "SpireMind",
+  "version": "0.1.0",
+  "description": "STS2 전투 상태 관찰과 AI 실험을 위한 읽기 전용 모드 골격입니다.",
+  "author": "SpireMind contributors",
+  "has_pck": false,
+  "has_dll": true,
+  "dependencies": [],
+  "affects_gameplay": false,
+  "early_access_notice": "STS2 앞서 해보기 업데이트로 모드 로더, manifest 형식, sts2.dll 공개 API가 바뀔 수 있습니다."
+}

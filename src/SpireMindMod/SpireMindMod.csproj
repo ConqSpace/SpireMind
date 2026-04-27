@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>SpireMind</AssemblyName>
+    <RootNamespace>SpireMindMod</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <Import Project="SpireMind.Local.props" Condition="Exists('SpireMind.Local.props')" />
+
+  <ItemGroup Condition="'$(Sts2AssemblyPath)' != '' and Exists('$(Sts2AssemblyPath)')">
+    <Reference Include="sts2">
+      <HintPath>$(Sts2AssemblyPath)</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="SpireMind.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

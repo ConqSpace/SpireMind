@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <!-- 개인 PC의 STS2 설치 파일 경로입니다. 이 파일은 복사해서 SpireMind.Local.props로 만든 뒤 사용합니다. -->
+    <Sts2AssemblyPath>C:\Program Files (x86)\Steam\steamapps\common\Slay the Spire 2\sts2.dll</Sts2AssemblyPath>
+
+    <!-- 배포 스크립트가 사용할 기본 mods 폴더입니다. 실제 위치는 사용자 환경에 맞게 바꿉니다. -->
+    <Sts2ModsDir>C:\Program Files (x86)\Steam\steamapps\common\Slay the Spire 2\mods</Sts2ModsDir>
+  </PropertyGroup>
+</Project>
+

@@ -116,7 +116,7 @@ STS2에서 로드되는 최소 C# 모드를 만든다.
 ### 완료 기준
 
 - STS2 설정 화면에서 SpireMind 모드가 보인다.
-- 모드 로드 시 로그 한 줄을 남긴다.
+- STS2 로더 로그에서 SpireMind manifest 발견, DLL 로드, 초기화 완료가 확인된다.
 - 모드를 켜고 새 전투에 진입해도 게임이 멈추지 않는다.
 
 ### 주요 위험
@@ -128,6 +128,33 @@ STS2에서 로드되는 최소 C# 모드를 만든다.
 
 - 첫 모드는 게임 상태를 바꾸지 않는 읽기 전용으로 만든다.
 - 외부 라이브러리 사용은 필요한 만큼만 한다.
+
+### 구현 시작 상태
+
+- 모드 골격은 `src/SpireMindMod/`에 둔다.
+- 로컬 STS2 설치 경로와 `mods` 폴더 경로는 `SpireMind.Local.props` 또는 스크립트 매개변수로만 받는다.
+- `SpireMind.Local.props`는 사용자별 파일이므로 커밋하지 않는다. 예시는 `SpireMind.Local.props.example`만 제공한다.
+- 빌드는 `scripts/build_mod.ps1`로 확인한다.
+- 배포는 `scripts/deploy_mod.ps1`로 수행한다. 실제 STS2 설치 경로는 `-ModsDir` 또는 로컬 props에서 읽는다.
+- 지금 단계의 `SpireMind.dll`은 빌드 가능한 읽기 전용 골격이다. 전투 상태 접근과 JSON 출력은 R2에서 별도 검증한다.
+- `SpireMindEntrypoint`는 R1 placeholder이며, 현재 STS2 로더가 직접 호출한다고 검증되지 않았다.
+- `SpireMind.pck`가 필요한 모드 로더라면 Godot export 산출물을 별도로 만들어 배포 스크립트의 `-PckPath`로 전달한다. 저장소에는 로컬 pck 산출물을 커밋하지 않는다.
+- R1에서는 BaseLib와 Harmony를 사용하지 않는다. 런타임 패치가 필요하다고 확인되면 R2에서 전투 상태 접근 지점 조사와 함께 재검토한다.
+- `SpireMind.json`은 기존 STS2 모드 manifest 형식으로 보고된 `author`, `has_pck`, `has_dll`, `dependencies`, `affects_gameplay` 필드를 기준으로 둔다. 로더 진입점 규칙을 확인하기 전까지 근거 없는 `entrypoint` 확장은 추가하지 않는다.
+- STS2 런타임은 .NET 9 계열 어셈블리를 포함할 수 있다. 그러나 R1 모드 프로젝트는 현재 저장소 검증 가능성을 우선해 `net8.0`으로 빌드한다.
+- STS2 core의 `ModInitializerAttribute`를 쓰는 모드 자체 `ModEntry` 로그는 R1에서 보류한다. 현재 로컬에는 .NET 9 SDK가 없고, STS2 v0.103.2의 `sts2.dll`이 `System.Runtime 9.0`을 참조해 `net8.0` 빌드와 충돌한다. STS2 core initializer는 .NET 9 SDK 도입 또는 대상 프레임워크 조정 결정을 한 뒤 별도 작업으로 처리한다.
+
+### R1 수동 검증 기록
+
+- 검증 게임 버전: STS2 v0.103.2
+- 로그 파일: `C:\Users\jye00\AppData\Roaming\SlayTheSpire2\logs\godot.log`
+- 모드 설정 화면 노출: 성공
+- 모드 활성화: 성공
+- 전투 종료까지 진행: 성공
+- 특이사항: 없음
+- 확인된 기존 로그: SpireMind manifest 발견, DLL 로드, 초기화 완료가 남았다.
+- 모드 자체 `ModEntry` 로그: 보류. 현재 R1은 빌드 가능한 읽기 전용 골격을 우선한다.
+- `SpireMindEntrypoint` 호출 여부: 미검증. R1에서는 STS2 로더 수준의 manifest 인식과 DLL 로드만 완료 사실로 본다.
 
 ## R2: 전투 상태 추출
 

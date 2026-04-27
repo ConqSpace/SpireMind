@@ -1,0 +1,15 @@
+# 빌드 산출물
+bin/
+obj/
+artifacts/
+
+# 로컬 사용자 설정
+*.Local.props
+*.local.json
+
+# STS2/Godot 원본 파일과 로컬 모드 산출물
+*.pck
+*.dll.config
+*.deps.json
+*.runtimeconfig.json
+
