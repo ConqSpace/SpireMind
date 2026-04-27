@@ -187,6 +187,7 @@ function Get-CombatStateSnapshot {
 
         $results.Add((New-SmokeResult "card pile total" "FAIL" $detail))
         $results.Add((New-SmokeResult "player hp or energy" "FAIL" $detail))
+        $results.Add((New-SmokeResult "legal_actions count" "FAIL" $detail))
         $results.Add((New-SmokeResult "enemy count" "WARN" $detail))
         $results.Add((New-SmokeResult "relic count" "WARN" $detail))
     }
@@ -213,6 +214,14 @@ function Get-CombatStateSnapshot {
         }
         else {
             $results.Add((New-SmokeResult "player hp or energy" "WARN" "both hp and energy are null"))
+        }
+
+        $legalActionCount = Get-CollectionCount (Get-JsonValue $json @("legal_actions"))
+        if ($legalActionCount -gt 0) {
+            $results.Add((New-SmokeResult "legal_actions count" "PASS" "$legalActionCount actions"))
+        }
+        else {
+            $results.Add((New-SmokeResult "legal_actions count" "FAIL" "legal_actions is empty or missing"))
         }
 
         $enemyCount = Get-CollectionCount (Get-JsonValue $json @("enemies"))
