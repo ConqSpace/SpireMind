@@ -262,6 +262,8 @@ R5에서는 다음 책임을 분리한다.
 
 첫 구현은 `end_turn`만 지원한다.
 
+기본 실행 경로는 `EndPlayerTurnAction`을 `RunManager.Instance.ActionQueueSynchronizer.RequestEnqueue(...)`로 넣는 방식이다. 이 경로는 턴 종료 버튼이 사용하는 액션 큐 계층을 통과하므로, 좌표 클릭이나 직접 상태 변경보다 안전하다.
+
 완료 조건:
 
 - Codex가 `end_turn`을 제출한다.
@@ -302,9 +304,10 @@ R5.1에서 하지 않을 것:
 
 ## 실행 방식 우선순위
 
-1. STS2 내부 메서드를 호출한다.
-2. UI 노드가 이미 쓰는 핸들러를 호출한다.
-3. 입력 시뮬레이션은 마지막 수단으로만 검토한다.
+1. `EndPlayerTurnAction`을 액션 큐에 넣는다.
+2. UI 노드가 이미 쓰는 턴 종료 핸들러를 호출한다.
+3. `PlayerCmd.EndTurn` 또는 `CombatManager.SetReadyToEndTurn` 같은 명령형 도우미를 조사한다.
+4. 입력 시뮬레이션은 마지막 수단으로만 검토한다.
 
 입력 시뮬레이션을 뒤로 미루는 이유:
 

@@ -91,7 +91,7 @@ codex mcp add spiremind-bridge -- node F:\Antigravity\STSAutoplay\bridge\spiremi
 
 ## 브리지 프록시 검사
 
-HTTP 브리지와 MCP 프록시 왕복을 한 번에 확인한다.
+HTTP 브리지, MCP 프록시, R5 `claim/result` 왕복을 한 번에 확인한다.
 
 ```powershell
 .\scripts\bridge_proxy_smoke_check.ps1

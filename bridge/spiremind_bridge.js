@@ -175,6 +175,28 @@ function getLegalActionIds(stateObject) {
   return actionIds;
 }
 
+function getLegalActionById(stateObject, actionId) {
+  const legalActions = isPlainObject(stateObject) ? stateObject.legal_actions : null;
+  if (!Array.isArray(legalActions) || typeof actionId !== "string" || actionId.trim() === "") {
+    return null;
+  }
+
+  const trimmedActionId = actionId.trim();
+  for (let index = 0; index < legalActions.length; index += 1) {
+    const legalAction = legalActions[index];
+    if (!isPlainObject(legalAction)) {
+      continue;
+    }
+
+    const candidate = legalAction.action_id || legalAction.actionId;
+    if (typeof candidate === "string" && candidate.trim() === trimmedActionId) {
+      return legalAction;
+    }
+  }
+
+  return null;
+}
+
 function getLatestStateSummary(stateEnvelope) {
   if (!stateEnvelope) {
     return null;
@@ -288,6 +310,14 @@ function setLatestAction(state, actionObject) {
   });
 }
 
+function updateLatestAction(state, eventType, details) {
+  if (state.latestAction) {
+    writeJsonFile(state.latestActionFilePath, state.latestAction);
+  }
+
+  appendEvent(state, eventType, details);
+}
+
 function createActionSubmission(state, actionArguments) {
   const selectedActionId = typeof actionArguments.selected_action_id === "string" ? actionArguments.selected_action_id.trim() : "";
   const expectedStateVersion = normalizeStateVersion(actionArguments.expected_state_version, state.stateVersion);
@@ -310,11 +340,210 @@ function createActionSubmission(state, actionArguments) {
     selected_action_id: selectedActionId,
     legal_action_ids: legalActionIds,
     valid: isValid,
+    execution_status: isValid ? "pending" : "invalid",
+    claim_token: null,
+    claimed_at: null,
+    claimed_by: null,
+    result: null,
+    result_reported_at: null,
     source: source || null,
     note: note || null,
     reason: isValid
       ? "최신 state_version의 legal_actions 안에 있습니다."
       : "selected_action_id가 없거나, expected_state_version이 최신 state_version과 다릅니다."
+  };
+}
+
+function getSupportedActionTypes(claimArguments) {
+  if (!Array.isArray(claimArguments.supported_action_types)) {
+    return [];
+  }
+
+  return claimArguments.supported_action_types
+    .filter((value) => typeof value === "string")
+    .map((value) => value.trim())
+    .filter((value) => value !== "");
+}
+
+function createActionClaim(state, claimArguments) {
+  const latestAction = state.latestAction;
+  const executorId = typeof claimArguments.executor_id === "string" ? claimArguments.executor_id.trim() : "";
+  const observedStateId = typeof claimArguments.observed_state_id === "string" ? claimArguments.observed_state_id.trim() : "";
+  const observedStateVersion = normalizeStateVersion(claimArguments.observed_state_version, -1);
+  const supportedActionTypes = getSupportedActionTypes(claimArguments);
+
+  if (!latestAction || latestAction.valid !== true || latestAction.execution_status === "invalid") {
+    return {
+      ok: true,
+      status: "empty",
+      reason: "실행할 유효 행동이 없습니다."
+    };
+  }
+
+  if (latestAction.result !== null || latestAction.execution_status === "applied" || latestAction.execution_status === "failed") {
+    return {
+      ok: true,
+      status: "empty",
+      reason: "이미 결과가 보고된 행동입니다."
+    };
+  }
+
+  if (latestAction.execution_status === "claimed" && latestAction.claim_token) {
+    return {
+      ok: true,
+      status: "empty",
+      reason: "이미 다른 claim이 처리 중입니다."
+    };
+  }
+
+  const stateMatches = latestAction.state_id === state.currentStateId
+    && latestAction.state_version === state.stateVersion
+    && latestAction.state_id === observedStateId
+    && latestAction.state_version === observedStateVersion;
+
+  if (!stateMatches) {
+    latestAction.execution_status = "stale";
+    latestAction.result = "stale";
+    latestAction.result_reported_at = toIsoString(new Date());
+    latestAction.result_note = "claim 시점의 상태가 제출 시점 상태와 다릅니다.";
+    updateLatestAction(state, "action_marked_stale", {
+      submission_id: latestAction.submission_id,
+      state_id: latestAction.state_id,
+      state_version: latestAction.state_version,
+      observed_state_id: observedStateId,
+      observed_state_version: observedStateVersion
+    });
+
+    return {
+      ok: true,
+      status: "stale",
+      reason: "행동의 상태와 모드가 보고 있는 상태가 다릅니다.",
+      action: latestAction
+    };
+  }
+
+  const legalAction = getLegalActionById(state.currentState, latestAction.selected_action_id);
+  if (!legalAction) {
+    latestAction.execution_status = "stale";
+    latestAction.result = "stale";
+    latestAction.result_reported_at = toIsoString(new Date());
+    latestAction.result_note = "현재 legal_actions에서 selected_action_id를 다시 찾지 못했습니다.";
+    updateLatestAction(state, "action_marked_stale", {
+      submission_id: latestAction.submission_id,
+      selected_action_id: latestAction.selected_action_id
+    });
+
+    return {
+      ok: true,
+      status: "stale",
+      reason: "현재 legal_actions에서 행동을 다시 찾지 못했습니다.",
+      action: latestAction
+    };
+  }
+
+  const actionType = typeof legalAction.type === "string" ? legalAction.type.trim() : "";
+  if (supportedActionTypes.length > 0 && !supportedActionTypes.includes(actionType)) {
+    latestAction.execution_status = "unsupported";
+    latestAction.result = "unsupported";
+    latestAction.result_reported_at = toIsoString(new Date());
+    latestAction.result_note = `실행자가 ${actionType} 행동을 지원하지 않습니다.`;
+    updateLatestAction(state, "action_claim_rejected", {
+      submission_id: latestAction.submission_id,
+      selected_action_id: latestAction.selected_action_id,
+      action_type: actionType,
+      reason: "unsupported"
+    });
+
+    return {
+      ok: true,
+      status: "unsupported",
+      reason: "실행자가 지원하지 않는 행동 타입입니다.",
+      action: latestAction
+    };
+  }
+
+  const claimedAt = toIsoString(new Date());
+  const claimToken = crypto.randomUUID();
+  latestAction.execution_status = "claimed";
+  latestAction.claim_token = claimToken;
+  latestAction.claimed_at = claimedAt;
+  latestAction.claimed_by = executorId || null;
+  latestAction.action_type = actionType || null;
+  latestAction.action = legalAction;
+  updateLatestAction(state, "action_claimed", {
+    submission_id: latestAction.submission_id,
+    claim_token: claimToken,
+    executor_id: executorId || null,
+    state_id: latestAction.state_id,
+    state_version: latestAction.state_version,
+    selected_action_id: latestAction.selected_action_id,
+    action_type: actionType || null
+  });
+
+  return {
+    ok: true,
+    status: "claimed",
+    claim_token: claimToken,
+    action: latestAction
+  };
+}
+
+function createActionResult(state, resultArguments) {
+  const latestAction = state.latestAction;
+  const submissionId = typeof resultArguments.submission_id === "string" ? resultArguments.submission_id.trim() : "";
+  const claimToken = typeof resultArguments.claim_token === "string" ? resultArguments.claim_token.trim() : "";
+  const executorId = typeof resultArguments.executor_id === "string" ? resultArguments.executor_id.trim() : "";
+  const result = typeof resultArguments.result === "string" ? resultArguments.result.trim() : "";
+  const note = typeof resultArguments.note === "string" ? resultArguments.note.trim() : "";
+  const observedStateId = typeof resultArguments.observed_state_id === "string" ? resultArguments.observed_state_id.trim() : "";
+  const observedStateVersion = normalizeStateVersion(resultArguments.observed_state_version, -1);
+  const allowedResults = new Set(["applied", "stale", "unsupported", "failed", "ignored_duplicate"]);
+
+  if (!latestAction || latestAction.submission_id !== submissionId) {
+    return {
+      ok: false,
+      status: "rejected",
+      error: "현재 제출 행동과 submission_id가 맞지 않습니다."
+    };
+  }
+
+  if (latestAction.claim_token !== claimToken) {
+    return {
+      ok: false,
+      status: "rejected",
+      error: "claim_token이 맞지 않습니다."
+    };
+  }
+
+  if (!allowedResults.has(result)) {
+    return {
+      ok: false,
+      status: "rejected",
+      error: "지원하지 않는 실행 결과입니다."
+    };
+  }
+
+  const reportedAt = toIsoString(new Date());
+  latestAction.execution_status = result;
+  latestAction.result = result;
+  latestAction.result_reported_at = reportedAt;
+  latestAction.result_executor_id = executorId || null;
+  latestAction.result_observed_state_id = observedStateId || null;
+  latestAction.result_observed_state_version = observedStateVersion >= 0 ? observedStateVersion : null;
+  latestAction.result_note = note || null;
+  updateLatestAction(state, "action_result_reported", {
+    submission_id: latestAction.submission_id,
+    claim_token: latestAction.claim_token,
+    executor_id: executorId || null,
+    result,
+    observed_state_id: observedStateId || null,
+    observed_state_version: observedStateVersion >= 0 ? observedStateVersion : null
+  });
+
+  return {
+    ok: true,
+    status: result,
+    latest_action: latestAction
   };
 }
 
@@ -459,6 +688,36 @@ function startHttpServer(state) {
         return;
       }
 
+      if (req.method === "POST" && requestUrl.pathname === "/action/claim") {
+        const body = await readJsonRequestBody(req, MAX_HTTP_BODY_BYTES);
+        if (!isPlainObject(body)) {
+          sendJson(res, 400, {
+            ok: false,
+            error: "행동 claim 본문은 JSON 객체여야 합니다."
+          });
+          return;
+        }
+
+        const claim = createActionClaim(state, body);
+        sendJson(res, 200, claim);
+        return;
+      }
+
+      if (req.method === "POST" && requestUrl.pathname === "/action/result") {
+        const body = await readJsonRequestBody(req, MAX_HTTP_BODY_BYTES);
+        if (!isPlainObject(body)) {
+          sendJson(res, 400, {
+            ok: false,
+            error: "행동 결과 본문은 JSON 객체여야 합니다."
+          });
+          return;
+        }
+
+        const result = createActionResult(state, body);
+        sendJson(res, result.ok ? 200 : 400, result);
+        return;
+      }
+
       sendJson(res, 404, {
         ok: false,
         error: "지원하지 않는 경로입니다."
@@ -498,7 +757,7 @@ function printUsage() {
     "  - 로컬 HTTP 서버만 실행한다.",
     "  - MCP 처리는 bridge/spiremind_mcp_proxy.js가 담당한다.",
     "  - 게임과 테스트가 전투 상태를 보내는 데 쓴다.",
-    "  - /state, /state/current, /action/submit, /action/latest, /health를 지원한다."
+    "  - /state, /state/current, /action/submit, /action/claim, /action/result, /action/latest, /health를 지원한다."
   ].join("\n"));
 }
 

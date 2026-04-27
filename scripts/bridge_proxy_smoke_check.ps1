@@ -225,6 +225,33 @@ try {
         throw "MCP 프록시 행동 제출이 유효하지 않습니다."
     }
 
+    $claimBody = [ordered]@{
+        executor_id = "smoke-test"
+        observed_state_id = $mcpSubmit.state_id
+        observed_state_version = [int]$mcpSubmit.state_version
+        supported_action_types = @("end_turn")
+    } | ConvertTo-Json -Compress
+
+    $claim = Invoke-RestMethod -Method Post -Uri "$BridgeUrl/action/claim" -ContentType "application/json; charset=utf-8" -Body $claimBody -TimeoutSec 5
+    if ($claim.status -ne "claimed") {
+        throw "행동 claim이 실패했습니다: $($claim.status)"
+    }
+
+    $resultBody = [ordered]@{
+        submission_id = $claim.action.submission_id
+        claim_token = $claim.claim_token
+        executor_id = "smoke-test"
+        result = "applied"
+        observed_state_id = $mcpSubmit.state_id
+        observed_state_version = [int]$mcpSubmit.state_version
+        note = "smoke test only"
+    } | ConvertTo-Json -Compress
+
+    $result = Invoke-RestMethod -Method Post -Uri "$BridgeUrl/action/result" -ContentType "application/json; charset=utf-8" -Body $resultBody -TimeoutSec 5
+    if ($result.status -ne "applied") {
+        throw "행동 결과 보고가 실패했습니다: $($result.status)"
+    }
+
     [pscustomobject]@{
         status = "PASS"
         bridge_url = $BridgeUrl
@@ -232,6 +259,8 @@ try {
         state_version = $current.state_version
         http_selected_action_id = $httpSubmit.latest_action.selected_action_id
         mcp_selected_action_id = $mcpSubmit.selected_action_id
+        claim_status = $claim.status
+        result_status = $result.status
     } | ConvertTo-Json -Depth 8
 } finally {
     if ($null -ne $startedBridge -and -not $KeepBridgeRunning -and -not $startedBridge.HasExited) {

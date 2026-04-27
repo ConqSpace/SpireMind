@@ -192,6 +192,7 @@ internal static class CombatStateBridgePoster
     private static int suppressedFailureLogs;
     private static string lastSuccessfulJson = string.Empty;
     private static string lastAttemptedJson = string.Empty;
+    private static PostedStateSnapshot? latestPostedState;
 
     internal static void ClearHistory()
     {
@@ -200,6 +201,12 @@ internal static class CombatStateBridgePoster
         suppressedFailureLogs = 0;
         lastSuccessfulJson = string.Empty;
         lastAttemptedJson = string.Empty;
+        latestPostedState = null;
+    }
+
+    internal static PostedStateSnapshot? GetLatestPostedState()
+    {
+        return Volatile.Read(ref latestPostedState);
     }
 
     public static void TryPost(string json)
@@ -262,6 +269,7 @@ internal static class CombatStateBridgePoster
                     HttpCompletionOption.ResponseHeadersRead,
                     timeoutSource.Token).ConfigureAwait(false);
                 response.EnsureSuccessStatusCode();
+                await RememberPostedStateAsync(response, json).ConfigureAwait(false);
             }
             else
             {
@@ -280,6 +288,7 @@ internal static class CombatStateBridgePoster
                     HttpCompletionOption.ResponseHeadersRead,
                     timeoutSource.Token).ConfigureAwait(false);
                 response.EnsureSuccessStatusCode();
+                await RememberPostedStateAsync(response, json).ConfigureAwait(false);
             }
 
             lastSuccessfulJson = json;
@@ -299,6 +308,27 @@ internal static class CombatStateBridgePoster
         {
             LogFailure(exception);
             return false;
+        }
+    }
+
+    private static async Task RememberPostedStateAsync(HttpResponseMessage response, string json)
+    {
+        string body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        try
+        {
+            StatePostResponse? parsed = JsonSerializer.Deserialize<StatePostResponse>(body);
+            if (parsed is null || !parsed.Ok)
+            {
+                return;
+            }
+
+            Volatile.Write(
+                ref latestPostedState,
+                new PostedStateSnapshot(parsed.StateId ?? string.Empty, parsed.StateVersion, json));
+        }
+        catch
+        {
+            // 브리지 응답 저장 실패는 다음 전송 때 다시 회복할 수 있다.
         }
     }
 
@@ -324,5 +354,19 @@ internal static class CombatStateBridgePoster
             Logger.Warning(
                 $"로컬 브리지로 combat_state.json 전송에 실패했습니다{suppressedText}. {exception.GetType().Name}: {exception.Message}");
         }
+    }
+
+    internal sealed record PostedStateSnapshot(string StateId, int StateVersion, string Json);
+
+    private sealed record StatePostResponse
+    {
+        [JsonPropertyName("ok")]
+        public bool Ok { get; init; }
+
+        [JsonPropertyName("state_version")]
+        public int StateVersion { get; init; }
+
+        [JsonPropertyName("state_id")]
+        public string? StateId { get; init; }
     }
 }

@@ -1,6 +1,8 @@
 using System.Collections;
 using System.Diagnostics;
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -20,7 +22,7 @@ internal static class CombatStateExporter
     };
 
     private static long lastExportAtMs;
-    private static string lastJson = string.Empty;
+    private static string lastStateFingerprint = string.Empty;
     private static bool hasLoggedOutputPath;
     private static object? recentPlayer;
     private static object? recentCombatState;
@@ -53,17 +55,30 @@ internal static class CombatStateExporter
         try
         {
             Dictionary<string, object?> state = BuildState(combatRoot);
+            string stateFingerprint = ComputeStateFingerprint(state);
+            state["state_id"] = $"combat_{stateFingerprint[..16]}";
+            state["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             string json = JsonSerializer.Serialize(state, JsonOptions);
-            if (json == lastJson)
+            if (stateFingerprint == lastStateFingerprint)
             {
+                CombatActionRuntimeContext.UpdateFromExport(combatRoot, json);
+                CombatStateBridgePoster.PostedStateSnapshot? postedState = CombatStateBridgePoster.GetLatestPostedState();
+                if (postedState is null || postedState.StateId != state["state_id"]?.ToString())
+                {
+                    CombatStateBridgePoster.TryPost(json);
+                }
+
+                CombatActionExecutor.Tick();
                 return;
             }
 
-            lastJson = json;
+            lastStateFingerprint = stateFingerprint;
             string outputPath = GetOutputPath();
             Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
             File.WriteAllText(outputPath, json);
+            CombatActionRuntimeContext.UpdateFromExport(combatRoot, json);
             CombatStateBridgePoster.TryPost(json);
+            CombatActionExecutor.Tick();
 
             if (!hasLoggedOutputPath)
             {
@@ -151,7 +166,7 @@ internal static class CombatStateExporter
         {
             ["schema_version"] = "combat_state.v1",
             ["phase"] = "combat_turn",
-            ["state_id"] = BuildStateId(),
+            ["state_id"] = "combat_pending",
             ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             ["run"] = BuildRun(combatRoot, graph),
             ["player"] = playerState,
@@ -197,10 +212,14 @@ internal static class CombatStateExporter
         };
     }
 
-    private static string BuildStateId()
+    private static string ComputeStateFingerprint(Dictionary<string, object?> state)
     {
-        long exportedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        return $"combat_{exportedAtMs}";
+        Dictionary<string, object?> comparableState = state
+            .Where(pair => pair.Key is not ("state_id" or "exported_at_ms" or "debug"))
+            .ToDictionary(pair => pair.Key, pair => pair.Value);
+        string json = JsonSerializer.Serialize(comparableState, JsonOptions);
+        byte[] hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(json));
+        return Convert.ToHexString(hashBytes).ToLowerInvariant();
     }
 
     private static Dictionary<string, object?> BuildRun(object combatRoot, ObjectGraph graph)

@@ -101,7 +101,7 @@ Codex가 고른 행동을 브리지에 저장한다.
 
 검증 결과는 `latest_action`으로 저장한다. 실패해도 기록은 남긴다.
 
-### R5 예정: `POST /action/claim`
+### `POST /action/claim`
 
 STS2 모드가 실행할 행동을 확보한다. 단순 조회가 아니라 claim을 쓰는 이유는 같은 `submission_id`를 여러 번 실행하지 않기 위해서다.
 
@@ -112,7 +112,7 @@ claim은 아래 조건을 만족할 때만 성공한다.
 - 모드가 보낸 `observed_state_id`와 `observed_state_version`이 행동의 상태와 맞다.
 - 모드가 해당 행동 타입을 지원한다.
 
-### R5 예정: `POST /action/result`
+### `POST /action/result`
 
 STS2 모드가 실행 결과를 보고한다.
 
