@@ -359,21 +359,23 @@ internal static class CombatStateExporter
         foreach (object card in EnumerateCards(source))
         {
             string fallbackName = GetReadableName(card);
+            object? cardStats = FindMemberValue(card, "cardStats", "_cardStats", "stats", "_stats");
+            object? cardInfo = FindMemberValue(card, "cardInfo", "_cardInfo", "info", "_info", "baseCard", "_baseCard");
             cards.Add(new Dictionary<string, object?>
             {
                 ["instance_id"] = $"{pileName}_{index}",
-                ["card_id"] = ReadString(card, "id", "cardId", "key") ?? fallbackName,
-                ["name"] = ReadString(card, "name", "displayName", "title") ?? fallbackName,
-                ["type"] = ReadString(card, "type", "cardType", "_cardType"),
-                ["cost"] = ReadInt(card, "cost", "_cost", "currentCost", "_currentCost", "energyCost", "_energyCost"),
-                ["base_cost"] = ReadInt(card, "baseCost", "_baseCost", "baseEnergyCost", "_baseEnergyCost"),
+                ["card_id"] = ReadFirstString(new[] { card, cardInfo }, "id", "_id", "cardId", "_cardId", "key", "_key") ?? fallbackName,
+                ["name"] = ReadFirstString(new[] { card, cardInfo }, "name", "_name", "displayName", "_displayName", "title", "_title") ?? fallbackName,
+                ["type"] = ReadFirstString(new[] { card, cardInfo, cardStats }, "type", "_type", "cardType", "_cardType"),
+                ["cost"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "cost", "_cost", "currentCost", "_currentCost", "energyCost", "_energyCost", "calculatedEnergy", "_calculatedEnergy", "calculatedEnergyKey", "_calculatedEnergyKey"),
+                ["base_cost"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "baseCost", "_baseCost", "baseEnergyCost", "_baseEnergyCost", "energyCost", "_energyCost"),
                 ["upgraded"] = ReadBool(card, "upgraded", "isUpgraded"),
                 ["playable"] = ReadBool(card, "playable", "canPlay", "isPlayable"),
-                ["target_type"] = ReadString(card, "targetType", "_targetType", "target", "_target", "cardTarget", "_cardTarget"),
-                ["damage"] = ReadInt(card, "damage", "_damage", "baseDamage", "_baseDamage", "currentDamage", "_currentDamage", "attackDamage", "_attackDamage"),
-                ["block"] = ReadInt(card, "block", "_block", "baseBlock", "_baseBlock", "currentBlock", "_currentBlock"),
-                ["hits"] = ReadInt(card, "hits", "_hits", "times", "_times", "attackCount", "_attackCount", "repeatCount", "_repeatCount", "hitCount", "_hitCount"),
-                ["description"] = ReadString(card, "description", "_description", "desc", "_desc", "rawDescription", "_rawDescription", "text", "_text", "descriptionLoc", "_descriptionLoc")
+                ["target_type"] = ReadFirstString(new[] { card, cardInfo, cardStats }, "targetType", "_targetType", "target", "_target", "cardTarget", "_cardTarget"),
+                ["damage"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "damage", "_damage", "baseDamage", "_baseDamage", "currentDamage", "_currentDamage", "attackDamage", "_attackDamage", "damageVar", "_damageVar", "calculatedDamage", "_calculatedDamage", "calculatedDamageVar", "_calculatedDamageVar"),
+                ["block"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "block", "_block", "baseBlock", "_baseBlock", "currentBlock", "_currentBlock", "blockVar", "_blockVar", "calculatedBlock", "_calculatedBlock"),
+                ["hits"] = ReadFirstInt(new[] { card, cardStats, cardInfo }, "hits", "_hits", "times", "_times", "attackCount", "_attackCount", "repeatCount", "_repeatCount", "hitCount", "_hitCount", "calculatedHits", "_calculatedHits", "calculatedHitsKey", "_calculatedHitsKey"),
+                ["description"] = ReadFirstString(new[] { card, cardInfo, cardStats }, "description", "_description", "desc", "_desc", "rawDescription", "_rawDescription", "text", "_text", "descriptionLoc", "_descriptionLoc", "descriptionText", "_descriptionText")
             });
             index++;
         }
@@ -865,13 +867,80 @@ internal static class CombatStateExporter
 
     private static Dictionary<string, object?> BuildIntent(object enemy)
     {
-        object? intent = FindMemberValue(enemy, "intent", "currentIntent", "move", "currentMove", "nextMove");
-        int? damage = ReadInt(intent, "damage", "Damage", "baseDamage", "BaseDamage", "damageCalc", "DamageCalc", "attackDamage")
-            ?? ReadInt(enemy, "intentDamage", "moveDamage", "damage", "Damage");
-        int? hits = ReadInt(intent, "hits", "Hits", "repeats", "Repeats", "times", "attackCount")
-            ?? ReadInt(enemy, "intentHits", "moveHits", "hits", "repeats");
-        int? totalDamage = ReadInt(intent, "totalDamage", "TotalDamage")
-            ?? ReadInt(enemy, "intentTotalDamage", "moveTotalDamage", "totalDamage");
+        object? intent = FindMemberValue(
+            enemy,
+            "intent",
+            "_intent",
+            "Intent",
+            "currentIntent",
+            "_currentIntent",
+            "move",
+            "_move",
+            "Move",
+            "currentMove",
+            "_currentMove",
+            "nextMove",
+            "_nextMove",
+            "NextMove",
+            "cardIntent",
+            "_cardIntent",
+            "CardIntent");
+        object? move = FindMemberValue(intent, "move", "_move", "Move", "nextMove", "_nextMove", "NextMove")
+            ?? FindMemberValue(enemy, "move", "_move", "Move", "nextMove", "_nextMove", "NextMove");
+        object? damageCalc = FindMemberValue(intent, "damageCalc", "_damageCalc", "DamageCalc", "damage", "_damage")
+            ?? FindMemberValue(move, "damageCalc", "_damageCalc", "DamageCalc", "damage", "_damage");
+        object? repeatCalc = FindMemberValue(intent, "repeatCalc", "_repeatCalc", "RepeatCalc", "repeat", "_repeat", "hits", "_hits")
+            ?? FindMemberValue(move, "repeatCalc", "_repeatCalc", "RepeatCalc", "repeat", "_repeat", "hits", "_hits");
+
+        int? damage = ReadFirstInt(
+            new[] { intent, move, damageCalc, enemy },
+            "damage",
+            "_damage",
+            "Damage",
+            "baseDamage",
+            "_baseDamage",
+            "BaseDamage",
+            "damageCalc",
+            "_damageCalc",
+            "DamageCalc",
+            "attackDamage",
+            "_attackDamage",
+            "damageAmount",
+            "_damageAmount",
+            "damagePerHit",
+            "_damagePerHit",
+            "intentDamage",
+            "_intentDamage",
+            "moveDamage",
+            "_moveDamage");
+        int? hits = ReadFirstInt(
+            new[] { intent, move, repeatCalc, enemy },
+            "hits",
+            "_hits",
+            "Hits",
+            "repeats",
+            "_repeats",
+            "Repeats",
+            "times",
+            "_times",
+            "attackCount",
+            "_attackCount",
+            "hitCount",
+            "_hitCount",
+            "intentHits",
+            "_intentHits",
+            "moveHits",
+            "_moveHits");
+        int? totalDamage = ReadFirstInt(
+            new[] { intent, move, enemy },
+            "totalDamage",
+            "_totalDamage",
+            "TotalDamage",
+            "intentTotalDamage",
+            "_intentTotalDamage",
+            "moveTotalDamage",
+            "_moveTotalDamage",
+            "total_damage");
 
         if (totalDamage is null && damage is not null && hits is not null)
         {
@@ -881,10 +950,28 @@ internal static class CombatStateExporter
         int damageValue = damage ?? 0;
         int hitsValue = hits ?? (damageValue > 0 ? 1 : 0);
         int totalDamageValue = totalDamage ?? (damageValue > 0 && hitsValue > 0 ? damageValue * hitsValue : 0);
-        int blockValue = ReadInt(intent, "block", "Block", "baseBlock", "BaseBlock", "shield")
-            ?? ReadInt(enemy, "intentBlock", "moveBlock", "blockGain")
+        int blockValue = ReadFirstInt(
+            new[] { intent, move, enemy },
+            "block",
+            "_block",
+            "Block",
+            "baseBlock",
+            "_baseBlock",
+            "BaseBlock",
+            "shield",
+            "_shield",
+            "intentBlock",
+            "_intentBlock",
+            "moveBlock",
+            "_moveBlock",
+            "blockGain",
+            "_blockGain",
+            "blockAmount",
+            "_blockAmount")
             ?? 0;
-        string? rawIntent = intent is null ? null : GetReadableName(intent);
+        string? rawIntent = intent is null
+            ? (move is null ? null : GetReadableName(move))
+            : GetReadableName(intent);
 
         return new Dictionary<string, object?>
         {
@@ -895,7 +982,7 @@ internal static class CombatStateExporter
             ["total_damage"] = totalDamageValue,
             ["block"] = blockValue,
             ["applied_powers"] = BuildIntentAppliedPowers(intent),
-            ["description"] = ReadString(intent, "description", "desc", "tooltip", "toolTip"),
+            ["description"] = ReadFirstString(new[] { intent, move }, "description", "_description", "desc", "_desc", "tooltip", "_tooltip", "toolTip", "_toolTip", "moveName", "_moveName"),
             ["damage_is_adjusted"] = null,
             ["damage_source"] = damage is null && hits is null && totalDamage is null
                 ? "unavailable"
@@ -1094,6 +1181,20 @@ internal static class CombatStateExporter
         {
             int? value = ReadInt(source, names);
             if (value is not null)
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? ReadFirstString(IEnumerable<object?> sources, params string[] names)
+    {
+        foreach (object? source in sources)
+        {
+            string? value = ReadString(source, names);
+            if (!string.IsNullOrWhiteSpace(value))
             {
                 return value;
             }
