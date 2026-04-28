@@ -388,6 +388,137 @@ function countLiveEnemies(stateSummary) {
   }).length;
 }
 
+function sumKnownEnemyHp(enemies) {
+  if (!Array.isArray(enemies)) {
+    return null;
+  }
+
+  let total = 0;
+  let foundKnownHp = false;
+  for (const enemy of enemies) {
+    if (!isPlainObject(enemy)) {
+      continue;
+    }
+
+    const hp = readNumber(enemy.hp);
+    if (hp !== null) {
+      total += Math.max(0, hp);
+      foundKnownHp = true;
+    }
+  }
+
+  return foundKnownHp ? total : null;
+}
+
+function createEnemyStateKey(enemy, index) {
+  if (!isPlainObject(enemy)) {
+    return `index:${index}`;
+  }
+
+  const combatId = readNumber(enemy.combat_id);
+  if (combatId !== null) {
+    return `combat:${combatId}`;
+  }
+
+  const name = typeof enemy.name === "string" && enemy.name.trim() !== ""
+    ? enemy.name.trim()
+    : "unknown";
+  return `name:${name}:${index}`;
+}
+
+function summarizeEnemyHpChanges(beforeEnemies, afterEnemies) {
+  const afterByKey = new Map();
+  const normalizedAfterEnemies = Array.isArray(afterEnemies) ? afterEnemies : [];
+  normalizedAfterEnemies.forEach((enemy, index) => {
+    afterByKey.set(createEnemyStateKey(enemy, index), enemy);
+  });
+
+  const changes = [];
+  const normalizedBeforeEnemies = Array.isArray(beforeEnemies) ? beforeEnemies : [];
+  normalizedBeforeEnemies.forEach((beforeEnemy, index) => {
+    if (!isPlainObject(beforeEnemy)) {
+      return;
+    }
+
+    const beforeCombatId = readNumber(beforeEnemy.combat_id);
+    const afterEnemy = afterByKey.get(createEnemyStateKey(beforeEnemy, index)) || null;
+    const afterCombatId = afterEnemy ? readNumber(afterEnemy.combat_id) : null;
+    const beforeHp = readNumber(beforeEnemy.hp);
+    const rawAfterHp = afterEnemy ? readNumber(afterEnemy.hp) : null;
+    if (beforeCombatId === null && afterCombatId === null && beforeHp === null && rawAfterHp === null) {
+      return;
+    }
+
+    const afterHp = afterEnemy ? rawAfterHp : (beforeHp !== null ? 0 : null);
+    const hpLost = beforeHp !== null && afterHp !== null
+      ? Math.max(0, beforeHp - afterHp)
+      : null;
+
+    changes.push({
+      combat_id: beforeCombatId,
+      name: typeof beforeEnemy.name === "string" ? beforeEnemy.name : null,
+      hp_before: beforeHp,
+      hp_after: afterHp,
+      hp_lost: hpLost,
+      defeated: beforeHp !== null && beforeHp > 0 && afterHp !== null && afterHp <= 0
+    });
+  });
+
+  return changes;
+}
+
+function buildStateDelta(beforeSummary, afterSummary) {
+  if (!isPlainObject(beforeSummary) || !isPlainObject(afterSummary)) {
+    return null;
+  }
+
+  const playerHpBefore = readNumber(beforeSummary.player && beforeSummary.player.hp);
+  const playerHpAfter = readNumber(afterSummary.player && afterSummary.player.hp);
+  const playerBlockBefore = readNumber(beforeSummary.player && beforeSummary.player.block);
+  const playerBlockAfter = readNumber(afterSummary.player && afterSummary.player.block);
+  const playerEnergyBefore = readNumber(beforeSummary.player && beforeSummary.player.energy);
+  const playerEnergyAfter = readNumber(afterSummary.player && afterSummary.player.energy);
+  const totalEnemyHpBefore = sumKnownEnemyHp(beforeSummary.enemies);
+  const totalEnemyHpAfter = sumKnownEnemyHp(afterSummary.enemies);
+  const enemyHpChanges = summarizeEnemyHpChanges(beforeSummary.enemies, afterSummary.enemies);
+
+  return {
+    state_version_before: beforeSummary.state_version,
+    state_version_after: afterSummary.state_version,
+    state_id_before: beforeSummary.state_id,
+    state_id_after: afterSummary.state_id,
+    phase_before: beforeSummary.phase,
+    phase_after: afterSummary.phase,
+    player: {
+      hp_before: playerHpBefore,
+      hp_after: playerHpAfter,
+      hp_lost: playerHpBefore !== null && playerHpAfter !== null
+        ? Math.max(0, playerHpBefore - playerHpAfter)
+        : null,
+      block_before: playerBlockBefore,
+      block_after: playerBlockAfter,
+      block_delta: playerBlockBefore !== null && playerBlockAfter !== null
+        ? playerBlockAfter - playerBlockBefore
+        : null,
+      energy_before: playerEnergyBefore,
+      energy_after: playerEnergyAfter,
+      energy_spent: playerEnergyBefore !== null && playerEnergyAfter !== null
+        ? Math.max(0, playerEnergyBefore - playerEnergyAfter)
+        : null
+    },
+    hand_count_before: Array.isArray(beforeSummary.hand) ? beforeSummary.hand.length : null,
+    hand_count_after: Array.isArray(afterSummary.hand) ? afterSummary.hand.length : null,
+    live_enemy_count_before: countLiveEnemies(beforeSummary),
+    live_enemy_count_after: countLiveEnemies(afterSummary),
+    total_enemy_hp_before: totalEnemyHpBefore,
+    total_enemy_hp_after: totalEnemyHpAfter,
+    enemy_hp_lost: totalEnemyHpBefore !== null && totalEnemyHpAfter !== null
+      ? Math.max(0, totalEnemyHpBefore - totalEnemyHpAfter)
+      : null,
+    enemies: enemyHpChanges
+  };
+}
+
 function classifyCombatReadiness(snapshot) {
   const stateSummary = summarizeState(snapshot);
   const phase = typeof stateSummary.phase === "string" ? stateSummary.phase.trim() : "";
@@ -700,7 +831,7 @@ function createDecisionSubmittedEvent(options, decisionId, stateSummary, decisio
   };
 }
 
-function createActionResultObservedEvent(options, decisionId, finalLatest, finalStatus) {
+function createActionResultObservedEvent(options, decisionId, finalLatest, finalStatus, afterStateSummary, stateDelta) {
   const latestAction = finalLatest && isPlainObject(finalLatest.latest_action) ? finalLatest.latest_action : null;
   const actionPlan = finalLatest && isPlainObject(finalLatest.action_plan) ? finalLatest.action_plan : null;
   return {
@@ -715,7 +846,9 @@ function createActionResultObservedEvent(options, decisionId, finalLatest, final
     action_type: latestAction ? latestAction.action_type || null : null,
     plan_id: actionPlan ? actionPlan.plan_id || null : null,
     plan_status: actionPlan ? actionPlan.status || null : null,
-    completed_count: actionPlan && Array.isArray(actionPlan.completed) ? actionPlan.completed.length : null
+    completed_count: actionPlan && Array.isArray(actionPlan.completed) ? actionPlan.completed.length : null,
+    after_state_summary: afterStateSummary || null,
+    state_delta: stateDelta || null
   };
 }
 
@@ -799,6 +932,10 @@ function hasPendingAction(snapshot) {
 }
 
 function readNumber(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
@@ -1099,6 +1236,7 @@ async function main() {
             state_version: stateVersion,
             state_summary: stateSummary,
             latest_state_summary: latestBeforeSubmitSummary,
+            latest_state_delta: buildStateDelta(stateSummary, latestBeforeSubmitSummary),
             play_session_id: options.playSessionId,
             combat_observed: combatObserved,
             decision,
@@ -1180,6 +1318,18 @@ async function main() {
         : (finalLatestAction && typeof finalLatestAction.result === "string" ? finalLatestAction.result : null)
           || (finalLatestAction && typeof finalLatestAction.execution_status === "string" ? finalLatestAction.execution_status : null)
           || "submitted";
+      let afterStateSummary = null;
+      let stateDelta = null;
+      let afterStateError = null;
+      if (finalLatest) {
+        try {
+          const afterSnapshot = await getCurrentState(options.bridgeUrl, options.timeoutMs);
+          afterStateSummary = summarizeState(afterSnapshot);
+          stateDelta = buildStateDelta(stateSummary, afterStateSummary);
+        } catch (error) {
+          afterStateError = error instanceof Error ? error.message : String(error);
+        }
+      }
       const record = {
         event_type: "decision_recorded",
         decision_id: decisionId,
@@ -1195,6 +1345,9 @@ async function main() {
         action_plan: submitted.action_plan || null,
         final_latest_action: finalLatest ? finalLatest.latest_action || null : null,
         final_action_plan: finalPlan,
+        after_state_summary: afterStateSummary,
+        state_delta: stateDelta,
+        after_state_error: afterStateError,
         wait_error: waitError ? waitError.message : null,
         decision_ms: decisionMs
       };
@@ -1203,7 +1356,7 @@ async function main() {
         updateMetrics(runLogDir, record);
       }
       if (finalLatest) {
-        appendCombatLog(runLogDir, createActionResultObservedEvent(options, decisionId, finalLatest, finalStatus));
+        appendCombatLog(runLogDir, createActionResultObservedEvent(options, decisionId, finalLatest, finalStatus, afterStateSummary, stateDelta));
       }
       if (waitError) {
         throw waitError;

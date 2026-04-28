@@ -257,6 +257,15 @@ try {
         throw "combat_log.jsonl이 생성되지 않았습니다."
     }
 
+    $decisionRecords = @(Get-Content -Encoding UTF8 $decisionsPath | ForEach-Object { $_ | ConvertFrom-Json })
+    $waitDecisionRecord = $decisionRecords | Select-Object -First 1
+    if ($null -eq $waitDecisionRecord.after_state_summary -or $null -eq $waitDecisionRecord.state_delta) {
+        throw "decisions.jsonl에 판단 전후 상태 요약과 변화량이 기록되지 않았습니다."
+    }
+    if ($null -eq $waitDecisionRecord.state_delta.player -or $null -eq $waitDecisionRecord.state_delta.enemies) {
+        throw "state_delta에 플레이어 변화와 적 변화가 기록되지 않았습니다."
+    }
+
     $metrics = Get-Content -Raw -Encoding UTF8 $metricsPath | ConvertFrom-Json
     if ($metrics.submitted_decisions -lt 1 -or $metrics.actions_applied -lt 1) {
         throw "metrics.json에 제출과 실행 지표가 기록되지 않았습니다."
@@ -273,6 +282,9 @@ try {
     $combatLogText = Get-Content -Raw -Encoding UTF8 $combatLogPath
     if ($combatLogText -notmatch '"event_type":"combat_observed"' -or $combatLogText -notmatch '"event_type":"decision_submitted"' -or $combatLogText -notmatch '"event_type":"action_result_observed"') {
         throw "combat_log.jsonl에 필요한 최소 이벤트가 기록되지 않았습니다."
+    }
+    if ($combatLogText -notmatch '"state_delta"') {
+        throw "combat_log.jsonl에 판단 전후 변화량이 기록되지 않았습니다."
     }
 
     $combatStopState = $combatStateJson | ConvertFrom-Json
@@ -382,6 +394,7 @@ try {
         run_log_dir = $runLogDir
         metrics = $metrics
         scenario_id = $scenarioConfig.scenario_id
+        state_delta = $waitDecisionRecord.state_delta
         combat_stop_reason = $combatStop.reason
         submitted_action = $latest.latest_action.selected_action_id
         stale_retry_status = $staleClaim.status
