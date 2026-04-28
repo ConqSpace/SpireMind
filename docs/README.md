@@ -50,3 +50,10 @@
 - 카드 사용 가능 여부, 대상 가능 여부, 에너지 부족 여부는 모드가 판단한다.
 - 같은 입력 JSON과 같은 모델 설정이면 같은 실험을 다시 실행할 수 있어야 한다.
 - 실패한 응답도 버리지 않는다. 실패 자체가 실험 결과다.
+
+## 로컬 빌드 설정
+
+- `src/SpireMindMod/SpireMind.Local.props.example`을 같은 폴더의 `SpireMind.Local.props`로 복사한다.
+- `Sts2AssemblyPath`는 로컬 STS2 `sts2.dll` 경로로 설정한다.
+- `Sts2GameDataPath`는 로컬 STS2 `data_sts2_windows_x86_64` 폴더로 설정한다. 이 값으로 `GodotSharp.dll` 참조를 찾는다.
+- `SpireMind.Local.props`는 개인 PC 경로를 담기 때문에 Git에 커밋하지 않는다.

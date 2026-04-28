@@ -14,6 +14,8 @@ internal static class CombatStateExporter
     private const int ExportIntervalMs = 250;
     private const int MaxSearchDepth = 5;
     private const int MaxVisitedObjects = 600;
+    private const int MaxSafeJsonDepth = 12;
+    private const int MaxSafeJsonListItems = 200;
     private static readonly bool EnableUnsafeUiHandDebug = false;
     private static readonly string[] PowerSourceMemberNames =
     {
@@ -95,6 +97,63 @@ internal static class CombatStateExporter
         return recentPlayer;
     }
 
+    internal static CombatExportProbe ForceExportFromCombatManager(string reason)
+    {
+        try
+        {
+            object? combatManager = GetCombatManagerInstance();
+            bool isInProgress = ReadBool(combatManager, "IsInProgress") == true;
+            object? combatState = ReadCombatManagerDebugState(combatManager);
+            if (combatState is null)
+            {
+                return new CombatExportProbe(false, false, false, false, false, null, null, 0, 0, "combat_state_null");
+            }
+
+            RememberObservedRoot(combatState);
+            Dictionary<string, object?>? state = ExportNow(combatState, force: true, tickAfterExport: false);
+            return BuildExportProbe(state, isInProgress, "forced:" + reason);
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"강제 전투 상태 export 중 예외가 발생했습니다. 게임 진행은 멈추지 않습니다. {exception.GetType().Name}: {exception.Message}");
+            return new CombatExportProbe(false, false, false, false, false, null, null, 0, 0, exception.GetType().Name);
+        }
+    }
+
+    internal static CombatExportProbe ReadLatestStateFileProbe(string reason)
+    {
+        string outputPath = GetOutputPath();
+        try
+        {
+            if (!File.Exists(outputPath))
+            {
+                return new CombatExportProbe(false, false, false, false, false, null, null, 0, 0, "state_file_missing");
+            }
+
+            string json = File.ReadAllText(outputPath, Encoding.UTF8);
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return new CombatExportProbe(false, false, false, false, false, null, null, 0, 0, "state_file_empty");
+            }
+
+            using JsonDocument document = JsonDocument.Parse(json);
+            JsonElement root = document.RootElement;
+            int? hp = ReadJsonInt(root, "player", "hp");
+            int? energy = ReadJsonInt(root, "player", "energy");
+            int handCount = ReadJsonArrayCount(root, "piles", "hand");
+            int enemyCount = ReadJsonArrayCount(root, "enemies");
+            bool hasPlayer = hp is not null && energy is not null;
+            bool hasHand = handCount >= 1;
+            bool hasEnemies = enemyCount >= 1;
+            return new CombatExportProbe(false, true, hasPlayer, hasHand, hasEnemies, hp, energy, handCount, enemyCount, "file:" + reason);
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"최신 combat_state.json 준비 판정 중 예외가 발생했습니다. 게임 진행은 멈추지 않습니다. path={outputPath}, {exception.GetType().Name}: {exception.Message}");
+            return new CombatExportProbe(false, false, false, false, false, null, null, 0, 0, "state_file_" + exception.GetType().Name);
+        }
+    }
+
     private static void TryExport(object combatRoot)
     {
 
@@ -112,17 +171,18 @@ internal static class CombatStateExporter
             string stateFingerprint = ComputeStateFingerprint(state);
             state["state_id"] = $"combat_{stateFingerprint[..16]}";
             state["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            string json = JsonSerializer.Serialize(state, JsonOptions);
+            Dictionary<string, object?> safeState = NormalizeStateForJson(state, "combat_state");
+            string json = JsonSerializer.Serialize(safeState, JsonOptions);
             if (stateFingerprint == lastStateFingerprint)
             {
                 CombatActionRuntimeContext.UpdateFromExport(combatRoot, json);
                 CombatStateBridgePoster.PostedStateSnapshot? postedState = CombatStateBridgePoster.GetLatestPostedState();
-                if (postedState is null || postedState.StateId != state["state_id"]?.ToString())
+                if (postedState is null || postedState.StateId != safeState["state_id"]?.ToString())
                 {
                     CombatStateBridgePoster.TryPost(json);
                 }
 
-                CombatActionExecutor.Tick();
+                CombatActionExecutor.TickMainThread();
                 return;
             }
 
@@ -132,7 +192,7 @@ internal static class CombatStateExporter
             File.WriteAllText(outputPath, json);
             CombatActionRuntimeContext.UpdateFromExport(combatRoot, json);
             CombatStateBridgePoster.TryPost(json);
-            CombatActionExecutor.Tick();
+            CombatActionExecutor.TickMainThread();
 
             if (!hasLoggedOutputPath)
             {
@@ -144,6 +204,80 @@ internal static class CombatStateExporter
         {
             Logger.Warning($"전투 상태 추출에 실패했습니다. 게임 진행은 멈추지 않습니다. {exception.GetType().Name}: {exception.Message}");
         }
+    }
+
+    private static Dictionary<string, object?>? ExportNow(object combatRoot, bool force, bool tickAfterExport = true)
+    {
+        Dictionary<string, object?> state = BuildState(combatRoot);
+        string stateFingerprint = ComputeStateFingerprint(state);
+        state["state_id"] = $"combat_{stateFingerprint[..16]}";
+        state["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        Dictionary<string, object?> safeState = NormalizeStateForJson(state, "combat_state");
+        string json = JsonSerializer.Serialize(safeState, JsonOptions);
+        if (!force && stateFingerprint == lastStateFingerprint)
+        {
+            CombatActionRuntimeContext.UpdateFromExport(combatRoot, json);
+            CombatStateBridgePoster.PostedStateSnapshot? postedState = CombatStateBridgePoster.GetLatestPostedState();
+            if (postedState is null || postedState.StateId != safeState["state_id"]?.ToString())
+            {
+                CombatStateBridgePoster.TryPost(json);
+            }
+
+            if (tickAfterExport)
+            {
+                CombatActionExecutor.TickMainThread();
+            }
+
+            return safeState;
+        }
+
+        lastStateFingerprint = stateFingerprint;
+        string outputPath = GetOutputPath();
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        File.WriteAllText(outputPath, json);
+        CombatActionRuntimeContext.UpdateFromExport(combatRoot, json);
+        CombatStateBridgePoster.TryPost(json);
+        if (tickAfterExport)
+        {
+            CombatActionExecutor.TickMainThread();
+        }
+
+        if (!hasLoggedOutputPath)
+        {
+            hasLoggedOutputPath = true;
+            Logger.Info($"combat_state.v1 출력 경로: {outputPath}");
+        }
+
+        return safeState;
+    }
+
+    private static CombatExportProbe BuildExportProbe(Dictionary<string, object?>? state, bool isInProgress, string reason)
+    {
+        if (state is null)
+        {
+            return new CombatExportProbe(isInProgress, false, false, false, false, null, null, 0, 0, reason);
+        }
+
+        Dictionary<string, object?> player = ReadDictionary(state, "player");
+        Dictionary<string, object?> piles = ReadDictionary(state, "piles");
+        int? hp = ReadDictionaryInt(player, "hp");
+        int? energy = ReadDictionaryInt(player, "energy");
+        int handCount = ReadDictionaryList(piles, "hand").Count;
+        int enemyCount = ReadDictionaryList(state, "enemies").Count;
+        bool hasPlayer = hp is not null && energy is not null;
+        bool hasHand = handCount > 0;
+        bool hasEnemies = enemyCount > 0;
+        return new CombatExportProbe(isInProgress, true, hasPlayer, hasHand, hasEnemies, hp, energy, handCount, enemyCount, reason);
+    }
+
+    private static object? GetCombatManagerInstance()
+    {
+        return GetStaticPropertyValue("MegaCrit.Sts2.Core.Combat.CombatManager", "Instance");
+    }
+
+    private static object? ReadCombatManagerDebugState(object? combatManager)
+    {
+        return TryInvokeMethod(combatManager, "DebugOnlyGetState");
     }
 
     private static void RememberObservedRoot(object instance)
@@ -207,12 +341,19 @@ internal static class CombatStateExporter
 
     private static Dictionary<string, object?> BuildState(object currentRoot)
     {
-        List<object> roots = GetExportRoots(currentRoot);
+        object? managerCombatState = ReadCombatManagerDebugState(GetCombatManagerInstance());
+        if (managerCombatState is not null)
+        {
+            RememberObservedRoot(managerCombatState);
+        }
+
+        List<object> roots = GetExportRoots(currentRoot, managerCombatState);
         ObjectGraph graph = ObjectGraph.Collect(roots, MaxSearchDepth, MaxVisitedObjects);
-        object? combatRoot = recentCombatState ?? currentRoot;
-        object? player = recentPlayerCombatState
+        object? combatRoot = managerCombatState ?? recentCombatState ?? currentRoot;
+        object? player = ResolveRuntimePlayer(combatRoot, graph)
             ?? recentPlayer
-            ?? FindFirst(graph, "PlayerCombatState", "Player");
+            ?? recentPlayerCombatState
+            ?? FindFirst(graph, "Player", "PlayerCombatState");
         object? enemiesSource = FindMemberValue(combatRoot, "enemies", "monsters", "creatures")
             ?? FindFirstEnumerable(graph, "enemies", "monsters");
         object? relicsSource = FindMemberValue(combatRoot, "relics")
@@ -240,9 +381,10 @@ internal static class CombatStateExporter
         };
     }
 
-    private static List<object> GetExportRoots(object currentRoot)
+    private static List<object> GetExportRoots(object currentRoot, object? managerCombatState)
     {
         List<object> roots = new();
+        AddRoot(roots, managerCombatState);
         AddRoot(roots, currentRoot);
         AddRoot(roots, recentCombatState);
         AddRoot(roots, recentPlayerCombatState);
@@ -263,6 +405,26 @@ internal static class CombatStateExporter
         }
 
         roots.Add(root);
+    }
+
+    private static object? ResolveRuntimePlayer(object? combatRoot, ObjectGraph graph)
+    {
+        object? players = FindMemberValue(combatRoot, "Players", "players", "_players");
+        object? directPlayer = EnumerateObjects(players)
+            .FirstOrDefault(value => IsRuntimePlayerType(value.GetType().FullName ?? value.GetType().Name));
+        if (directPlayer is not null)
+        {
+            recentPlayer = directPlayer;
+            object? playerCombatState = FindMemberValue(directPlayer, "PlayerCombatState", "playerCombatState", "_playerCombatState");
+            if (playerCombatState is not null)
+            {
+                recentPlayerCombatState = playerCombatState;
+            }
+
+            return directPlayer;
+        }
+
+        return FindFirstRuntimePlayer(graph);
     }
 
     private static Dictionary<string, object?> BuildDebug(
@@ -543,9 +705,114 @@ internal static class CombatStateExporter
         Dictionary<string, object?> comparableState = state
             .Where(pair => pair.Key is not ("state_id" or "exported_at_ms" or "debug"))
             .ToDictionary(pair => pair.Key, pair => pair.Value);
-        string json = JsonSerializer.Serialize(comparableState, JsonOptions);
+        Dictionary<string, object?> safeComparableState = NormalizeStateForJson(comparableState, "combat_state_fingerprint");
+        string json = JsonSerializer.Serialize(safeComparableState, JsonOptions);
         byte[] hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(json));
         return Convert.ToHexString(hashBytes).ToLowerInvariant();
+    }
+
+    private static Dictionary<string, object?> NormalizeStateForJson(Dictionary<string, object?> state, string path)
+    {
+        object? normalized = NormalizeJsonValue(state, path, 0);
+        if (normalized is Dictionary<string, object?> dictionary)
+        {
+            return dictionary;
+        }
+
+        Logger.Warning($"{path} 정규화 결과가 JSON 객체가 아닙니다. 빈 상태로 대체합니다.");
+        return new Dictionary<string, object?>();
+    }
+
+    private static object? NormalizeJsonValue(object? value, string path, int depth)
+    {
+        if (value is null)
+        {
+            return null;
+        }
+
+        if (depth > MaxSafeJsonDepth)
+        {
+            Logger.Warning($"{path} 값이 JSON 정규화 깊이 제한을 넘었습니다. 문자열로 대체합니다.");
+            return "[max_depth]";
+        }
+
+        if (value is string or bool)
+        {
+            return value;
+        }
+
+        if (value is char character)
+        {
+            return character.ToString();
+        }
+
+        if (value is byte or sbyte or short or ushort or int or uint or long or ulong or float or double or decimal)
+        {
+            return value;
+        }
+
+        if (value is Enum)
+        {
+            return value.ToString();
+        }
+
+        if (value is DateTime dateTime)
+        {
+            return dateTime.ToString("O");
+        }
+
+        if (value is DateTimeOffset dateTimeOffset)
+        {
+            return dateTimeOffset.ToString("O");
+        }
+
+        if (value is Delegate)
+        {
+            Logger.Warning($"{path} 필드에 Delegate가 있어 문자열 설명으로 대체했습니다. type={value.GetType().FullName}");
+            return $"[unsupported_delegate:{value.GetType().FullName ?? value.GetType().Name}]";
+        }
+
+        if (value is IntPtr or UIntPtr)
+        {
+            Logger.Warning($"{path} 필드에 포인터 값이 있어 문자열 설명으로 대체했습니다. type={value.GetType().FullName}");
+            return $"[unsupported_pointer:{value.GetType().FullName ?? value.GetType().Name}]";
+        }
+
+        if (value is IDictionary dictionary)
+        {
+            Dictionary<string, object?> result = new(StringComparer.Ordinal);
+            foreach (DictionaryEntry entry in dictionary)
+            {
+                string key = entry.Key?.ToString() ?? "null";
+                result[key] = NormalizeJsonValue(entry.Value, $"{path}.{key}", depth + 1);
+            }
+
+            return result;
+        }
+
+        if (value is IEnumerable enumerable and not string)
+        {
+            List<object?> result = new();
+            int index = 0;
+            foreach (object? item in enumerable)
+            {
+                if (index >= MaxSafeJsonListItems)
+                {
+                    Logger.Warning($"{path} 목록이 {MaxSafeJsonListItems}개를 넘어 나머지를 잘랐습니다.");
+                    break;
+                }
+
+                result.Add(NormalizeJsonValue(item, $"{path}[{index}]", depth + 1));
+                index++;
+            }
+
+            return result;
+        }
+
+        // 원시 게임 객체와 Godot Object 계열은 JsonSerializer에 넘기지 않는다.
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        Logger.Warning($"{path} 필드에 JSON 안전 타입이 아닌 객체가 있어 문자열 설명으로 대체했습니다. type={typeName}");
+        return $"[unsupported_object:{typeName}]";
     }
 
     private static Dictionary<string, object?> BuildRun(object combatRoot, ObjectGraph graph)
@@ -574,8 +841,13 @@ internal static class CombatStateExporter
 
     private static Dictionary<string, object?> BuildPlayer(object? player)
     {
-        object? runtimeCreature = FindMemberValue(recentPlayer, "Creature", "creature", "_creature");
-        PowerGroups powerGroups = BuildPowerGroups(player, recentPlayer, runtimeCreature);
+        object? playerCombatState = player is not null && IsPlayerCombatStateType(player.GetType())
+            ? player
+            : FindMemberValue(player, "PlayerCombatState", "playerCombatState", "_playerCombatState")
+                ?? recentPlayerCombatState;
+        object? runtimeCreature = FindMemberValue(player, "Creature", "creature", "_creature")
+            ?? FindMemberValue(recentPlayer, "Creature", "creature", "_creature");
+        PowerGroups powerGroups = BuildPowerGroups(player, playerCombatState, recentPlayer, runtimeCreature);
 
         return new Dictionary<string, object?>
         {
@@ -583,8 +855,8 @@ internal static class CombatStateExporter
             ["hp"] = ReadFirstInt(new[] { player, recentPlayer, runtimeCreature }, "hp", "_hp", "currentHp", "_currentHp", "currentHealth", "_currentHealth", "health", "_health"),
             ["max_hp"] = ReadFirstInt(new[] { player, recentPlayer, runtimeCreature }, "maxHp", "_maxHp", "maxHealth", "_maxHealth"),
             ["block"] = ReadFirstInt(new[] { player, recentPlayer, runtimeCreature }, "block", "_block", "currentBlock", "_currentBlock", "shield", "_shield"),
-            ["energy"] = ReadFirstInt(new[] { player, recentPlayer }, "energy", "_energy", "currentEnergy", "_currentEnergy"),
-            ["max_energy"] = ReadFirstInt(new[] { player, recentPlayer }, "maxEnergy", "_maxEnergy", "energyMax", "_energyMax"),
+            ["energy"] = ReadFirstInt(new[] { playerCombatState, player, recentPlayer }, "energy", "_energy", "currentEnergy", "_currentEnergy"),
+            ["max_energy"] = ReadFirstInt(new[] { playerCombatState, player, recentPlayer }, "maxEnergy", "_maxEnergy", "energyMax", "_energyMax"),
             ["gold"] = ReadFirstInt(new[] { player, recentPlayer }, "gold", "_gold", "currentGold", "_currentGold"),
             ["buffs"] = powerGroups.Buffs,
             ["debuffs"] = powerGroups.Debuffs,
@@ -1355,6 +1627,16 @@ internal static class CombatStateExporter
             dynamicVar.GetType().FullName ?? dynamicVar.GetType().Name);
     }
 
+    private static Dictionary<string, object?> ReadDictionary(Dictionary<string, object?> source, string key)
+    {
+        if (!source.TryGetValue(key, out object? value))
+        {
+            return new Dictionary<string, object?>();
+        }
+
+        return value as Dictionary<string, object?> ?? new Dictionary<string, object?>();
+    }
+
     private static List<Dictionary<string, object?>> ReadDictionaryList(Dictionary<string, object?> source, string key)
     {
         if (!source.TryGetValue(key, out object? value))
@@ -1385,6 +1667,58 @@ internal static class CombatStateExporter
         {
             return null;
         }
+    }
+
+    private static int? ReadJsonInt(JsonElement root, string objectName, string propertyName)
+    {
+        if (root.ValueKind != JsonValueKind.Object
+            || !root.TryGetProperty(objectName, out JsonElement child)
+            || child.ValueKind != JsonValueKind.Object
+            || !child.TryGetProperty(propertyName, out JsonElement value))
+        {
+            return null;
+        }
+
+        return ReadJsonInt(value);
+    }
+
+    private static int? ReadJsonInt(JsonElement value)
+    {
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out int number))
+        {
+            return number;
+        }
+
+        if (value.ValueKind == JsonValueKind.String && int.TryParse(value.GetString(), out int parsed))
+        {
+            return parsed;
+        }
+
+        return null;
+    }
+
+    private static int ReadJsonArrayCount(JsonElement root, string propertyName)
+    {
+        if (root.ValueKind != JsonValueKind.Object
+            || !root.TryGetProperty(propertyName, out JsonElement value)
+            || value.ValueKind != JsonValueKind.Array)
+        {
+            return 0;
+        }
+
+        return value.GetArrayLength();
+    }
+
+    private static int ReadJsonArrayCount(JsonElement root, string objectName, string propertyName)
+    {
+        if (root.ValueKind != JsonValueKind.Object
+            || !root.TryGetProperty(objectName, out JsonElement child)
+            || child.ValueKind != JsonValueKind.Object)
+        {
+            return 0;
+        }
+
+        return ReadJsonArrayCount(child, propertyName);
     }
 
     private static bool? ReadDictionaryBool(Dictionary<string, object?> source, string key)
@@ -2413,6 +2747,21 @@ internal static class CombatStateExporter
 
             return new ObjectGraph(nodes);
         }
+    }
+
+    internal sealed record CombatExportProbe(
+        bool IsInProgress,
+        bool StateFound,
+        bool HasPlayerVitals,
+        bool HasHandCards,
+        bool HasEnemies,
+        int? PlayerHp,
+        int? PlayerEnergy,
+        int HandCount,
+        int EnemyCount,
+        string Reason)
+    {
+        public bool IsStable => StateFound && HasPlayerVitals && HasHandCards && HasEnemies;
     }
 
     private sealed record ObjectNode(string Path, object? Value, int Depth);

@@ -3,13 +3,14 @@ using HarmonyLib;
 
 namespace SpireMindMod;
 
-[HarmonyPatch]
 internal static class CardMovementHarmonyPatch
 {
     private static readonly SpireMindLogger Logger = new("SpireMind.R2.CardMovePatch");
     private static bool hasLoggedTargets;
 
-    public static IEnumerable<MethodBase> TargetMethods()
+    // PatchAll이 대상 없는 Prefix/Postfix를 자동 발견하면 모드 로드가 실패합니다.
+    // 이 연구용 패치는 기본 배포에서 HarmonyPatch 특성을 붙이지 않고 수동 연결할 때만 사용합니다.
+    public static IEnumerable<MethodBase> GetTargetMethodsForManualPatch()
     {
         List<MethodBase> targets = new();
         if (!CardMovementObserver.Enabled)
@@ -39,7 +40,7 @@ internal static class CardMovementHarmonyPatch
         return targets;
     }
 
-    public static void Prefix(MethodBase __originalMethod, object __instance)
+    public static void ObserveBeforeCardMovement(MethodBase __originalMethod, object __instance)
     {
         try
         {
@@ -54,7 +55,7 @@ internal static class CardMovementHarmonyPatch
         }
     }
 
-    public static void Postfix(MethodBase __originalMethod, object __instance, object[] __args)
+    public static void ObserveAfterCardMovement(MethodBase __originalMethod, object __instance, object[] __args)
     {
         try
         {

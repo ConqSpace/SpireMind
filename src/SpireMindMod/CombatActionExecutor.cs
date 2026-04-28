@@ -56,6 +56,13 @@ internal static class CombatActionExecutor
 
     public static void Tick()
     {
+        AutotestCommandChannel.Tick();
+        TryStartClaimRequest();
+    }
+
+    public static void TickMainThread()
+    {
+        AutotestCommandChannel.TickMainThread();
         TryExecutePendingClaim();
         TryStartClaimRequest();
     }
