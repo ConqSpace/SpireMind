@@ -17,10 +17,12 @@
 - [state_schema.md](./state_schema.md): STS2에서 추출해 LLM에 전달할 상태 JSON 형식
 - [action_schema.md](./action_schema.md): LLM이 선택할 수 있는 행동 목록과 응답 형식
 - [experiment_protocol.md](./experiment_protocol.md): 성능 측정 조건, 지표, 비교 기준
+- [scenario_framework.md](./scenario_framework.md): SpireMind를 STS2 AI 시나리오 평가 도구로 다루기 위한 상위 설계
 - [failure_policy.md](./failure_policy.md): 잘못된 응답, 지연, 상태 변경, 예외 처리 규칙
 - [development_roadmap.md](./development_roadmap.md): 구현 단계, 산출물, 검증 기준, 주요 위험
 - [strategic_roadmap.md](./strategic_roadmap.md): 연구 방향, 장기 단계, 의사결정 지점
 - [decision_loop.md](./decision_loop.md): 브리지 상태를 읽고 행동 묶음을 제출하는 의사결정 루프
+- [run_memory_logging.md](./run_memory_logging.md): 전투 로그, 런 로그, 판단 기록, LLM 기억 요약 설계
 
 ## 현재 잠글 범위
 

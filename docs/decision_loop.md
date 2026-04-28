@@ -11,6 +11,7 @@
 - `combat_card_id`, `target_combat_id` 기반 행동을 제출한다.
 - 여러 장의 카드를 순서대로 쓰는 계획을 `actions` 배열로 제출한다.
 - 마지막에 `end_turn`을 붙여 한 턴 단위 실행을 닫는다.
+- 판단 입력과 결과는 나중에 `decisions.jsonl`에 남긴다. 자세한 로그 설계는 [run_memory_logging.md](./run_memory_logging.md)를 따른다.
 
 ## 실행 모드
 
@@ -28,6 +29,18 @@ node .\bridge\spiremind_decision_loop.js --mode heuristic --once --max-actions-p
 
 ```powershell
 node .\bridge\spiremind_decision_loop.js --mode heuristic --once --dry-run
+```
+
+실행 결과까지 기다리고 기록을 남길 때:
+
+```powershell
+node .\bridge\spiremind_decision_loop.js `
+  --mode heuristic `
+  --once `
+  --wait-result `
+  --scenario-id "manual_combat" `
+  --play-session-id "session_001" `
+  --run-log-dir "$env:APPDATA\SlayTheSpire2\SpireMind\runs\manual_001"
 ```
 
 ### `command`
@@ -90,6 +103,8 @@ node .\bridge\spiremind_decision_loop.js `
 
 - 휴리스틱 판단이 JSON으로 생성된다.
 - 행동 묶음이 `/action/submit`으로 제출된다.
+- `--run-log-dir` 지정 시 `scenario_config.json`, `decider_config.json`, `decisions.jsonl`, `combat_log.jsonl`, `metrics.json`이 생성된다.
+- `--wait-result` 지정 시 제출한 행동의 실행 결과까지 기다린다.
 - 일부러 만든 `stale` claim 상황에서 같은 계획 단계가 다시 큐에 들어간다.
 
 실제 게임까지 포함한 검증은 다음 흐름으로 본다.
@@ -105,3 +120,4 @@ node .\bridge\spiremind_decision_loop.js `
 - `heuristic`은 공격 카드 중심 검증용 판단기다.
 - X 비용 카드, 에너지 생성 카드, 드로우 후 추가 행동 가치는 아직 정교하게 계산하지 않는다.
 - `command` 모드는 외부 판단기의 실행 형식만 제공한다. Codex CLI용 장기 상주 세션 연결은 다음 단계에서 별도 설계가 필요하다.
+- 현재 전투 로그는 `combat_observed`, `decision_submitted`, `action_result_observed`만 남긴다. 전투 시작/종료, 턴 시작/종료, 피해량 변화 같은 세부 이벤트 수집은 아직 별도 구현이 필요하다.
