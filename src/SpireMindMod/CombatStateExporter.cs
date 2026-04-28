@@ -777,22 +777,29 @@ internal static class CombatStateExporter
         int index = 0;
         foreach (object card in EnumerateCards(source))
         {
-            string fallbackName = GetReadableName(card);
-            object? cardStats = FindMemberValue(card, "cardStats", "_cardStats", "stats", "_stats");
-            object? cardInfo = FindMemberValue(card, "cardInfo", "_cardInfo", "info", "_info", "baseCard", "_baseCard");
-            object? cardModel = FindMemberValue(card, "Model", "model", "_model", "cardModel", "_cardModel");
-            string cardName = ReadCardName(card, cardModel, cardInfo) ?? fallbackName;
+            object? rewardCardModel = FindMemberValue(card, "Card", "card", "_modifiedCard", "originalCard");
+            object primaryCard = rewardCardModel ?? card;
+            string fallbackName = GetReadableName(primaryCard);
+            object? cardStats = FindMemberValue(primaryCard, "cardStats", "_cardStats", "stats", "_stats");
+            object? cardInfo = FindMemberValue(primaryCard, "cardInfo", "_cardInfo", "info", "_info", "baseCard", "_baseCard");
+            object? cardModel = FindMemberValue(primaryCard, "Model", "model", "_model", "cardModel", "_cardModel") ?? primaryCard;
+            object? energyCost = FindMemberValue(cardModel, "EnergyCost", "energyCost", "_energyCost");
+            string cardName = ReadCardName(primaryCard, cardModel, cardInfo) ?? fallbackName;
+            int? resolvedCost = TryInvokeInt(energyCost, "GetAmountToSpend")
+                ?? ReadFirstInt(new[] { primaryCard, cardModel, cardStats, cardInfo }, "cost", "_cost", "currentCost", "_currentCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost");
+            int? baseCost = ReadInt(energyCost, "Canonical")
+                ?? ReadFirstInt(new[] { primaryCard, cardModel, cardStats, cardInfo }, "baseCost", "_baseCost", "baseEnergyCost", "_baseEnergyCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost");
             cards.Add(new Dictionary<string, object?>
             {
                 ["card_reward_index"] = index,
-                ["card_id"] = ReadFirstString(new[] { card, cardModel, cardInfo }, "id", "_id", "cardId", "_cardId", "key", "_key") ?? fallbackName,
+                ["card_id"] = ReadFirstString(new[] { primaryCard, cardModel, cardInfo }, "id", "_id", "cardId", "_cardId", "key", "_key") ?? fallbackName,
                 ["name"] = cardName,
-                ["type"] = ReadFirstString(new[] { card, cardModel, cardInfo, cardStats }, "type", "_type", "cardType", "_cardType"),
-                ["cost"] = ReadFirstInt(new[] { card, cardModel, cardStats, cardInfo }, "cost", "_cost", "currentCost", "_currentCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost"),
-                ["base_cost"] = ReadFirstInt(new[] { card, cardModel, cardStats, cardInfo }, "baseCost", "_baseCost", "baseEnergyCost", "_baseEnergyCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost"),
-                ["rarity"] = ReadFirstString(new[] { card, cardModel, cardInfo }, "rarity", "_rarity", "cardRarity", "_cardRarity"),
-                ["upgraded"] = ReadBool(card, "upgraded", "isUpgraded"),
-                ["description"] = BuildCardDescription("reward", card, cardModel, cardInfo, cardStats)
+                ["type"] = ReadFirstString(new[] { primaryCard, cardModel, cardInfo, cardStats }, "type", "_type", "cardType", "_cardType"),
+                ["cost"] = resolvedCost,
+                ["base_cost"] = baseCost,
+                ["rarity"] = ReadFirstString(new[] { primaryCard, cardModel, cardInfo }, "rarity", "_rarity", "cardRarity", "_cardRarity"),
+                ["upgraded"] = ReadBool(primaryCard, "upgraded", "isUpgraded", "IsUpgraded"),
+                ["description"] = BuildCardDescription("reward", primaryCard, cardModel, cardInfo, cardStats)
             });
             index++;
         }
@@ -821,6 +828,17 @@ internal static class CombatStateExporter
     private static List<Dictionary<string, object?>> BuildRewardLegalActions(List<Dictionary<string, object?>> rewards)
     {
         List<Dictionary<string, object?>> actions = new();
+        if (rewards.Count == 0)
+        {
+            actions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = "proceed_rewards",
+                ["type"] = "proceed_reward_screen",
+                ["summary"] = "보상 화면을 닫고 다음 화면으로 진행한다."
+            });
+            return actions;
+        }
+
         AddRewardLegalActions(actions, rewards);
         return actions;
     }
@@ -846,7 +864,7 @@ internal static class CombatStateExporter
                         ["card_id"] = ReadDictionaryString(card, "card_id"),
                         ["card_name"] = cardName,
                         ["summary"] = $"{cardName} 카드를 보상으로 선택한다.",
-                        ["validation_note"] = "이번 단계에서는 관측용 후보만 생성한다. 실행기는 아직 보상 선택을 수행하지 않는다."
+                        ["validation_note"] = "현재 보상 화면의 실제 카드 선택 버튼을 실행할 수 있는 후보입니다."
                     });
                 }
 
@@ -858,9 +876,19 @@ internal static class CombatStateExporter
                         ["type"] = "skip_card_reward",
                         ["reward_id"] = rewardId,
                         ["summary"] = "카드 보상을 건너뛴다.",
-                        ["validation_note"] = "이번 단계에서는 관측용 후보만 생성한다. 실행기는 아직 보상 선택을 수행하지 않는다."
+                        ["validation_note"] = "현재 보상 화면의 실제 건너뛰기 동작을 실행할 수 있는 후보입니다."
                     });
                 }
+            }
+            else if (rewardType == "gold")
+            {
+                actions.Add(new Dictionary<string, object?>
+                {
+                    ["action_id"] = SanitizeActionId($"claim_{rewardId}"),
+                    ["type"] = "claim_gold_reward",
+                    ["reward_id"] = rewardId,
+                    ["summary"] = "골드 보상을 획득한다."
+                });
             }
             else if (rewardType == "relic")
             {
@@ -870,7 +898,7 @@ internal static class CombatStateExporter
                     ["type"] = "claim_relic_reward",
                     ["reward_id"] = rewardId,
                     ["summary"] = "유물 보상을 획득한다.",
-                    ["validation_note"] = "이번 단계에서는 관측용 후보만 생성한다. 실행기는 아직 보상 선택을 수행하지 않는다."
+                    ["validation_note"] = "현재 보상 화면의 실제 유물 보상 버튼을 실행할 수 있는 후보입니다."
                 });
             }
             else if (rewardType == "potion")
@@ -881,7 +909,7 @@ internal static class CombatStateExporter
                     ["type"] = "claim_potion_reward",
                     ["reward_id"] = rewardId,
                     ["summary"] = "포션 보상을 획득한다.",
-                    ["validation_note"] = "이번 단계에서는 관측용 후보만 생성한다. 실행기는 아직 보상 선택을 수행하지 않는다."
+                    ["validation_note"] = "현재 보상 화면의 실제 포션 보상 버튼을 실행할 수 있는 후보입니다."
                 });
             }
             else if (rewardType == "linked_reward_set")

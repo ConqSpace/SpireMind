@@ -74,7 +74,9 @@ internal static class CombatActionRuntimeContext
                 ReadString(action, "card_instance_id"),
                 ReadInt(action, "combat_card_id"),
                 ReadString(action, "target_id"),
-                ReadInt(action, "target_combat_id")));
+                ReadInt(action, "target_combat_id"),
+                ReadString(action, "reward_id"),
+                ReadInt(action, "card_reward_index")));
         }
 
         return actions;
@@ -135,4 +137,6 @@ internal sealed record LegalActionSnapshot(
     string? CardInstanceId,
     int? CombatCardId,
     string? TargetId,
-    int? TargetCombatId);
+    int? TargetCombatId,
+    string? RewardId,
+    int? CardRewardIndex);

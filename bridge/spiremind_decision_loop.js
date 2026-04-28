@@ -1292,6 +1292,27 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
   const legalActions = Array.isArray(state.legal_actions)
     ? state.legal_actions.filter(isPlainObject)
     : [];
+  const phase = typeof state.phase === "string" ? state.phase : "";
+  if (phase === "reward") {
+    const preferredRewardActionTypes = [
+      "claim_gold_reward",
+      "claim_relic_reward",
+      "claim_potion_reward",
+      "choose_card_reward",
+      "skip_card_reward",
+      "proceed_reward_screen"
+    ];
+    for (const actionType of preferredRewardActionTypes) {
+      const rewardAction = legalActions.find((legalAction) => legalAction.type === actionType);
+      if (rewardAction && typeof rewardAction.action_id === "string") {
+        return {
+          selected_action_id: rewardAction.action_id,
+          reason: `휴리스틱 보상 처리: ${actionType}`
+        };
+      }
+    }
+  }
+
   const enemies = Array.isArray(state.enemies)
     ? state.enemies.filter((enemy) => isPlainObject(enemy) && (readNumber(enemy.hp) ?? 1) > 0)
     : [];

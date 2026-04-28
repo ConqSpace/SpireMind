@@ -62,7 +62,16 @@ function Send-ActionClaim {
         executor_id = "decision-loop-smoke"
         observed_state_id = $CurrentState.state.state_id
         observed_state_version = $CurrentState.state_version
-        supported_action_types = @("play_card", "end_turn")
+        supported_action_types = @(
+            "play_card",
+            "end_turn",
+            "claim_gold_reward",
+            "claim_relic_reward",
+            "claim_potion_reward",
+            "choose_card_reward",
+            "skip_card_reward",
+            "proceed_reward_screen"
+        )
     } | ConvertTo-Json -Depth 8
 
     return Invoke-RestMethod `
@@ -133,6 +142,15 @@ if ($null -eq (Test-BridgeHealth -Url $BridgeUrl)) {
 
 try {
     $combatStateJson = Get-Content -Path $CombatStatePath -Raw -Encoding UTF8
+    $stateForSmoke = $combatStateJson | ConvertFrom-Json
+    $initialPhase = [string]$stateForSmoke.phase
+    $smokeAction = @($stateForSmoke.legal_actions | Where-Object {
+        $null -ne $_.action_id -and -not [string]::IsNullOrWhiteSpace([string]$_.action_id)
+    } | Select-Object -First 1)
+    if ($smokeAction.Count -lt 1) {
+        throw "smoke check에 사용할 legal_actions가 없습니다."
+    }
+    $smokeActionId = [string]$smokeAction[0].action_id
     $null = Invoke-RestMethod `
         -Method Post `
         -Uri "$BridgeUrl/state" `
@@ -152,14 +170,17 @@ try {
 
     $previousFakeDecision = $env:SPIREMIND_CODEX_FAKE_DECISION
     try {
-        $env:SPIREMIND_CODEX_FAKE_DECISION = '{"selected_action_id":"end_turn","reason":"smoke codex adapter"}'
+        $env:SPIREMIND_CODEX_FAKE_DECISION = (@{
+            selected_action_id = $smokeActionId
+            reason = "smoke codex adapter"
+        } | ConvertTo-Json -Compress)
         $codexDryRunText = & node $decisionLoopPath --bridge-url $BridgeUrl --mode command --command node --command-arg $codexDeciderPath --once --dry-run
         if ($LASTEXITCODE -ne 0) {
             throw "Codex 판단기 dry-run이 실패했습니다."
         }
 
         $codexDryRun = $codexDryRunText | ConvertFrom-Json
-        if ($codexDryRun.status -ne "dry_run" -or $codexDryRun.decision.selected_action_id -ne "end_turn") {
+        if ($codexDryRun.status -ne "dry_run" -or $codexDryRun.decision.selected_action_id -ne $smokeActionId) {
             throw "Codex 판단기 dry-run 결과가 올바르지 않습니다."
         }
     } finally {
@@ -170,7 +191,7 @@ try {
     New-Item -ItemType Directory -Force -Path $runLogDir | Out-Null
     $waitStdoutPath = Join-Path $runLogDir "wait_stdout.json"
     $waitStderrPath = Join-Path $runLogDir "wait_stderr.txt"
-    $commandScript = "process.stdout.write(JSON.stringify({selected_action_id:'end_turn',reason:'smoke'}));"
+    $commandScript = "process.stdout.write(JSON.stringify({selected_action_id:'$smokeActionId',reason:'smoke'}));"
     $waitProcess = Start-Process `
         -FilePath "node" `
         -ArgumentList @(
@@ -197,7 +218,7 @@ try {
     $pendingLatest = Wait-LatestAction -Url $BridgeUrl -TimeoutSeconds 10 -Predicate {
         param($latest)
         return $null -ne $latest.latest_action `
-            -and $latest.latest_action.selected_action_id -eq "end_turn" `
+            -and $latest.latest_action.selected_action_id -eq $smokeActionId `
             -and $latest.latest_action.execution_status -eq "pending"
     }
 
@@ -278,8 +299,11 @@ try {
     if ($metrics.submitted_decisions -lt 1 -or $metrics.actions_applied -lt 1) {
         throw "metrics.json에 제출과 실행 지표가 기록되지 않았습니다."
     }
-    if ($metrics.observed_combats -lt 1 -or $metrics.combat_turn_decisions -lt 1 -or $metrics.end_turns_applied -lt 1) {
+    if ($initialPhase -eq "combat_turn" -and ($metrics.observed_combats -lt 1 -or $metrics.combat_turn_decisions -lt 1)) {
         throw "metrics.json에 전투 관찰 지표가 기록되지 않았습니다."
+    }
+    if ($smokeActionId -eq "end_turn" -and $metrics.end_turns_applied -lt 1) {
+        throw "metrics.json end_turn count was not recorded."
     }
 
     $scenarioConfig = Get-Content -Raw -Encoding UTF8 $scenarioConfigPath | ConvertFrom-Json
@@ -288,14 +312,17 @@ try {
     }
 
     $combatLogText = Get-Content -Raw -Encoding UTF8 $combatLogPath
-    if ($combatLogText -notmatch '"event_type":"combat_observed"' -or $combatLogText -notmatch '"event_type":"decision_submitted"' -or $combatLogText -notmatch '"event_type":"action_result_observed"') {
+    if ($initialPhase -eq "combat_turn" -and $combatLogText -notmatch '"event_type":"combat_observed"') {
+        throw "combat_log.jsonl combat_observed event was not recorded."
+    }
+    if ($combatLogText -notmatch '"event_type":"decision_submitted"' -or $combatLogText -notmatch '"event_type":"action_result_observed"') {
         throw "combat_log.jsonl에 필요한 최소 이벤트가 기록되지 않았습니다."
     }
     if ($combatLogText -notmatch '"state_delta"') {
         throw "combat_log.jsonl에 판단 전후 변화량이 기록되지 않았습니다."
     }
 
-    $historyCommandScript = "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',(chunk)=>input+=chunk);process.stdin.on('end',()=>{const request=JSON.parse(input);if(!request.recent_history||!request.recent_history.memory_summary||!Array.isArray(request.recent_history.combat_events)||request.recent_history.combat_events.length<1){process.exit(2);}process.stdout.write(JSON.stringify({selected_action_id:'end_turn',reason:'recent history observed'}));});"
+    $historyCommandScript = "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',(chunk)=>input+=chunk);process.stdin.on('end',()=>{const request=JSON.parse(input);if(!request.recent_history||!request.recent_history.memory_summary||!Array.isArray(request.recent_history.combat_events)||request.recent_history.combat_events.length<1){process.exit(2);}process.stdout.write(JSON.stringify({selected_action_id:'$smokeActionId',reason:'recent history observed'}));});"
     $historyDryRunText = & node $decisionLoopPath `
         --bridge-url $BridgeUrl `
         --mode command `
@@ -494,7 +521,16 @@ try {
         executor_id = "decision-loop-smoke"
         observed_state_id = $currentAfterStateChange.state.state_id
         observed_state_version = $currentAfterStateChange.state_version
-        supported_action_types = @("play_card", "end_turn")
+        supported_action_types = @(
+            "play_card",
+            "end_turn",
+            "claim_gold_reward",
+            "claim_relic_reward",
+            "claim_potion_reward",
+            "choose_card_reward",
+            "skip_card_reward",
+            "proceed_reward_screen"
+        )
     } | ConvertTo-Json -Depth 8
     $staleClaim = Invoke-RestMethod `
         -Method Post `

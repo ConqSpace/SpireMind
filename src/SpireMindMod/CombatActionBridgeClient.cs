@@ -34,7 +34,17 @@ internal static class CombatActionBridgeClient
             ExecutorId = "sts2-mod-main",
             ObservedStateId = postedState.StateId,
             ObservedStateVersion = postedState.StateVersion,
-            SupportedActionTypes = new[] { "end_turn", "play_card" }
+            SupportedActionTypes = new[]
+            {
+                "end_turn",
+                "play_card",
+                "claim_gold_reward",
+                "claim_relic_reward",
+                "claim_potion_reward",
+                "choose_card_reward",
+                "skip_card_reward",
+                "proceed_reward_screen"
+            }
         };
 
         return await PostJsonAsync<ActionClaimRequest, ActionClaimResponse>(

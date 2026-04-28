@@ -11,6 +11,7 @@ internal static class CombatActionExecutor
     private const int BackgroundPollIntervalMs = 250;
     private const int DiagnosticLogIntervalMs = 5000;
     private const int ClaimInFlightWatchdogMs = 3000;
+    private const int RewardCardSelectionTimeoutMs = 5000;
     private const int MaxExecutedHistory = 128;
 
     private static readonly SpireMindLogger Logger = new("SpireMind.R5.Execute");
@@ -25,6 +26,7 @@ internal static class CombatActionExecutor
     private static long claimStartedAtMs;
     private static long lastDiagnosticLogAtMs;
     private static PendingClaim? pendingClaim;
+    private static PendingRewardCardSelection? pendingRewardCardSelection;
 
     public static void StartBackgroundPolling()
     {
@@ -63,6 +65,7 @@ internal static class CombatActionExecutor
     public static void TickMainThread()
     {
         AutotestCommandChannel.TickMainThread();
+        TryExecutePendingRewardCardSelection();
         TryExecutePendingClaim();
         TryStartClaimRequest();
     }
@@ -220,8 +223,7 @@ internal static class CombatActionExecutor
             return;
         }
 
-        if (!legalAction.ActionType.Equals("end_turn", StringComparison.OrdinalIgnoreCase)
-            && !legalAction.ActionType.Equals("play_card", StringComparison.OrdinalIgnoreCase))
+        if (!IsSupportedActionType(legalAction.ActionType))
         {
             RememberExecuted(claim.Action.SubmissionId);
             ReportResult(claim, "unsupported", $"{legalAction.ActionType} 행동은 아직 실행기가 지원하지 않습니다.");
@@ -231,9 +233,24 @@ internal static class CombatActionExecutor
         try
         {
             string detail;
-            bool applied = legalAction.ActionType.Equals("end_turn", StringComparison.OrdinalIgnoreCase)
-                ? TryExecuteEndTurn(context.CombatRoot, out detail)
-                : TryExecutePlayCard(legalAction, context.CombatRoot, out detail);
+            bool applied;
+            if (legalAction.ActionType.Equals("end_turn", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecuteEndTurn(context.CombatRoot, out detail);
+            }
+            else if (legalAction.ActionType.Equals("play_card", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecutePlayCard(legalAction, context.CombatRoot, out detail);
+            }
+            else
+            {
+                applied = TryExecuteRewardAction(legalAction, context.CombatRoot, claim, out detail, out bool resultDeferred);
+                if (applied && resultDeferred)
+                {
+                    Logger.Info(detail);
+                    return;
+                }
+            }
 
             if (applied)
             {
@@ -250,6 +267,290 @@ internal static class CombatActionExecutor
             RememberExecuted(claim.Action.SubmissionId);
             ReportResult(claim, "failed", $"{exception.GetType().Name}: {exception.Message}");
         }
+    }
+
+    private static bool IsSupportedActionType(string actionType)
+    {
+        return actionType.Equals("end_turn", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("play_card", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("claim_gold_reward", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("claim_relic_reward", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("claim_potion_reward", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("choose_card_reward", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("skip_card_reward", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("proceed_reward_screen", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryExecuteRewardAction(
+        LegalActionSnapshot legalAction,
+        object rewardRoot,
+        PendingClaim claim,
+        out string detail,
+        out bool resultDeferred)
+    {
+        resultDeferred = false;
+        string rootTypeName = rewardRoot.GetType().FullName ?? rewardRoot.GetType().Name;
+        if (!rootTypeName.Contains("NRewardsScreen", StringComparison.OrdinalIgnoreCase))
+        {
+            detail = $"보상 행동을 실행할 수 있는 화면이 아닙니다. root={rootTypeName}";
+            return false;
+        }
+
+        if (legalAction.ActionType.Equals("proceed_reward_screen", StringComparison.OrdinalIgnoreCase))
+        {
+            return TryPressRewardProceedButton(rewardRoot, out detail);
+        }
+
+        if (!TryParseRewardIndex(legalAction.RewardId, out int rewardIndex))
+        {
+            detail = $"reward_id를 해석하지 못했습니다. reward_id={legalAction.RewardId ?? "<none>"}";
+            return false;
+        }
+
+        object? rewardButton = FindRewardButtonByIndex(rewardRoot, rewardIndex);
+        if (rewardButton is null)
+        {
+            detail = $"보상 버튼을 찾지 못했습니다. reward_id={legalAction.RewardId}, index={rewardIndex}";
+            return false;
+        }
+
+        if (legalAction.ActionType.Equals("skip_card_reward", StringComparison.OrdinalIgnoreCase))
+        {
+            object? reward = ReadNamedMember(rewardButton, "Reward");
+            _ = TryInvokeMethod(reward, "OnSkipped", out _);
+            if (!TryInvokeMethod(rewardRoot, "RewardCollectedFrom", out _, rewardButton))
+            {
+                detail = $"카드 보상 건너뛰기 처리는 했지만 보상 화면에서 버튼 제거 호출에 실패했습니다. reward_id={legalAction.RewardId}";
+                return false;
+            }
+
+            detail = $"카드 보상을 건너뛰었습니다. reward_id={legalAction.RewardId}";
+            Logger.Info(detail);
+            return true;
+        }
+
+        if (legalAction.ActionType.Equals("choose_card_reward", StringComparison.OrdinalIgnoreCase))
+        {
+            if (legalAction.CardRewardIndex is null)
+            {
+                detail = "choose_card_reward 행동에 card_reward_index가 없습니다.";
+                return false;
+            }
+
+            if (!TryInvokeMethod(rewardButton, "OnRelease", out _))
+            {
+                detail = $"카드 보상 버튼을 누르지 못했습니다. reward_id={legalAction.RewardId}";
+                return false;
+            }
+
+            pendingRewardCardSelection = new PendingRewardCardSelection(
+                legalAction.CardRewardIndex.Value,
+                claim,
+                Environment.TickCount64);
+            detail = $"카드 보상 화면을 열고 {legalAction.CardRewardIndex.Value}번 카드 선택을 예약했습니다. reward_id={legalAction.RewardId}";
+            resultDeferred = true;
+            return true;
+        }
+
+        if (!TryInvokeMethod(rewardButton, "OnRelease", out _))
+        {
+            detail = $"보상 버튼을 누르지 못했습니다. reward_id={legalAction.RewardId}, action_type={legalAction.ActionType}";
+            return false;
+        }
+
+        detail = $"보상 버튼을 눌렀습니다. reward_id={legalAction.RewardId}, action_type={legalAction.ActionType}";
+        Logger.Info(detail);
+        return true;
+    }
+
+    private static void TryExecutePendingRewardCardSelection()
+    {
+        PendingRewardCardSelection? pending = pendingRewardCardSelection;
+        if (pending is null)
+        {
+            return;
+        }
+
+        long nowMs = Environment.TickCount64;
+        if (nowMs - pending.StartedAtMs > RewardCardSelectionTimeoutMs)
+        {
+            pendingRewardCardSelection = null;
+            string detail = $"예약된 카드 보상 선택이 제한 시간 안에 완료되지 않았습니다. submission_id={pending.Claim.Action.SubmissionId}, card_reward_index={pending.CardRewardIndex}";
+            Logger.Warning(detail);
+            RememberExecuted(pending.Claim.Action.SubmissionId);
+            ReportResult(pending.Claim, "failed", detail);
+            return;
+        }
+
+        object? selectionScreen = FindTopOverlayByTypeName("NCardRewardSelectionScreen");
+        if (selectionScreen is null)
+        {
+            return;
+        }
+
+        object? completionSource = ReadNamedMember(selectionScreen, "_completionSource");
+        if (completionSource is null)
+        {
+            return;
+        }
+
+        if (IsCompletionSourceCompleted(completionSource))
+        {
+            pendingRewardCardSelection = null;
+            string detail = $"카드 보상 선택이 이미 완료되어 예약을 종료했습니다. submission_id={pending.Claim.Action.SubmissionId}, card_reward_index={pending.CardRewardIndex}";
+            Logger.Info(detail);
+            RememberExecuted(pending.Claim.Action.SubmissionId);
+            ReportResult(pending.Claim, "applied", detail);
+            return;
+        }
+
+        List<object> cardHolders = FindCardHolders(selectionScreen);
+        if (cardHolders.Count == 0)
+        {
+            return;
+        }
+
+        if (pending.CardRewardIndex < 0 || pending.CardRewardIndex >= cardHolders.Count)
+        {
+            pendingRewardCardSelection = null;
+            Logger.Warning($"카드 보상 선택 인덱스가 화면의 카드 수를 벗어났습니다. index={pending.CardRewardIndex}, count={cardHolders.Count}");
+            return;
+        }
+
+        object cardHolder = cardHolders[pending.CardRewardIndex];
+        if (!TryInvokeMethod(selectionScreen, "SelectCard", out _, cardHolder))
+        {
+            if (IsCompletionSourceCompleted(completionSource))
+            {
+                pendingRewardCardSelection = null;
+                string completedDetail = $"카드 보상 선택이 완료된 상태로 확인되었습니다. submission_id={pending.Claim.Action.SubmissionId}, card_reward_index={pending.CardRewardIndex}";
+                Logger.Info(completedDetail);
+                RememberExecuted(pending.Claim.Action.SubmissionId);
+                ReportResult(pending.Claim, "applied", completedDetail);
+            }
+
+            return;
+        }
+
+        pendingRewardCardSelection = null;
+        string successDetail = $"카드 보상 선택 신호를 보냈습니다. submission_id={pending.Claim.Action.SubmissionId}, card_reward_index={pending.CardRewardIndex}";
+        Logger.Info(successDetail);
+        RememberExecuted(pending.Claim.Action.SubmissionId);
+        ReportResult(pending.Claim, "applied", successDetail);
+    }
+
+    private static bool TryPressRewardProceedButton(object rewardScreen, out string detail)
+    {
+        object? proceedButton = ReadNamedMember(rewardScreen, "_proceedButton");
+        if (proceedButton is null)
+        {
+            detail = "보상 화면의 진행 버튼을 찾지 못했습니다.";
+            return false;
+        }
+
+        if (!TryInvokeMethod(rewardScreen, "OnProceedButtonPressed", out _, proceedButton))
+        {
+            detail = "보상 화면 진행 버튼 호출에 실패했습니다.";
+            return false;
+        }
+
+        detail = "보상 화면 진행 버튼을 눌렀습니다.";
+        Logger.Info(detail);
+        return true;
+    }
+
+    private static object? FindRewardButtonByIndex(object rewardScreen, int rewardIndex)
+    {
+        return ExpandValue(ReadNamedMember(rewardScreen, "_rewardButtons"))
+            .Where(value => !IsScalar(value.GetType()))
+            .Skip(rewardIndex)
+            .FirstOrDefault();
+    }
+
+    private static bool TryParseRewardIndex(string? rewardId, out int rewardIndex)
+    {
+        rewardIndex = -1;
+        if (string.IsNullOrWhiteSpace(rewardId)
+            || !rewardId.StartsWith("reward_", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return int.TryParse(rewardId["reward_".Length..], out rewardIndex) && rewardIndex >= 0;
+    }
+
+    private static object? FindTopOverlayByTypeName(string typeNamePart)
+    {
+        Type? overlayStackType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Nodes.Screens.Overlays.NOverlayStack");
+        object? overlayStack = ReadStaticNamedMember(overlayStackType, "Instance");
+        object? topOverlay = null;
+        _ = TryInvokeMethod(overlayStack, "Peek", out topOverlay);
+        string typeName = topOverlay?.GetType().FullName ?? topOverlay?.GetType().Name ?? string.Empty;
+        return typeName.Contains(typeNamePart, StringComparison.OrdinalIgnoreCase) ? topOverlay : null;
+    }
+
+    private static IEnumerable<object> EnumerateNodeChildren(object? node)
+    {
+        object? children = null;
+        if (!TryInvokeMethod(node, "GetChildren", out children))
+        {
+            _ = TryInvokeMethod(node, "GetChildren", out children, false);
+        }
+
+        return ExpandValue(children).Where(value => !IsScalar(value.GetType()));
+    }
+
+    private static List<object> FindCardHolders(object selectionScreen)
+    {
+        object? cardRow = ReadNamedMember(selectionScreen, "_cardRow");
+        List<object> cardHolders = EnumerateNodeDescendants(cardRow)
+            .Where(IsCardHolder)
+            .ToList();
+        if (cardHolders.Count > 0)
+        {
+            return cardHolders;
+        }
+
+        return EnumerateNodeDescendants(selectionScreen)
+            .Where(IsCardHolder)
+            .ToList();
+    }
+
+    private static IEnumerable<object> EnumerateNodeDescendants(object? node)
+    {
+        if (node is null)
+        {
+            yield break;
+        }
+
+        Queue<object> queue = new();
+        queue.Enqueue(node);
+        int visitedCount = 0;
+        while (queue.Count > 0 && visitedCount < 512)
+        {
+            object current = queue.Dequeue();
+            visitedCount++;
+            yield return current;
+
+            foreach (object child in EnumerateNodeChildren(current))
+            {
+                queue.Enqueue(child);
+            }
+        }
+    }
+
+    private static bool IsCardHolder(object value)
+    {
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return typeName.Contains("NCardHolder", StringComparison.OrdinalIgnoreCase)
+            || typeName.Contains("NGridCardHolder", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsCompletionSourceCompleted(object completionSource)
+    {
+        object? task = ReadNamedMember(completionSource, "Task");
+        object? isCompleted = ReadNamedMember(task, "IsCompleted");
+        return isCompleted is bool completed && completed;
     }
 
     private static bool TryExecutePlayCard(LegalActionSnapshot legalAction, object combatRoot, out string detail)
@@ -556,6 +857,54 @@ internal static class CombatActionExecutor
             .Where(method => method.Name.Equals(methodName, StringComparison.OrdinalIgnoreCase))
             .Where(method => method.GetParameters().Length == 1)
             .FirstOrDefault(method => IsArgumentCompatible(method.GetParameters()[0].ParameterType, argument));
+    }
+
+    private static bool TryInvokeMethod(object? source, string methodName, out object? result, params object?[] args)
+    {
+        result = null;
+        if (source is null)
+        {
+            return false;
+        }
+
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        MethodInfo? method = source.GetType()
+            .GetMethods(flags)
+            .Where(candidate => candidate.Name.Equals(methodName, StringComparison.OrdinalIgnoreCase))
+            .Where(candidate => candidate.GetParameters().Length == args.Length)
+            .FirstOrDefault(candidate =>
+            {
+                ParameterInfo[] parameters = candidate.GetParameters();
+                for (int index = 0; index < parameters.Length; index++)
+                {
+                    if (!IsArgumentCompatible(parameters[index].ParameterType, args[index]))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            });
+        if (method is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            result = method.Invoke(source, args);
+            return true;
+        }
+        catch (TargetInvocationException exception) when (exception.InnerException is not null)
+        {
+            Logger.Warning($"{source.GetType().Name}.{method.Name} 호출 중 예외가 발생했습니다. {exception.InnerException.GetType().Name}: {exception.InnerException.Message}");
+            return false;
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"{source.GetType().Name}.{method.Name} 호출에 실패했습니다. {exception.GetType().Name}: {exception.Message}");
+            return false;
+        }
     }
 
     private static bool IsArgumentCompatible(Type parameterType, object? argument)
@@ -995,4 +1344,9 @@ internal static class CombatActionExecutor
     private sealed record PendingClaim(
         ClaimedAction Action,
         CombatStateBridgePoster.PostedStateSnapshot PostedState);
+
+    private sealed record PendingRewardCardSelection(
+        int CardRewardIndex,
+        PendingClaim Claim,
+        long StartedAtMs);
 }
