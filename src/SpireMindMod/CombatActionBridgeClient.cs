@@ -34,7 +34,7 @@ internal static class CombatActionBridgeClient
             ExecutorId = "sts2-mod-main",
             ObservedStateId = postedState.StateId,
             ObservedStateVersion = postedState.StateVersion,
-            SupportedActionTypes = new[] { "end_turn" }
+            SupportedActionTypes = new[] { "end_turn", "play_card" }
         };
 
         return await PostJsonAsync<ActionClaimRequest, ActionClaimResponse>(

@@ -1622,11 +1622,13 @@ internal static class CombatStateExporter
                     }
 
                     string enemyName = ReadDictionaryString(enemy, "name") ?? targetId;
+                    int? targetCombatId = ReadDictionaryInt(enemy, "combat_id");
                     actions.Add(CreatePlayCardAction(
                         $"play_{cardInstanceId}_{targetId}",
                         cardInstanceId,
                         combatCardId,
                         targetId,
+                        targetCombatId,
                         energyCost,
                         $"Play {cardName} on {enemyName}.",
                         BuildValidationNote(card, enemy, playerEnergy, energyCost, playable, true)));
@@ -1638,6 +1640,7 @@ internal static class CombatStateExporter
                     $"play_{cardInstanceId}_no_target",
                     cardInstanceId,
                     combatCardId,
+                    null,
                     null,
                     energyCost,
                     $"Play {cardName} with no target.",
@@ -1664,6 +1667,7 @@ internal static class CombatStateExporter
         string cardInstanceId,
         int? combatCardId,
         string? targetId,
+        int? targetCombatId,
         int? energyCost,
         string summary,
         string validationNote)
@@ -1675,6 +1679,7 @@ internal static class CombatStateExporter
             ["card_instance_id"] = cardInstanceId,
             ["combat_card_id"] = combatCardId,
             ["target_id"] = targetId,
+            ["target_combat_id"] = targetCombatId,
             ["energy_cost"] = energyCost,
             ["summary"] = summary,
             ["validation_note"] = validationNote
@@ -2043,11 +2048,14 @@ internal static class CombatStateExporter
         int index = 0;
         foreach (object enemy in enemies)
         {
-            PowerGroups powerGroups = BuildPowerGroups(enemy, FindMemberValue(enemy, "Creature", "creature"));
+            object? enemyCreature = FindMemberValue(enemy, "Creature", "creature");
+            PowerGroups powerGroups = BuildPowerGroups(enemy, enemyCreature);
+            int? combatId = ReadFirstInt(new[] { enemy, enemyCreature }, "CombatId", "combatId", "_combatId");
 
             result.Add(new Dictionary<string, object?>
             {
                 ["id"] = ReadString(enemy, "id", "enemyId", "monsterId") ?? $"enemy_{index}",
+                ["combat_id"] = combatId,
                 ["name"] = ReadString(enemy, "name", "displayName") ?? GetReadableName(enemy),
                 ["hp"] = ReadInt(enemy, "hp", "currentHp", "currentHealth", "health"),
                 ["max_hp"] = ReadInt(enemy, "maxHp", "maxHealth"),

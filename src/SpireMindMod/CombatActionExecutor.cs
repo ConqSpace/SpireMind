@@ -220,16 +220,22 @@ internal static class CombatActionExecutor
             return;
         }
 
-        if (!legalAction.ActionType.Equals("end_turn", StringComparison.OrdinalIgnoreCase))
+        if (!legalAction.ActionType.Equals("end_turn", StringComparison.OrdinalIgnoreCase)
+            && !legalAction.ActionType.Equals("play_card", StringComparison.OrdinalIgnoreCase))
         {
             RememberExecuted(claim.Action.SubmissionId);
-            ReportResult(claim, "unsupported", $"R5.1은 {legalAction.ActionType} 행동을 실행하지 않습니다.");
+            ReportResult(claim, "unsupported", $"{legalAction.ActionType} 행동은 아직 실행기가 지원하지 않습니다.");
             return;
         }
 
         try
         {
-            if (TryExecuteEndTurn(context.CombatRoot, out string detail))
+            string detail;
+            bool applied = legalAction.ActionType.Equals("end_turn", StringComparison.OrdinalIgnoreCase)
+                ? TryExecuteEndTurn(context.CombatRoot, out detail)
+                : TryExecutePlayCard(legalAction, context.CombatRoot, out detail);
+
+            if (applied)
             {
                 RememberExecuted(claim.Action.SubmissionId);
                 ReportResult(claim, "applied", detail);
@@ -244,6 +250,322 @@ internal static class CombatActionExecutor
             RememberExecuted(claim.Action.SubmissionId);
             ReportResult(claim, "failed", $"{exception.GetType().Name}: {exception.Message}");
         }
+    }
+
+    private static bool TryExecutePlayCard(LegalActionSnapshot legalAction, object combatRoot, out string detail)
+    {
+        if (legalAction.CombatCardId is null)
+        {
+            detail = "play_card 행동에 combat_card_id가 없습니다.";
+            return false;
+        }
+
+        if (!TryGetCombatCard((uint)legalAction.CombatCardId.Value, out object? card, out detail))
+        {
+            return false;
+        }
+
+        if (card is null)
+        {
+            detail = $"NetCombatCardDb가 null 카드를 반환했습니다. combat_card_id={legalAction.CombatCardId.Value}";
+            return false;
+        }
+
+        if (!IsCardInHand(card))
+        {
+            detail = $"카드가 현재 손패에 없습니다. combat_card_id={legalAction.CombatCardId.Value}";
+            return false;
+        }
+
+        if (!TryResolveCardTarget(legalAction, card, combatRoot, out object? target, out detail))
+        {
+            return false;
+        }
+
+        if (TryCheckCanPlayTargeting(card, target, out bool canPlay) && !canPlay)
+        {
+            detail = $"카드를 현재 대상에 사용할 수 없습니다. combat_card_id={legalAction.CombatCardId.Value}, target_id={legalAction.TargetId ?? "<none>"}";
+            return false;
+        }
+
+        if (!TryInvokeTryManualPlay(card, target, out bool enqueued, out detail))
+        {
+            return false;
+        }
+
+        if (!enqueued)
+        {
+            detail = $"TryManualPlay가 false를 반환했습니다. combat_card_id={legalAction.CombatCardId.Value}, target_id={legalAction.TargetId ?? "<none>"}";
+            return false;
+        }
+
+        string cardName = ReadNamedMember(card, "Title")?.ToString()
+            ?? ReadNamedMember(card, "Id")?.ToString()
+            ?? $"combat_card_{legalAction.CombatCardId.Value}";
+        string targetText = target is null
+            ? "대상 없음"
+            : ReadNamedMember(target, "LogName")?.ToString()
+                ?? ReadNamedMember(target, "Name")?.ToString()
+                ?? legalAction.TargetId
+                ?? "대상";
+        detail = $"PlayCardAction 입력 성공: card={cardName}, combat_card_id={legalAction.CombatCardId.Value}, target={targetText}";
+        Logger.Info(detail);
+        return true;
+    }
+
+    private static bool TryGetCombatCard(uint combatCardId, out object? card, out string detail)
+    {
+        card = null;
+        Type? databaseType = AccessTools.TypeByName("MegaCrit.Sts2.Core.GameActions.Multiplayer.NetCombatCardDb");
+        if (databaseType is null)
+        {
+            detail = "NetCombatCardDb 타입을 찾지 못했습니다.";
+            return false;
+        }
+
+        object? database = ReadStaticNamedMember(databaseType, "Instance");
+        if (database is null)
+        {
+            detail = "NetCombatCardDb.Instance를 찾지 못했습니다.";
+            return false;
+        }
+
+        MethodInfo? tryGetCard = databaseType
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .FirstOrDefault(method =>
+            {
+                if (!method.Name.Equals("TryGetCard", StringComparison.Ordinal))
+                {
+                    return false;
+                }
+
+                ParameterInfo[] parameters = method.GetParameters();
+                return parameters.Length == 2
+                    && parameters[0].ParameterType == typeof(uint);
+            });
+        if (tryGetCard is null)
+        {
+            detail = "NetCombatCardDb.TryGetCard(uint, out CardModel)를 찾지 못했습니다.";
+            return false;
+        }
+
+        object?[] args = { combatCardId, null };
+        try
+        {
+            object? result = tryGetCard.Invoke(database, args);
+            if (result is true && args[1] is not null)
+            {
+                card = args[1];
+                detail = "카드를 찾았습니다.";
+                return true;
+            }
+        }
+        catch (Exception exception)
+        {
+            detail = $"{exception.GetType().Name}: {exception.Message}";
+            return false;
+        }
+
+        detail = $"NetCombatCardDb에서 combat_card_id={combatCardId} 카드를 찾지 못했습니다.";
+        return false;
+    }
+
+    private static bool IsCardInHand(object? card)
+    {
+        object? pile = ReadNamedMember(card, "Pile");
+        object? pileType = ReadNamedMember(pile, "Type");
+        return pileType?.ToString()?.Contains("Hand", StringComparison.OrdinalIgnoreCase) == true;
+    }
+
+    private static bool TryResolveCardTarget(
+        LegalActionSnapshot legalAction,
+        object card,
+        object combatRoot,
+        out object? target,
+        out string detail)
+    {
+        target = null;
+        if (string.IsNullOrWhiteSpace(legalAction.TargetId))
+        {
+            detail = "대상이 필요 없는 카드입니다.";
+            return true;
+        }
+
+        object? combatState = FindCombatState(card)
+            ?? FindCombatState(combatRoot)
+            ?? FindCombatState(CombatStateExporter.GetLatestRuntimePlayer());
+        if (combatState is null)
+        {
+            detail = "카드 대상을 찾기 위한 CombatState를 찾지 못했습니다.";
+            return false;
+        }
+
+        if (legalAction.TargetCombatId is not null)
+        {
+            target = FindCreatureByCombatId(combatState, legalAction.TargetCombatId.Value);
+            if (target is not null)
+            {
+                detail = $"target_combat_id={legalAction.TargetCombatId.Value} 대상을 찾았습니다.";
+                return true;
+            }
+        }
+
+        if (TryParseEnemyIndex(legalAction.TargetId, out int enemyIndex))
+        {
+            target = EnumerateEnemies(combatState).Skip(enemyIndex).FirstOrDefault();
+            if (target is not null)
+            {
+                detail = $"target_id={legalAction.TargetId} 순서 대상을 찾았습니다.";
+                return true;
+            }
+        }
+
+        detail = $"대상을 찾지 못했습니다. target_id={legalAction.TargetId}, target_combat_id={legalAction.TargetCombatId?.ToString() ?? "<none>"}";
+        return false;
+    }
+
+    private static object? FindCombatState(object? source)
+    {
+        if (source is null)
+        {
+            return null;
+        }
+
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        if (typeName.Equals("MegaCrit.Sts2.Core.Combat.CombatState", StringComparison.Ordinal)
+            || typeName.EndsWith(".CombatState", StringComparison.Ordinal))
+        {
+            return source;
+        }
+
+        object? direct = ReadNamedMember(source, "CombatState");
+        if (direct is not null)
+        {
+            return direct;
+        }
+
+        object? owner = ReadNamedMember(source, "Owner");
+        object? creature = ReadNamedMember(owner, "Creature")
+            ?? ReadNamedMember(source, "Creature");
+        return ReadNamedMember(creature, "CombatState");
+    }
+
+    private static object? FindCreatureByCombatId(object combatState, int combatId)
+    {
+        foreach (object creature in EnumerateCreatures(combatState))
+        {
+            int? candidateId = ReadInt(creature, "CombatId");
+            if (candidateId == combatId)
+            {
+                return creature;
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<object> EnumerateCreatures(object combatState)
+    {
+        return ExpandValue(ReadNamedMember(combatState, "Creatures"))
+            .Where(value => !IsScalar(value.GetType()));
+    }
+
+    private static IEnumerable<object> EnumerateEnemies(object combatState)
+    {
+        return ExpandValue(ReadNamedMember(combatState, "Enemies"))
+            .Where(value => !IsScalar(value.GetType()));
+    }
+
+    private static bool TryParseEnemyIndex(string? targetId, out int index)
+    {
+        index = -1;
+        if (string.IsNullOrWhiteSpace(targetId)
+            || !targetId.StartsWith("enemy_", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return int.TryParse(targetId["enemy_".Length..], out index) && index >= 0;
+    }
+
+    private static bool TryCheckCanPlayTargeting(object card, object? target, out bool canPlay)
+    {
+        canPlay = false;
+        MethodInfo? method = FindSingleArgumentMethod(card.GetType(), "CanPlayTargeting", target);
+        if (method is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            object? result = method.Invoke(card, new[] { target });
+            if (result is bool boolean)
+            {
+                canPlay = boolean;
+                return true;
+            }
+        }
+        catch
+        {
+            return false;
+        }
+
+        return false;
+    }
+
+    private static bool TryInvokeTryManualPlay(object card, object? target, out bool enqueued, out string detail)
+    {
+        enqueued = false;
+        MethodInfo? method = FindSingleArgumentMethod(card.GetType(), "TryManualPlay", target);
+        if (method is null)
+        {
+            detail = "CardModel.TryManualPlay(Creature?)를 찾지 못했습니다.";
+            return false;
+        }
+
+        try
+        {
+            object? result = method.Invoke(card, new[] { target });
+            if (result is bool boolean)
+            {
+                enqueued = boolean;
+                detail = $"TryManualPlay 반환값: {boolean}";
+                return true;
+            }
+
+            detail = $"TryManualPlay 반환 타입이 bool이 아닙니다: {DescribeResult(result)}";
+            return false;
+        }
+        catch (TargetInvocationException exception) when (exception.InnerException is not null)
+        {
+            detail = $"{exception.InnerException.GetType().Name}: {exception.InnerException.Message}";
+            return false;
+        }
+        catch (Exception exception)
+        {
+            detail = $"{exception.GetType().Name}: {exception.Message}";
+            return false;
+        }
+    }
+
+    private static MethodInfo? FindSingleArgumentMethod(Type type, string methodName, object? argument)
+    {
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        return type.GetMethods(flags)
+            .Where(method => method.Name.Equals(methodName, StringComparison.OrdinalIgnoreCase))
+            .Where(method => method.GetParameters().Length == 1)
+            .FirstOrDefault(method => IsArgumentCompatible(method.GetParameters()[0].ParameterType, argument));
+    }
+
+    private static bool IsArgumentCompatible(Type parameterType, object? argument)
+    {
+        if (argument is null)
+        {
+            return !parameterType.IsValueType || Nullable.GetUnderlyingType(parameterType) is not null;
+        }
+
+        return parameterType.IsAssignableFrom(argument.GetType());
     }
 
     private static bool TryExecuteEndTurn(object combatRoot, out string detail)
