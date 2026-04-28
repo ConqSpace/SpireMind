@@ -56,7 +56,7 @@ node .\bridge\spiremind_decision_loop.js `
   --run-log-dir "$env:APPDATA\SlayTheSpire2\SpireMind\runs\combat_001"
 ```
 
-이 모드는 `phase`가 `combat_turn`이고 살아 있는 적과 가능한 행동이 있을 때만 판단한다. 적 턴, 애니메이션, 전환처럼 아직 판단할 수 없는 전투 상태는 기다린다. 플레이어가 쓰러졌거나, 살아 있는 적이 없거나, 전투 밖 화면으로 넘어가면 `combat_loop_stopped` 이벤트를 남기고 멈춘다.
+이 모드는 `phase`가 `combat_turn`이고 살아 있는 적과 가능한 행동이 있을 때만 판단한다. 적 턴, 애니메이션, 전환처럼 아직 판단할 수 없는 전투 상태는 기다린다. 플레이어가 쓰러졌거나, 살아 있는 적이 없거나, 전투 밖 화면으로 넘어가면 `combat_ended`와 `combat_loop_stopped` 이벤트를 남기고 멈춘다.
 
 ### `command`
 
@@ -120,6 +120,21 @@ Codex CLI를 붙일 때는 `scripts/codex_decider.js`를 사용한다. 자세한
 
 같은 정보는 `combat_log.jsonl`의 `action_result_observed` 이벤트에도 남는다. 따라서 한 판단이 어떤 행동을 냈고, 그 행동 뒤에 전투 상태가 어떻게 바뀌었는지 한 줄 단위로 추적할 수 있다.
 
+## 전투 종료 기록
+
+`--until-combat-end` 모드는 반복 판단이 멈출 때 `combat_ended` 이벤트를 먼저 남기고, 이어서 `combat_loop_stopped` 이벤트를 남긴다.
+
+`combat_ended`에는 다음 요약이 들어간다.
+
+- 종료 사유: `player_defeated`, `no_live_enemies`, `non_combat_phase:*`
+- 시작 상태와 종료 상태
+- 시작 체력, 종료 체력, 체력 손실
+- 판단 수, 실행된 행동 수, 턴 종료 수
+- stale 재시도 수, 결과 대기 시간 초과 수, 제출 실패 수
+- 기록된 적 체력 감소량
+
+`combat_loop_stopped`에는 같은 요약이 `combat_outcome`으로 들어간다. 이 이벤트는 루프 제어용이고, `combat_ended`는 이후 보상 화면과 전체 등반 기록을 연결하기 위한 전투 결과 기록이다.
+
 ## 최근 기록 전달
 
 `command` 모드에서 `--run-log-dir`를 함께 쓰면 의사결정 루프는 최근 `combat_log.jsonl`과 `decisions.jsonl` 일부를 읽어 외부 판단기에 `recent_history`로 보낸다.
@@ -166,4 +181,4 @@ node .\bridge\spiremind_decision_loop.js `
 - `heuristic`은 공격 카드 중심 검증용 판단기다.
 - X 비용 카드, 에너지 생성 카드, 드로우 후 추가 행동 가치는 아직 정교하게 계산하지 않는다.
 - `command` 모드는 외부 판단기의 실행 형식만 제공한다. Codex CLI용 장기 상주 세션 연결은 다음 단계에서 별도 설계가 필요하다.
-- 현재 전투 로그는 `combat_observed`, `decision_submitted`, `action_result_observed`만 남긴다. 전투 시작/종료, 턴 시작/종료, 피해량 변화 같은 세부 이벤트 수집은 아직 별도 구현이 필요하다.
+- 현재 전투 로그는 `combat_observed`, `decision_submitted`, `action_result_observed`, `combat_ended`, `combat_loop_stopped`를 남긴다. 턴 시작/종료와 피해 원인 분해 같은 세부 이벤트 수집은 아직 별도 구현이 필요하다.

@@ -338,14 +338,23 @@ try {
     if ($combatStop.status -ne "combat_loop_stopped" -or $combatStop.reason -ne "no_live_enemies") {
         throw "전투 반복 루프 종료 감지 결과가 올바르지 않습니다: $combatStopText"
     }
+    if ($null -eq $combatStop.combat_outcome -or $combatStop.combat_outcome.reason -ne "no_live_enemies") {
+        throw "전투 종료 결과 요약이 stdout에 포함되지 않았습니다."
+    }
+    if ($null -eq $combatStop.combat_outcome.player -or $null -eq $combatStop.combat_outcome.actions_applied) {
+        throw "전투 종료 결과 요약에 플레이어와 행동 집계가 없습니다."
+    }
 
     $combatStopLogPath = Join-Path $combatStopRunLogDir "combat_log.jsonl"
     if (-not (Test-Path $combatStopLogPath)) {
         throw "전투 반복 루프 종료 로그가 생성되지 않았습니다."
     }
     $combatStopLogText = Get-Content -Raw -Encoding UTF8 $combatStopLogPath
-    if ($combatStopLogText -notmatch '"event_type":"combat_loop_stopped"') {
+    if ($combatStopLogText -notmatch '"event_type":"combat_loop_stopped"' -or $combatStopLogText -notmatch '"event_type":"combat_ended"') {
         throw "전투 반복 루프 종료 이벤트가 기록되지 않았습니다."
+    }
+    if ($combatStopLogText -notmatch '"combat_outcome"') {
+        throw "전투 반복 루프 종료 이벤트에 결과 요약이 기록되지 않았습니다."
     }
 
     $null = Invoke-RestMethod `
@@ -424,6 +433,7 @@ try {
         memory_summary = $memorySummary
         state_delta = $waitDecisionRecord.state_delta
         combat_stop_reason = $combatStop.reason
+        combat_outcome = $combatStop.combat_outcome
         submitted_action = $latest.latest_action.selected_action_id
         stale_retry_status = $staleClaim.status
         retry_action = $retryLatest.latest_action.selected_action_id

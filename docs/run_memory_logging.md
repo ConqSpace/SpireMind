@@ -391,7 +391,8 @@ LLM 요청에는 다음만 넣는다.
 
 2. `combat_log.jsonl`
    - 전투 시작, 턴 시작, 행동 적용, 턴 종료, 전투 종료를 남긴다.
-   - 현재는 `combat_observed`, `decision_submitted`, `action_result_observed` 최소 이벤트만 구현되어 있다.
+   - 현재는 `combat_observed`, `decision_submitted`, `action_result_observed`, `combat_ended`, `combat_loop_stopped` 최소 이벤트가 구현되어 있다.
+   - `combat_ended`는 종료 사유, 시작/종료 체력, 체력 손실, 판단 수, 실행 행동 수, 턴 종료 수, 재시도/실패 수를 포함한다.
 
 3. `run_log.jsonl` 골격
    - 이벤트 이름과 파일 형식을 먼저 고정한다.

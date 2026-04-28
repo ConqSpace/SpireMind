@@ -987,6 +987,109 @@ function createCombatObservedEvent(options, decisionId, stateSummary) {
   };
 }
 
+function createCombatProgress(stateSummary) {
+  return {
+    started_at: nowIsoString(),
+    start_state_summary: stateSummary,
+    latest_state_summary: stateSummary,
+    decisions: 0,
+    actions_applied: 0,
+    end_turns_applied: 0,
+    stale_retries: 0,
+    result_timeouts: 0,
+    submit_failures: 0,
+    enemy_hp_lost: 0,
+    player_hp_lost: 0
+  };
+}
+
+function addDecisionRecordToCombatProgress(progress, record, fallbackAfterStateSummary) {
+  if (!progress || !isPlainObject(record)) {
+    return;
+  }
+
+  progress.decisions += 1;
+  progress.latest_state_summary = isPlainObject(record.after_state_summary)
+    ? record.after_state_summary
+    : (isPlainObject(fallbackAfterStateSummary) ? fallbackAfterStateSummary : progress.latest_state_summary);
+
+  if (record.status === "result_timeout") {
+    progress.result_timeouts += 1;
+  }
+  if (record.status === "submit_failed") {
+    progress.submit_failures += 1;
+  }
+
+  const finalPlan = isPlainObject(record.final_action_plan)
+    ? record.final_action_plan
+    : (isPlainObject(record.action_plan) ? record.action_plan : null);
+  if (finalPlan) {
+    progress.actions_applied += Array.isArray(finalPlan.completed) ? finalPlan.completed.length : 0;
+    progress.stale_retries += countObjectValues(finalPlan.stale_retries);
+  }
+
+  const finalLatestAction = isPlainObject(record.final_latest_action) ? record.final_latest_action : null;
+  if (!finalPlan && finalLatestAction && finalLatestAction.result === "applied") {
+    progress.actions_applied += 1;
+  }
+  if (finalLatestAction
+    && finalLatestAction.result === "applied"
+    && finalLatestAction.selected_action_id === "end_turn") {
+    progress.end_turns_applied += 1;
+  }
+
+  const stateDelta = isPlainObject(record.state_delta)
+    ? record.state_delta
+    : (isPlainObject(record.latest_state_delta) ? record.latest_state_delta : null);
+  const playerDelta = stateDelta && isPlainObject(stateDelta.player) ? stateDelta.player : null;
+  const playerHpLost = playerDelta ? readNumber(playerDelta.hp_lost) : null;
+  const enemyHpLost = stateDelta ? readNumber(stateDelta.enemy_hp_lost) : null;
+  if (playerHpLost !== null) {
+    progress.player_hp_lost += playerHpLost;
+  }
+  if (enemyHpLost !== null) {
+    progress.enemy_hp_lost += enemyHpLost;
+  }
+}
+
+function createCombatOutcome(options, progress, endStateSummary, reason, decisions) {
+  const startSummary = progress && isPlainObject(progress.start_state_summary)
+    ? progress.start_state_summary
+    : null;
+  const finalSummary = isPlainObject(endStateSummary)
+    ? endStateSummary
+    : (progress && isPlainObject(progress.latest_state_summary) ? progress.latest_state_summary : null);
+  const startPlayer = startSummary && isPlainObject(startSummary.player) ? startSummary.player : {};
+  const finalPlayer = finalSummary && isPlainObject(finalSummary.player) ? finalSummary.player : {};
+  const hpBefore = readNumber(startPlayer.hp);
+  const hpAfter = readNumber(finalPlayer.hp);
+
+  return {
+    play_session_id: options.playSessionId,
+    reason,
+    result: reason === "player_defeated"
+      ? "defeat"
+      : (reason === "no_live_enemies" || String(reason).startsWith("non_combat_phase:") ? "cleared_or_transitioned" : "stopped"),
+    started_at: progress ? progress.started_at : null,
+    ended_at: nowIsoString(),
+    decisions,
+    actions_applied: progress ? progress.actions_applied : 0,
+    turns_ended: progress ? progress.end_turns_applied : 0,
+    stale_retries: progress ? progress.stale_retries : 0,
+    result_timeouts: progress ? progress.result_timeouts : 0,
+    submit_failures: progress ? progress.submit_failures : 0,
+    player: {
+      hp_before: hpBefore,
+      hp_after: hpAfter,
+      hp_lost: hpBefore !== null && hpAfter !== null ? Math.max(0, hpBefore - hpAfter) : null,
+      recorded_hp_lost: progress ? progress.player_hp_lost : 0
+    },
+    enemy_hp_lost: progress ? progress.enemy_hp_lost : 0,
+    start_state: startSummary,
+    end_state: finalSummary
+  };
+}
+
 function createDecisionSubmittedEvent(options, decisionId, stateSummary, decision, submitted) {
   return {
     event_type: "decision_submitted",
@@ -1023,7 +1126,15 @@ function createActionResultObservedEvent(options, decisionId, finalLatest, final
   };
 }
 
-function createCombatStoppedEvent(options, stateSummary, reason, decisions) {
+function createCombatEndedEvent(outcome) {
+  return {
+    event_type: "combat_ended",
+    recorded_at: nowIsoString(),
+    ...outcome
+  };
+}
+
+function createCombatStoppedEvent(options, stateSummary, reason, decisions, outcome) {
   return {
     event_type: "combat_loop_stopped",
     recorded_at: nowIsoString(),
@@ -1035,7 +1146,8 @@ function createCombatStoppedEvent(options, stateSummary, reason, decisions) {
     phase: stateSummary.phase,
     player: stateSummary.player,
     live_enemy_count: countLiveEnemies(stateSummary),
-    hand_count: stateSummary.hand.length
+    hand_count: stateSummary.hand.length,
+    combat_outcome: outcome || null
   };
 }
 
@@ -1397,19 +1509,22 @@ async function main() {
   let decisions = 0;
   let lastSeenVersion = 0;
   let combatLoopStopped = false;
-  const observedCombatIds = new Set();
+  let combatProgress = null;
   while (decisions < options.maxDecisions) {
     const readiness = options.untilCombatEnd
       ? await waitForCombatDecisionOrStop(options, lastSeenVersion)
       : null;
     if (readiness && readiness.stopReason) {
       combatLoopStopped = true;
-      appendCombatLog(runLogDir, createCombatStoppedEvent(options, readiness.stateSummary, readiness.stopReason, decisions));
+      const combatOutcome = createCombatOutcome(options, combatProgress, readiness.stateSummary, readiness.stopReason, decisions);
+      appendCombatLog(runLogDir, createCombatEndedEvent(combatOutcome));
+      appendCombatLog(runLogDir, createCombatStoppedEvent(options, readiness.stateSummary, readiness.stopReason, decisions, combatOutcome));
       updateCombatStopMetrics(runLogDir);
       process.stdout.write(`${JSON.stringify({
         status: "combat_loop_stopped",
         reason: readiness.stopReason,
         decisions,
+        combat_outcome: combatOutcome,
         state_version: readiness.stateSummary.state_version,
         state_id: readiness.stateSummary.state_id,
         phase: readiness.stateSummary.phase,
@@ -1422,10 +1537,9 @@ async function main() {
     const stateVersion = readNumber(snapshot.state_version) ?? 0;
     const decisionId = createDecisionId();
     const stateSummary = readiness ? readiness.stateSummary : summarizeState(snapshot);
-    const combatKey = stateSummary.state_id || `state_version_${stateVersion}`;
-    const combatObserved = stateSummary.phase === "combat_turn" && !observedCombatIds.has(combatKey);
+    const combatObserved = stateSummary.phase === "combat_turn" && combatProgress === null;
     if (combatObserved) {
-      observedCombatIds.add(combatKey);
+      combatProgress = createCombatProgress(stateSummary);
       appendCombatLog(runLogDir, createCombatObservedEvent(options, decisionId, stateSummary));
     }
     const decisionStartedAt = Date.now();
@@ -1454,6 +1568,7 @@ async function main() {
         updateMetrics(runLogDir, record);
         rebuildMemorySummary(runLogDir, options);
       }
+      addDecisionRecordToCombatProgress(combatProgress, record, stateSummary);
       process.stdout.write(`${JSON.stringify({ status: "dry_run", state_version: stateVersion, decision }, null, 2)}\n`);
     } else {
       if (options.untilCombatEnd) {
@@ -1480,6 +1595,7 @@ async function main() {
             updateMetrics(runLogDir, record);
             rebuildMemorySummary(runLogDir, options);
           }
+          addDecisionRecordToCombatProgress(combatProgress, record, latestBeforeSubmitSummary);
           process.stdout.write(`${JSON.stringify({
             status: "decision_stale_before_submit",
             state_version: stateVersion,
@@ -1521,6 +1637,7 @@ async function main() {
           updateMetrics(runLogDir, record);
           rebuildMemorySummary(runLogDir, options);
         }
+        addDecisionRecordToCombatProgress(combatProgress, record, stateSummary);
         throw error;
       }
       appendCombatLog(runLogDir, createDecisionSubmittedEvent(options, decisionId, stateSummary, decision, submitted));
@@ -1591,6 +1708,7 @@ async function main() {
         updateMetrics(runLogDir, record);
         rebuildMemorySummary(runLogDir, options);
       }
+      addDecisionRecordToCombatProgress(combatProgress, record, afterStateSummary);
       if (finalLatest) {
         appendCombatLog(runLogDir, createActionResultObservedEvent(options, decisionId, finalLatest, finalStatus, afterStateSummary, stateDelta));
       }
