@@ -241,6 +241,7 @@ try {
     $deciderConfigPath = Join-Path $runLogDir "decider_config.json"
     $scenarioConfigPath = Join-Path $runLogDir "scenario_config.json"
     $combatLogPath = Join-Path $runLogDir "combat_log.jsonl"
+    $memorySummaryPath = Join-Path $runLogDir "memory_summary.json"
     if (-not (Test-Path $decisionsPath)) {
         throw "decisions.jsonl이 생성되지 않았습니다."
     }
@@ -256,6 +257,9 @@ try {
     if (-not (Test-Path $combatLogPath)) {
         throw "combat_log.jsonl이 생성되지 않았습니다."
     }
+    if (-not (Test-Path $memorySummaryPath)) {
+        throw "memory_summary.json이 생성되지 않았습니다."
+    }
 
     $decisionRecords = @(Get-Content -Encoding UTF8 $decisionsPath | ForEach-Object { $_ | ConvertFrom-Json })
     $waitDecisionRecord = $decisionRecords | Select-Object -First 1
@@ -264,6 +268,10 @@ try {
     }
     if ($null -eq $waitDecisionRecord.state_delta.player -or $null -eq $waitDecisionRecord.state_delta.enemies) {
         throw "state_delta에 플레이어 변화와 적 변화가 기록되지 않았습니다."
+    }
+    $memorySummary = Get-Content -Raw -Encoding UTF8 $memorySummaryPath | ConvertFrom-Json
+    if ($memorySummary.source.decisions_seen -lt 1 -or $memorySummary.combat.decisions_recorded -lt 1) {
+        throw "memory_summary.json에 판단 기록 요약이 반영되지 않았습니다."
     }
 
     $metrics = Get-Content -Raw -Encoding UTF8 $metricsPath | ConvertFrom-Json
@@ -287,7 +295,7 @@ try {
         throw "combat_log.jsonl에 판단 전후 변화량이 기록되지 않았습니다."
     }
 
-    $historyCommandScript = "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',(chunk)=>input+=chunk);process.stdin.on('end',()=>{const request=JSON.parse(input);if(!request.recent_history||!Array.isArray(request.recent_history.combat_events)||request.recent_history.combat_events.length<1){process.exit(2);}process.stdout.write(JSON.stringify({selected_action_id:'end_turn',reason:'recent history observed'}));});"
+    $historyCommandScript = "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',(chunk)=>input+=chunk);process.stdin.on('end',()=>{const request=JSON.parse(input);if(!request.recent_history||!request.recent_history.memory_summary||!Array.isArray(request.recent_history.combat_events)||request.recent_history.combat_events.length<1){process.exit(2);}process.stdout.write(JSON.stringify({selected_action_id:'end_turn',reason:'recent history observed'}));});"
     $historyDryRunText = & node $decisionLoopPath `
         --bridge-url $BridgeUrl `
         --mode command `
@@ -413,6 +421,7 @@ try {
         run_log_dir = $runLogDir
         metrics = $metrics
         scenario_id = $scenarioConfig.scenario_id
+        memory_summary = $memorySummary
         state_delta = $waitDecisionRecord.state_delta
         combat_stop_reason = $combatStop.reason
         submitted_action = $latest.latest_action.selected_action_id

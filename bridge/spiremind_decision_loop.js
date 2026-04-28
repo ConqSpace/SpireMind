@@ -323,6 +323,14 @@ function writeJsonFile(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+function readJsonFile(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+
+  return safeJsonParse(fs.readFileSync(filePath, "utf8"));
+}
+
 function appendJsonLine(filePath, value) {
   fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`, "utf8");
 }
@@ -764,6 +772,142 @@ function updateCombatStopMetrics(runLogDir) {
   return metrics;
 }
 
+function createEmptyMemorySummary(options) {
+  return {
+    play_session_id: options.playSessionId,
+    updated_at: nowIsoString(),
+    source: {
+      decisions_seen: 0,
+      combat_events_seen: 0
+    },
+    combat: {
+      decisions_recorded: 0,
+      actions_applied: 0,
+      end_turns_applied: 0,
+      stale_retries: 0,
+      result_timeouts: 0,
+      submit_failures: 0,
+      player_hp_lost: 0,
+      enemy_hp_lost: 0,
+      last_status: null
+    },
+    recent_notes: [],
+    risk_notes: []
+  };
+}
+
+function addUniqueNote(notes, note, limit) {
+  if (typeof note !== "string" || note.trim() === "") {
+    return;
+  }
+
+  const trimmed = note.trim();
+  const existingIndex = notes.indexOf(trimmed);
+  if (existingIndex >= 0) {
+    notes.splice(existingIndex, 1);
+  }
+
+  notes.push(trimmed);
+  while (notes.length > limit) {
+    notes.shift();
+  }
+}
+
+function formatDecisionNote(record) {
+  const status = typeof record.status === "string" ? record.status : "unknown";
+  const decision = isPlainObject(record.decision) ? record.decision : {};
+  const reason = typeof decision.reason === "string" && decision.reason.trim() !== ""
+    ? decision.reason.trim()
+    : null;
+  const stateDelta = isPlainObject(record.state_delta) ? record.state_delta : null;
+  const playerDelta = stateDelta && isPlainObject(stateDelta.player) ? stateDelta.player : null;
+  const hpLost = playerDelta ? readNumber(playerDelta.hp_lost) : null;
+  const enemyHpLost = stateDelta ? readNumber(stateDelta.enemy_hp_lost) : null;
+  const parts = [`판단 ${status}`];
+  if (hpLost !== null) {
+    parts.push(`체력 손실 ${hpLost}`);
+  }
+  if (enemyHpLost !== null) {
+    parts.push(`적 체력 감소 ${enemyHpLost}`);
+  }
+  if (reason) {
+    parts.push(`이유: ${reason}`);
+  }
+
+  return parts.join(", ");
+}
+
+function rebuildMemorySummary(runLogDir, options) {
+  if (!runLogDir) {
+    return null;
+  }
+
+  const decisions = readJsonLines(path.join(runLogDir, "decisions.jsonl"));
+  const combatEvents = readJsonLines(path.join(runLogDir, "combat_log.jsonl"));
+  const summary = createEmptyMemorySummary(options);
+  summary.source.decisions_seen = decisions.length;
+  summary.source.combat_events_seen = combatEvents.length;
+
+  for (const record of decisions) {
+    summary.combat.decisions_recorded += 1;
+    summary.combat.last_status = typeof record.status === "string" ? record.status : summary.combat.last_status;
+
+    if (record.status === "result_timeout") {
+      summary.combat.result_timeouts += 1;
+    }
+    if (record.status === "submit_failed") {
+      summary.combat.submit_failures += 1;
+    }
+
+    const finalPlan = isPlainObject(record.final_action_plan)
+      ? record.final_action_plan
+      : (isPlainObject(record.action_plan) ? record.action_plan : null);
+    if (finalPlan) {
+      summary.combat.actions_applied += Array.isArray(finalPlan.completed) ? finalPlan.completed.length : 0;
+      summary.combat.stale_retries += countObjectValues(finalPlan.stale_retries);
+    }
+
+    const finalLatestAction = isPlainObject(record.final_latest_action) ? record.final_latest_action : null;
+    if (!finalPlan && finalLatestAction && finalLatestAction.result === "applied") {
+      summary.combat.actions_applied += 1;
+    }
+    if (finalLatestAction
+      && finalLatestAction.result === "applied"
+      && finalLatestAction.selected_action_id === "end_turn") {
+      summary.combat.end_turns_applied += 1;
+    }
+
+    const stateDelta = isPlainObject(record.state_delta)
+      ? record.state_delta
+      : (isPlainObject(record.latest_state_delta) ? record.latest_state_delta : null);
+    const playerDelta = stateDelta && isPlainObject(stateDelta.player) ? stateDelta.player : null;
+    const hpLost = playerDelta ? readNumber(playerDelta.hp_lost) : null;
+    const enemyHpLost = stateDelta ? readNumber(stateDelta.enemy_hp_lost) : null;
+    if (hpLost !== null) {
+      summary.combat.player_hp_lost += hpLost;
+    }
+    if (enemyHpLost !== null) {
+      summary.combat.enemy_hp_lost += enemyHpLost;
+    }
+
+    addUniqueNote(summary.recent_notes, formatDecisionNote(record), 8);
+  }
+
+  if (summary.combat.player_hp_lost >= 15) {
+    addUniqueNote(summary.risk_notes, `최근 기록에서 누적 체력 손실이 ${summary.combat.player_hp_lost}입니다. 방어와 전투 종료 속도를 함께 고려해야 합니다.`, 4);
+  }
+  if (summary.combat.result_timeouts > 0) {
+    addUniqueNote(summary.risk_notes, `판단 결과 대기 시간 초과가 ${summary.combat.result_timeouts}회 있었습니다. 오래 걸리는 판단은 실행 시점의 상태와 어긋날 수 있습니다.`, 4);
+  }
+  if (summary.combat.submit_failures > 0) {
+    addUniqueNote(summary.risk_notes, `행동 제출 실패가 ${summary.combat.submit_failures}회 있었습니다. 현재 legal_actions만 사용해야 합니다.`, 4);
+  }
+
+  summary.updated_at = nowIsoString();
+  writeJsonFile(path.join(runLogDir, "memory_summary.json"), summary);
+  return summary;
+}
+
 function ensureScenarioConfigFile(runLogDir, options) {
   if (!runLogDir) {
     return;
@@ -812,6 +956,11 @@ function ensureRunRecordFiles(runLogDir, options) {
       result_timeout_ms: options.resultTimeoutMs,
       created_at: nowIsoString()
     });
+  }
+
+  const memorySummaryPath = path.join(runLogDir, "memory_summary.json");
+  if (!fs.existsSync(memorySummaryPath)) {
+    writeJsonFile(memorySummaryPath, createEmptyMemorySummary(options));
   }
 }
 
@@ -934,13 +1083,15 @@ function buildRecentHistory(runLogDir, limit) {
   const decisions = readJsonLines(path.join(runLogDir, "decisions.jsonl"))
     .map(pickRecentDecisionFields)
     .slice(-normalizedLimit);
+  const memorySummary = readJsonFile(path.join(runLogDir, "memory_summary.json"));
 
-  if (combatEvents.length === 0 && decisions.length === 0) {
+  if (combatEvents.length === 0 && decisions.length === 0 && !isPlainObject(memorySummary)) {
     return null;
   }
 
   return {
     limit: normalizedLimit,
+    memory_summary: isPlainObject(memorySummary) ? memorySummary : null,
     combat_events: combatEvents,
     decisions
   };
@@ -1301,6 +1452,7 @@ async function main() {
       if (runLogDir) {
         appendJsonLine(path.join(runLogDir, "decisions.jsonl"), record);
         updateMetrics(runLogDir, record);
+        rebuildMemorySummary(runLogDir, options);
       }
       process.stdout.write(`${JSON.stringify({ status: "dry_run", state_version: stateVersion, decision }, null, 2)}\n`);
     } else {
@@ -1326,6 +1478,7 @@ async function main() {
           if (runLogDir) {
             appendJsonLine(path.join(runLogDir, "decisions.jsonl"), record);
             updateMetrics(runLogDir, record);
+            rebuildMemorySummary(runLogDir, options);
           }
           process.stdout.write(`${JSON.stringify({
             status: "decision_stale_before_submit",
@@ -1366,6 +1519,7 @@ async function main() {
         if (runLogDir) {
           appendJsonLine(path.join(runLogDir, "decisions.jsonl"), record);
           updateMetrics(runLogDir, record);
+          rebuildMemorySummary(runLogDir, options);
         }
         throw error;
       }
@@ -1435,6 +1589,7 @@ async function main() {
       if (runLogDir) {
         appendJsonLine(path.join(runLogDir, "decisions.jsonl"), record);
         updateMetrics(runLogDir, record);
+        rebuildMemorySummary(runLogDir, options);
       }
       if (finalLatest) {
         appendCombatLog(runLogDir, createActionResultObservedEvent(options, decisionId, finalLatest, finalStatus, afterStateSummary, stateDelta));

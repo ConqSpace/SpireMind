@@ -399,6 +399,8 @@ LLM 요청에는 다음만 넣는다.
 
 4. `memory_summary.json`
    - 전투와 런 로그를 바탕으로 LLM 입력용 요약을 만든다.
+   - 현재는 `decisions.jsonl`과 `combat_log.jsonl`에서 판단 수, 실행 행동 수, 턴 종료 수, 누적 체력 손실, 누적 적 체력 감소, 최근 판단 메모, 위험 메모를 압축해 저장한다.
+   - `command` 모드에서 `--run-log-dir`를 쓰면 이 요약이 `recent_history.memory_summary`로 판단기에 전달된다.
 
 ## 열어둘 범위
 

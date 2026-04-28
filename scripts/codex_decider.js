@@ -146,8 +146,10 @@ function compactRecentHistory(request) {
   const decisions = Array.isArray(history.decisions)
     ? history.decisions.filter(isPlainObject)
     : [];
+  const memorySummary = isPlainObject(history.memory_summary) ? history.memory_summary : null;
 
   return {
+    memory_summary: memorySummary,
     combat_events: combatEvents.map((event) => ({
       event_type: typeof event.event_type === "string" ? event.event_type : null,
       status: typeof event.status === "string" ? event.status : null,

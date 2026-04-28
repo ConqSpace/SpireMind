@@ -135,7 +135,7 @@ node .\bridge\spiremind_decision_loop.js `
   --run-log-dir "$env:APPDATA\SlayTheSpire2\SpireMind\runs\combat_001"
 ```
 
-`recent_history`에는 판단 결과, 행동 결과, `state_delta`가 들어간다. 판단기는 이전 턴에 체력을 얼마나 잃었는지, 적 체력을 얼마나 줄였는지, 어떤 계획이 실패했는지 참고할 수 있다. 단, 현재 턴에서 실제로 실행 가능한 행동은 항상 최신 `legal_actions`가 결정한다.
+`recent_history`에는 `memory_summary.json`의 압축 기억, 최근 판단 결과, 행동 결과, `state_delta`가 들어간다. 판단기는 이전 턴에 체력을 얼마나 잃었는지, 적 체력을 얼마나 줄였는지, 어떤 계획이 실패했는지 참고할 수 있다. 단, 현재 턴에서 실제로 실행 가능한 행동은 항상 최신 `legal_actions`가 결정한다.
 
 ## 검증
 
