@@ -47,8 +47,9 @@ STS2 모드
 
 - `bridge/spiremind_bridge.js`
 - `bridge/spiremind_mcp_proxy.js`
+- `bridge/spiremind_decision_loop.js`
 
-둘 다 Node.js 기본 모듈만 사용한다.
+모두 Node.js 기본 모듈만 사용한다.
 
 ## HTTP endpoint
 
@@ -126,6 +127,14 @@ STS2 모드가 실행 결과를 보고한다.
 
 브리지는 결과를 `latest_action.json`, `events.jsonl`, `bridge.log`에 남긴다.
 
+### 상태 변경 재시도
+
+카드 여러 장을 순서대로 실행하면 각 카드 사용 뒤 전투 상태가 바뀐다. 이때 다음 행동이 `claim` 직전에 `stale`로 판정될 수 있다.
+
+브리지는 계획에 포함된 행동이 `stale`이 되면 같은 계획 단계를 최신 상태 기준으로 다시 맞춘다. 카드 행동은 `combat_card_id`와 `target_combat_id`를 우선 사용한다. 같은 단계가 계속 맞지 않으면 최대 2회까지만 다시 제출하고, 이후에는 계획을 실패로 닫는다.
+
+이 규칙 덕분에 LLM은 한 턴 안에서 `강타 -> 타격 -> 턴 종료` 같은 행동 묶음을 제출할 수 있다. 브리지는 각 행동 사이에 바뀐 손패와 에너지를 확인하면서 다음 행동을 다시 검증한다.
+
 ## MCP 도구
 
 ### `wait_for_decision_request`
@@ -169,11 +178,19 @@ $env:SPIREMIND_BRIDGE_URL = "http://127.0.0.1:17832"
 codex mcp add spiremind-bridge -- node F:\Antigravity\STSAutoplay\bridge\spiremind_mcp_proxy.js
 ```
 
+의사결정 루프를 한 번 실행할 때:
+
+```powershell
+node .\bridge\spiremind_decision_loop.js --mode heuristic --once --max-actions-per-turn 2
+```
+
+LLM 또는 Codex CLI를 외부 명령으로 붙이는 방식은 [decision_loop.md](./decision_loop.md)에 정리한다.
+
 ## 현재 한계
 
-- R4는 행동 실행을 하지 않는다.
 - MCP 프록시는 상태 조회와 행동 제출만 담당한다.
-- 게임 행동을 실제로 실행하는 경로는 R5에서 `claim -> 실행 -> result` 흐름으로 만든다.
+- 의사결정 루프의 `heuristic` 모드는 연결 검증용 기준선이다.
+- Codex CLI 장기 상주 세션 연결은 아직 별도 구현이 필요하다.
 
 ## 나중에 열어둘 에이전트 구조
 

@@ -1,0 +1,107 @@
+# 의사결정 루프
+
+이 문서는 `bridge/spiremind_decision_loop.js`의 역할과 실행 방법을 정리한다.
+
+의사결정 루프의 목적은 브리지에 쌓인 최신 전투 상태를 읽고, 그 상태에 맞는 행동 묶음을 다시 브리지에 제출하는 것이다. 게임 조작은 직접 하지 않는다. 실제 실행은 STS2 모드가 `/action/claim`으로 행동을 확보한 뒤 처리한다.
+
+## 현재 목표
+
+- 브리지의 `/state/current`를 반복 조회한다.
+- 아직 처리 중인 행동이 없고 전투 상태가 준비됐을 때만 판단한다.
+- `combat_card_id`, `target_combat_id` 기반 행동을 제출한다.
+- 여러 장의 카드를 순서대로 쓰는 계획을 `actions` 배열로 제출한다.
+- 마지막에 `end_turn`을 붙여 한 턴 단위 실행을 닫는다.
+
+## 실행 모드
+
+### `heuristic`
+
+현재 검증용 기본 모드다.
+
+사용 가능한 공격 카드를 에너지 범위 안에서 앞에서부터 고른다. 그 뒤 `end_turn`을 붙인다. 이 모드는 강한 플레이를 목표로 하지 않는다. 브리지, 모드, 행동 실행 흐름이 안정적으로 연결됐는지 확인하는 기준선이다.
+
+```powershell
+node .\bridge\spiremind_decision_loop.js --mode heuristic --once --max-actions-per-turn 2
+```
+
+실행 전 판단만 확인할 때:
+
+```powershell
+node .\bridge\spiremind_decision_loop.js --mode heuristic --once --dry-run
+```
+
+### `command`
+
+LLM 또는 Codex CLI 같은 외부 판단기를 붙이기 위한 모드다.
+
+의사결정 루프는 현재 상태와 규칙을 JSON 프롬프트로 외부 명령의 stdin에 전달한다. 외부 명령은 stdout으로 JSON만 반환해야 한다.
+
+```powershell
+node .\bridge\spiremind_decision_loop.js `
+  --mode command `
+  --command node `
+  --command-arg .\scripts\my_decider.js
+```
+
+반환 형식:
+
+```json
+{
+  "actions": [
+    {
+      "type": "play_card",
+      "combat_card_id": 0,
+      "target_combat_id": 1
+    },
+    {
+      "type": "end_turn"
+    }
+  ],
+  "reason": "공격 카드를 먼저 사용한 뒤 턴을 종료합니다."
+}
+```
+
+단일 행동만 제출할 수도 있다.
+
+```json
+{
+  "selected_action_id": "end_turn",
+  "reason": "남은 에너지로 의미 있는 행동이 없습니다."
+}
+```
+
+## 상태 변경 대응
+
+카드를 여러 장 순서대로 쓰면 한 장을 쓸 때마다 손패, 에너지, 적 체력, `state_version`이 바뀐다.
+
+브리지는 계획의 다음 행동을 실행 직전 최신 상태에 다시 맞춘다. `combat_card_id`와 `target_combat_id`를 우선 사용하므로, 같은 이름 카드가 여러 장 있어도 어떤 전투 카드였는지 구분할 수 있다.
+
+실행자가 행동을 확보하려는 순간 상태가 바뀌면 `/action/claim`이 `stale`이 될 수 있다. 이 경우 브리지는 같은 계획 단계를 최신 `legal_actions` 기준으로 최대 2회 다시 제출한다. 다시 맞출 수 없으면 계획을 실패로 닫는다.
+
+## 검증
+
+브리지와 의사결정 루프만 빠르게 확인할 때:
+
+```powershell
+.\scripts\decision_loop_smoke_check.ps1
+```
+
+이 검증은 다음을 확인한다.
+
+- 휴리스틱 판단이 JSON으로 생성된다.
+- 행동 묶음이 `/action/submit`으로 제출된다.
+- 일부러 만든 `stale` claim 상황에서 같은 계획 단계가 다시 큐에 들어간다.
+
+실제 게임까지 포함한 검증은 다음 흐름으로 본다.
+
+1. 브리지를 실행한다.
+2. STS2를 실행한다.
+3. `continue_run` 자동 명령으로 전투에 진입한다.
+4. 의사결정 루프를 `--once`로 실행한다.
+5. 브리지의 `/action/latest`와 게임 로그에서 카드 사용, 턴 종료, 계획 상태를 확인한다.
+
+## 현재 한계
+
+- `heuristic`은 공격 카드 중심 검증용 판단기다.
+- X 비용 카드, 에너지 생성 카드, 드로우 후 추가 행동 가치는 아직 정교하게 계산하지 않는다.
+- `command` 모드는 외부 판단기의 실행 형식만 제공한다. Codex CLI용 장기 상주 세션 연결은 다음 단계에서 별도 설계가 필요하다.

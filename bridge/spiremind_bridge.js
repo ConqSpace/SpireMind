@@ -777,6 +777,75 @@ function advanceActionPlanAfterStateUpdate(state) {
   });
 }
 
+function retryCurrentPlanStepAfterStale(state, staleAction, note) {
+  const plan = state.actionPlan;
+  if (!plan || plan.status !== "running" || staleAction.plan_id !== plan.plan_id) {
+    return null;
+  }
+
+  const actionIndex = Number(staleAction.plan_action_index);
+  if (!Number.isInteger(actionIndex) || actionIndex < 0 || actionIndex >= plan.actions.length) {
+    return null;
+  }
+
+  if (!isPlainObject(plan.stale_retries)) {
+    plan.stale_retries = {};
+  }
+
+  const retryCount = Number(plan.stale_retries[String(actionIndex)] || 0);
+  if (retryCount >= 2) {
+    return null;
+  }
+
+  const plannedAction = plan.actions[actionIndex];
+  const resolved = resolveLegalActionForPlannedStep(state.currentState, plannedAction);
+  if (!resolved.ok) {
+    return null;
+  }
+
+  plan.stale_retries[String(actionIndex)] = retryCount + 1;
+  plan.current_index = actionIndex;
+  const submission = createActionSubmissionFromLegalAction(state, resolved.legalAction, {
+    source: plan.source,
+    note: plan.reason || note
+  });
+  submission.plan_id = plan.plan_id;
+  submission.plan_action_index = actionIndex;
+  submission.planned_action = plannedAction;
+  setLatestAction(state, submission);
+  appendEvent(state, "action_plan_step_retried_after_stale", {
+    plan_id: plan.plan_id,
+    action_index: actionIndex,
+    retry_count: retryCount + 1,
+    stale_submission_id: staleAction.submission_id,
+    submission_id: submission.submission_id,
+    selected_action_id: submission.selected_action_id
+  });
+  return submission;
+}
+
+function failCurrentPlanStepAfterStale(state, staleAction, note) {
+  if (!state.actionPlan
+    || state.actionPlan.status !== "running"
+    || staleAction.plan_id !== state.actionPlan.plan_id) {
+    return;
+  }
+
+  state.actionPlan.status = "failed";
+  state.actionPlan.failure = {
+    action_index: staleAction.plan_action_index,
+    submission_id: staleAction.submission_id,
+    result: "stale",
+    reason: note || "stale 행동을 최신 상태에서 다시 제출하지 못했습니다."
+  };
+  updateLatestAction(state, "action_plan_failed", {
+    plan_id: state.actionPlan.plan_id,
+    action_index: staleAction.plan_action_index,
+    submission_id: staleAction.submission_id,
+    result: "stale"
+  });
+}
+
 function updateLatestAction(state, eventType, details) {
   if (state.latestAction) {
     writeJsonFile(state.latestActionFilePath, state.latestAction);
@@ -881,6 +950,17 @@ function createActionClaim(state, claimArguments) {
       observed_state_version: observedStateVersion
     });
 
+    const retrySubmission = retryCurrentPlanStepAfterStale(state, latestAction, latestAction.result_note);
+    if (retrySubmission) {
+      return {
+        ok: true,
+        status: "stale_retry_queued",
+        reason: "상태가 바뀐 행동을 최신 상태 기준으로 다시 제출했습니다.",
+        action: retrySubmission
+      };
+    }
+
+    failCurrentPlanStepAfterStale(state, latestAction, latestAction.result_note);
     return {
       ok: true,
       status: "stale",
@@ -900,6 +980,17 @@ function createActionClaim(state, claimArguments) {
       selected_action_id: latestAction.selected_action_id
     });
 
+    const retrySubmission = retryCurrentPlanStepAfterStale(state, latestAction, latestAction.result_note);
+    if (retrySubmission) {
+      return {
+        ok: true,
+        status: "stale_retry_queued",
+        reason: "사라진 행동을 최신 legal_actions 기준으로 다시 제출했습니다.",
+        action: retrySubmission
+      };
+    }
+
+    failCurrentPlanStepAfterStale(state, latestAction, latestAction.result_note);
     return {
       ok: true,
       status: "stale",
@@ -1002,7 +1093,8 @@ function createActionResult(state, resultArguments) {
   if (state.actionPlan
     && state.actionPlan.status === "running"
     && latestAction.plan_id === state.actionPlan.plan_id
-    && result !== "applied") {
+    && result !== "applied"
+    && result !== "stale") {
     state.actionPlan.status = "failed";
     state.actionPlan.failure = {
       action_index: latestAction.plan_action_index,
@@ -1020,6 +1112,20 @@ function createActionResult(state, resultArguments) {
     observed_state_id: observedStateId || null,
     observed_state_version: observedStateVersion >= 0 ? observedStateVersion : null
   });
+
+  if (result === "stale") {
+    const retrySubmission = retryCurrentPlanStepAfterStale(state, latestAction, note);
+    if (retrySubmission) {
+      return {
+        ok: true,
+        status: "stale_retry_queued",
+        latest_action: retrySubmission,
+        action_plan: state.actionPlan
+      };
+    }
+
+    failCurrentPlanStepAfterStale(state, latestAction, note);
+  }
 
   return {
     ok: true,
