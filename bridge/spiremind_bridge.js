@@ -228,6 +228,15 @@ function readTrimmedString(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function readOptionalInteger(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const numberValue = Number(value);
+  return Number.isInteger(numberValue) ? numberValue : null;
+}
+
 function normalizeOptionalTargetId(value) {
   const targetId = readTrimmedString(value);
   return targetId === "" ? null : targetId;
@@ -235,11 +244,29 @@ function normalizeOptionalTargetId(value) {
 
 function findHandCardForAction(stateObject, actionObject) {
   const hand = getHandCards(stateObject);
+  const combatCardId = readOptionalInteger(actionObject.combat_card_id);
+  if (combatCardId !== null) {
+    const card = hand.find((candidate) => readOptionalInteger(candidate.combat_card_id) === combatCardId);
+    if (!card) {
+      return {
+        ok: false,
+        error: `현재 손패에서 combat_card_id ${combatCardId} 카드를 찾지 못했습니다.`
+      };
+    }
+
+    return {
+      ok: true,
+      card,
+      cardInstanceId: readTrimmedString(card.instance_id || card.card_instance_id)
+    };
+  }
+
   const directCardId = readTrimmedString(actionObject.card_id || actionObject.card_instance_id || actionObject.instance_id);
   if (directCardId !== "") {
     const card = hand.find((candidate) => {
       return readTrimmedString(candidate.instance_id) === directCardId
-        || readTrimmedString(candidate.card_instance_id) === directCardId;
+        || readTrimmedString(candidate.card_instance_id) === directCardId
+        || readTrimmedString(candidate.fallback_instance_id) === directCardId;
     });
     if (!card) {
       return {
@@ -283,11 +310,39 @@ function findHandCardForAction(stateObject, actionObject) {
 }
 
 function resolveTargetIdForAction(stateObject, actionObject) {
-  const explicitTargetId = normalizeOptionalTargetId(actionObject.target_id);
-  if (explicitTargetId !== null) {
+  const liveEnemies = getLiveEnemies(stateObject);
+  const targetCombatId = readOptionalInteger(actionObject.target_combat_id);
+  if (targetCombatId !== null) {
+    const enemy = liveEnemies.find((candidate) => readOptionalInteger(candidate.combat_id) === targetCombatId);
+    if (!enemy) {
+      return {
+        ok: false,
+        error: `현재 적 목록에서 target_combat_id ${targetCombatId} 대상을 찾지 못했습니다.`
+      };
+    }
+
+    const targetId = readTrimmedString(enemy.id);
+    if (targetId === "") {
+      return {
+        ok: false,
+        error: `target_combat_id ${targetCombatId} 대상에 id가 없습니다.`
+      };
+    }
+
     return {
       ok: true,
-      targetId: explicitTargetId
+      targetId,
+      targetCombatId
+    };
+  }
+
+  const explicitTargetId = normalizeOptionalTargetId(actionObject.target_id);
+  if (explicitTargetId !== null) {
+    const enemy = liveEnemies.find((candidate) => readTrimmedString(candidate.id) === explicitTargetId);
+    return {
+      ok: true,
+      targetId: explicitTargetId,
+      targetCombatId: enemy ? readOptionalInteger(enemy.combat_id) : null
     };
   }
 
@@ -296,12 +351,12 @@ function resolveTargetIdForAction(stateObject, actionObject) {
     || actionObject.target_index === undefined) {
     return {
       ok: true,
-      targetId: null
+      targetId: null,
+      targetCombatId: null
     };
   }
 
   const targetIndex = Number(actionObject.target_index);
-  const liveEnemies = getLiveEnemies(stateObject);
   if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= liveEnemies.length) {
     return {
       ok: false,
@@ -319,7 +374,8 @@ function resolveTargetIdForAction(stateObject, actionObject) {
 
   return {
     ok: true,
-    targetId
+    targetId,
+    targetCombatId: readOptionalInteger(liveEnemies[targetIndex].combat_id)
   };
 }
 
@@ -351,6 +407,22 @@ function resolveLegalActionForPlannedStep(stateObject, actionObject) {
     return {
       ok: false,
       error: "actions 배열의 각 항목은 JSON 객체여야 합니다."
+    };
+  }
+
+  const selectedActionId = readTrimmedString(actionObject.selected_action_id || actionObject.action_id);
+  if (selectedActionId !== "") {
+    const legalAction = getLegalActionById(stateObject, selectedActionId);
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: `현재 legal_actions에서 action_id '${selectedActionId}'를 찾지 못했습니다.`
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
     };
   }
 
@@ -393,9 +465,15 @@ function resolveLegalActionForPlannedStep(stateObject, actionObject) {
   }
 
   const legalAction = getLegalActions(stateObject).find((candidate) => {
+    const candidateTargetCombatId = readOptionalInteger(candidate.target_combat_id);
+    const targetCombatIdMatches = targetResult.targetCombatId === null
+      || candidateTargetCombatId === null
+      || candidateTargetCombatId === targetResult.targetCombatId;
+
     return readTrimmedString(candidate.type) === "play_card"
       && readTrimmedString(candidate.card_instance_id) === cardResult.cardInstanceId
-      && normalizeOptionalTargetId(candidate.target_id) === targetResult.targetId;
+      && normalizeOptionalTargetId(candidate.target_id) === targetResult.targetId
+      && targetCombatIdMatches;
   });
   if (!legalAction) {
     return {

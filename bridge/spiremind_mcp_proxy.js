@@ -307,6 +307,11 @@ function createToolsList() {
                   type: "string",
                   description: "combat_state.json 손패 카드의 instance_id입니다."
                 },
+                combat_card_id: {
+                  type: "integer",
+                  minimum: 0,
+                  description: "combat_state.json 손패 카드의 combat_card_id입니다."
+                },
                 hand_index: {
                   type: "integer",
                   minimum: 0
@@ -320,6 +325,16 @@ function createToolsList() {
                   minimum: 0
                 },
                 target_id: {
+                  type: "string"
+                },
+                target_combat_id: {
+                  type: "integer",
+                  minimum: 0
+                },
+                selected_action_id: {
+                  type: "string"
+                },
+                action_id: {
                   type: "string"
                 }
               }
