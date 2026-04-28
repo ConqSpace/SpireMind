@@ -30,6 +30,7 @@ internal static class AutotestMainThreadTicker
         try
         {
             Interlocked.Increment(ref tickCount);
+            CombatStateExporter.FlushPendingExportIfReady();
             CombatActionExecutor.TickMainThread();
             LogDiagnosticsIfNeeded("AutotestMainThreadTicker.Timer.Timeout");
         }

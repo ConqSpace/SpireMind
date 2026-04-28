@@ -322,6 +322,14 @@ internal static class AutotestCommandChannel
         return value is bool isInProgress && isInProgress;
     }
 
+    private static bool IsCombatPlayPhase()
+    {
+        Type? combatManagerType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Combat.CombatManager");
+        object? combatManager = ReadStaticMember(combatManagerType, "Instance");
+        object? value = ReadInstanceMember(combatManager, "IsPlayPhase");
+        return value is bool isPlayPhase && isPlayPhase;
+    }
+
     private static void CaptureCombatManagerDiagnostics(Dictionary<string, object?> diagnostics)
     {
         Type? combatManagerType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Combat.CombatManager");
@@ -337,6 +345,7 @@ internal static class AutotestCommandChannel
         diagnostics["combat_manager_found"] = combatManager is not null;
         diagnostics["combat_manager_type"] = combatManager?.GetType().FullName;
         diagnostics["combat_manager_is_in_progress"] = ReadInstanceMember(combatManager, "IsInProgress") is bool isInProgress && isInProgress;
+        diagnostics["combat_manager_is_play_phase"] = ReadInstanceMember(combatManager, "IsPlayPhase") is bool isPlayPhase && isPlayPhase;
         diagnostics["combat_manager_state_found"] = combatState is not null;
         diagnostics["combat_manager_state_type"] = combatState?.GetType().FullName;
         diagnostics["current_room_found"] = currentRoom is not null;
@@ -378,6 +387,7 @@ internal static class AutotestCommandChannel
         diagnostics["is_in_progress"] = ReadInstanceMember(runManager, "IsInProgress") is bool isInProgress && isInProgress;
         diagnostics["run_manager_is_in_progress"] = diagnostics["is_in_progress"];
         diagnostics["combat_in_progress"] = IsCombatInProgress();
+        diagnostics["combat_play_phase"] = IsCombatPlayPhase();
         diagnostics["n_run_instance_found"] = ReadStaticMember(AccessTools.TypeByName("MegaCrit.Sts2.Core.Nodes.NRun"), "Instance") is not null;
         diagnostics["n_map_screen_instance_found"] = TryReadStaticMember(
             AccessTools.TypeByName("MegaCrit.Sts2.Core.Nodes.Screens.Map.NMapScreen"),
@@ -1720,7 +1730,9 @@ internal static class AutotestCommandChannel
             exportReadyWaitCount++;
             long elapsedMs = Environment.TickCount64 - exportReadyWaitStartedAtMs;
             CombatStateExporter.CombatExportProbe fileProbe = CombatStateExporter.ReadLatestStateFileProbe("continue_run");
+            bool exportPending = CombatStateExporter.HasPendingExport;
             bool combatInProgress = IsCombatInProgress();
+            bool combatPlayPhase = IsCombatPlayPhase();
             bool stableCombatInProgress = ObserveStableCombatInProgress(combatInProgress);
             bool canForceExport = ShouldForceExportDuringReadyWait(stableCombatInProgress, elapsedMs);
             CombatStateExporter.CombatExportProbe probe = canForceExport
@@ -1734,6 +1746,7 @@ internal static class AutotestCommandChannel
             diagnostics["export_ready_force_export_interval_ms"] = ExportReadyForceExportIntervalMs;
             diagnostics["export_ready_stable_combat_ms"] = ExportReadyStableCombatMs;
             diagnostics["export_ready_combat_in_progress_stable"] = stableCombatInProgress;
+            diagnostics["export_ready_combat_play_phase"] = combatPlayPhase;
             diagnostics["export_ready_state_found"] = probe.StateFound;
             diagnostics["export_ready_has_player_vitals"] = probe.HasPlayerVitals;
             diagnostics["export_ready_has_hand_cards"] = probe.HasHandCards;
@@ -1754,12 +1767,15 @@ internal static class AutotestCommandChannel
             diagnostics["export_ready_file_enemy_count"] = fileProbe.EnemyCount;
             diagnostics["export_ready_file_reason"] = fileProbe.Reason;
             diagnostics["export_ready_file_is_stable"] = fileProbe.IsStable;
+            diagnostics["export_ready_pending_export"] = exportPending;
+            diagnostics["export_ready_pending_export_count"] = CombatStateExporter.PendingExportCount;
+            diagnostics["export_ready_pending_export_age_ms"] = CombatStateExporter.PendingExportAgeMs;
             combatInProgress = combatInProgress || probe.IsInProgress;
             diagnostics["export_ready_combat_in_progress_for_file_fallback"] = combatInProgress;
 
             // 대기 단계에서는 파일 기반 판정을 우선합니다.
             // 강제 export는 전투 준비가 안정적으로 보일 때만 낮은 빈도로 보조 확인합니다.
-            if (probe.IsStable || (combatInProgress && fileProbe.IsStable))
+            if (combatPlayPhase && !exportPending && (probe.IsStable || (combatInProgress && fileProbe.IsStable)))
             {
                 stage = "done";
                 diagnostics["export_ready_success_source"] = probe.IsStable ? "combat_manager_force_export" : "latest_state_file";
@@ -1793,6 +1809,21 @@ internal static class AutotestCommandChannel
                 return false;
             }
 
+            if (!combatPlayPhase)
+            {
+                diagnostics["export_ready_waiting_reason"] = "combat_not_in_play_phase_yet";
+                WriteRunningResultIfDue("전투가 플레이 입력 가능 단계로 들어가기를 기다리는 중입니다.");
+                return false;
+            }
+
+            if (exportPending)
+            {
+                diagnostics["export_ready_waiting_reason"] = "pending_export_flush";
+                WriteRunningResultIfDue("마지막 전투 상태 변경이 combat_state.json에 반영되기를 기다리는 중입니다.");
+                return false;
+            }
+
+            diagnostics["export_ready_waiting_reason"] = "state_not_stable_yet";
             WriteRunningResultIfDue("전투 상태 export가 안정되기를 기다리는 중입니다.");
             return false;
         }

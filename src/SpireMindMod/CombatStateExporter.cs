@@ -75,6 +75,10 @@ internal static class CombatStateExporter
     private static long lastExportAtMs;
     private static string lastStateFingerprint = string.Empty;
     private static bool hasLoggedOutputPath;
+    private static readonly object ExportGate = new();
+    private static object? pendingExportRoot;
+    private static long pendingExportRequestedAtMs;
+    private static int pendingExportCount;
     private static object? recentPlayer;
     private static object? recentCombatState;
     private static object? recentPlayerCombatState;
@@ -154,12 +158,71 @@ internal static class CombatStateExporter
         }
     }
 
+    internal static bool HasPendingExport
+    {
+        get
+        {
+            lock (ExportGate)
+            {
+                return pendingExportRoot is not null;
+            }
+        }
+    }
+
+    internal static int PendingExportCount
+    {
+        get
+        {
+            lock (ExportGate)
+            {
+                return pendingExportCount;
+            }
+        }
+    }
+
+    internal static long PendingExportAgeMs
+    {
+        get
+        {
+            lock (ExportGate)
+            {
+                return pendingExportRoot is null ? 0 : ExportTimer.ElapsedMilliseconds - pendingExportRequestedAtMs;
+            }
+        }
+    }
+
+    internal static void FlushPendingExportIfReady()
+    {
+        object? root;
+        long nowMs = ExportTimer.ElapsedMilliseconds;
+        lock (ExportGate)
+        {
+            if (pendingExportRoot is null || nowMs - lastExportAtMs < ExportIntervalMs)
+            {
+                return;
+            }
+
+            root = pendingExportRoot;
+            lastExportAtMs = nowMs;
+        }
+
+        try
+        {
+            ExportNow(root, force: false, tickAfterExport: false);
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"보류된 전투 상태 export 처리 중 예외가 발생했습니다. 다음 틱에서 다시 시도합니다. {exception.GetType().Name}: {exception.Message}");
+        }
+    }
+
     private static void TryExport(object combatRoot)
     {
 
         long nowMs = ExportTimer.ElapsedMilliseconds;
         if (nowMs - lastExportAtMs < ExportIntervalMs)
         {
+            RememberPendingExport(combatRoot, nowMs);
             return;
         }
 
@@ -182,6 +245,7 @@ internal static class CombatStateExporter
                     CombatStateBridgePoster.TryPost(json);
                 }
 
+                ClearPendingExport();
                 CombatActionExecutor.TickMainThread();
                 return;
             }
@@ -192,6 +256,7 @@ internal static class CombatStateExporter
             File.WriteAllText(outputPath, json);
             CombatActionRuntimeContext.UpdateFromExport(combatRoot, json);
             CombatStateBridgePoster.TryPost(json);
+            ClearPendingExport();
             CombatActionExecutor.TickMainThread();
 
             if (!hasLoggedOutputPath)
@@ -203,6 +268,26 @@ internal static class CombatStateExporter
         catch (Exception exception)
         {
             Logger.Warning($"전투 상태 추출에 실패했습니다. 게임 진행은 멈추지 않습니다. {exception.GetType().Name}: {exception.Message}");
+        }
+    }
+
+    private static void RememberPendingExport(object combatRoot, long nowMs)
+    {
+        lock (ExportGate)
+        {
+            pendingExportRoot = combatRoot;
+            pendingExportRequestedAtMs = nowMs;
+            pendingExportCount++;
+        }
+    }
+
+    private static void ClearPendingExport()
+    {
+        lock (ExportGate)
+        {
+            pendingExportRoot = null;
+            pendingExportRequestedAtMs = 0;
+            pendingExportCount = 0;
         }
     }
 
@@ -223,6 +308,7 @@ internal static class CombatStateExporter
                 CombatStateBridgePoster.TryPost(json);
             }
 
+            ClearPendingExport();
             if (tickAfterExport)
             {
                 CombatActionExecutor.TickMainThread();
@@ -237,6 +323,7 @@ internal static class CombatStateExporter
         File.WriteAllText(outputPath, json);
         CombatActionRuntimeContext.UpdateFromExport(combatRoot, json);
         CombatStateBridgePoster.TryPost(json);
+        ClearPendingExport();
         if (tickAfterExport)
         {
             CombatActionExecutor.TickMainThread();
