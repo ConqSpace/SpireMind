@@ -72,6 +72,7 @@ internal static class CombatActionRuntimeContext
                 actionId,
                 actionType,
                 ReadString(action, "card_instance_id"),
+                ReadInt(action, "combat_card_id"),
                 ReadString(action, "target_id")));
         }
 
@@ -92,6 +93,27 @@ internal static class CombatActionRuntimeContext
             _ => property.ToString()
         };
     }
+
+    private static int? ReadInt(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out JsonElement property))
+        {
+            return null;
+        }
+
+        if (property.ValueKind == JsonValueKind.Number && property.TryGetInt32(out int value))
+        {
+            return value;
+        }
+
+        if (property.ValueKind == JsonValueKind.String
+            && int.TryParse(property.GetString(), out int stringValue))
+        {
+            return stringValue;
+        }
+
+        return null;
+    }
 }
 
 internal sealed record CombatActionContextSnapshot(
@@ -110,4 +132,5 @@ internal sealed record LegalActionSnapshot(
     string ActionId,
     string ActionType,
     string? CardInstanceId,
+    int? CombatCardId,
     string? TargetId);

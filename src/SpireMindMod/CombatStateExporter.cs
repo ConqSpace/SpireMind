@@ -1183,10 +1183,14 @@ internal static class CombatStateExporter
                 ?? (damage is not null ? 1 : null);
 
             string cardName = ReadCardName(card, cardModel, cardInfo) ?? fallbackName;
+            StableCardIdentity stableIdentity = BuildStableCardIdentity(pileName, index, cardName, card, cardInfo, cardModel);
 
             cards.Add(new Dictionary<string, object?>
             {
-                ["instance_id"] = BuildCardInstanceId(pileName, index, cardName, card, cardInfo, cardModel),
+                ["instance_id"] = stableIdentity.InstanceId,
+                ["combat_card_id"] = stableIdentity.CombatCardId,
+                ["instance_id_source"] = stableIdentity.Source,
+                ["fallback_instance_id"] = stableIdentity.FallbackInstanceId,
                 ["card_id"] = ReadFirstString(new[] { card, cardModel, cardInfo }, "id", "_id", "cardId", "_cardId", "key", "_key") ?? fallbackName,
                 ["name"] = cardName,
                 ["type"] = ReadFirstString(new[] { card, cardModel, cardInfo, cardStats }, "type", "_type", "cardType", "_cardType"),
@@ -1206,6 +1210,26 @@ internal static class CombatStateExporter
         return cards;
     }
 
+    private static StableCardIdentity BuildStableCardIdentity(string pileName, int index, string cardName, params object?[] sources)
+    {
+        string fallbackInstanceId = BuildFallbackCardInstanceId(pileName, index, cardName, sources);
+        uint? combatCardId = TryReadCombatCardId(sources);
+        if (combatCardId is not null)
+        {
+            return new StableCardIdentity(
+                SanitizeActionId($"combat_card_{combatCardId.Value}"),
+                combatCardId.Value,
+                "net_combat_card_db",
+                fallbackInstanceId);
+        }
+
+        return new StableCardIdentity(
+            fallbackInstanceId,
+            null,
+            "fallback",
+            fallbackInstanceId);
+    }
+
     private static string? ReadCardName(params object?[] sources)
     {
         return ReadFirstString(
@@ -1219,7 +1243,7 @@ internal static class CombatStateExporter
             "Title");
     }
 
-    private static string BuildCardInstanceId(string pileName, int index, string cardName, params object?[] sources)
+    private static string BuildFallbackCardInstanceId(string pileName, int index, string cardName, params object?[] sources)
     {
         string? runtimeId = ReadFirstString(
             sources,
@@ -1243,6 +1267,146 @@ internal static class CombatStateExporter
         }
 
         return SanitizeActionId($"{pileName}_{index}_{cardName}");
+    }
+
+    private static uint? TryReadCombatCardId(params object?[] sources)
+    {
+        object? runtimeCard = FindRuntimeCardModel(sources);
+        if (runtimeCard is null)
+        {
+            return null;
+        }
+
+        bool? isMutable = ReadBool(runtimeCard, "IsMutable", "isMutable", "_isMutable");
+        if (isMutable == false)
+        {
+            return null;
+        }
+
+        Type? databaseType = FindTypeByFullName("MegaCrit.Sts2.Core.GameActions.Multiplayer.NetCombatCardDb");
+        if (databaseType is null)
+        {
+            return null;
+        }
+
+        object? database = databaseType.GetProperty("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+            ?.GetValue(null);
+        if (database is null)
+        {
+            return null;
+        }
+
+        MethodInfo? tryGetCardId = databaseType
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .FirstOrDefault(method =>
+            {
+                if (!method.Name.Equals("TryGetCardId", StringComparison.Ordinal))
+                {
+                    return false;
+                }
+
+                ParameterInfo[] parameters = method.GetParameters();
+                return parameters.Length == 2
+                    && parameters[0].ParameterType.IsAssignableFrom(runtimeCard.GetType());
+            });
+        if (tryGetCardId is null)
+        {
+            return null;
+        }
+
+        object?[] args = { runtimeCard, null };
+        try
+        {
+            object? result = tryGetCardId.Invoke(database, args);
+            if (result is true && args[1] is not null)
+            {
+                return Convert.ToUInt32(args[1]);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+
+        return null;
+    }
+
+    private static object? FindRuntimeCardModel(IEnumerable<object?> sources)
+    {
+        foreach (object? source in sources)
+        {
+            if (IsRuntimeCardModel(source))
+            {
+                return source;
+            }
+        }
+
+        foreach (object? source in sources)
+        {
+            object? model = FindMemberValue(source, "Model", "model", "_model", "cardModel", "_cardModel");
+            if (IsRuntimeCardModel(model))
+            {
+                return model;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsRuntimeCardModel(object? value)
+    {
+        if (value is null)
+        {
+            return false;
+        }
+
+        Type type = value.GetType();
+        string typeName = type.FullName ?? type.Name;
+        return typeName.Equals("MegaCrit.Sts2.Core.Models.CardModel", StringComparison.Ordinal)
+            || typeName.Contains(".Cards.", StringComparison.Ordinal)
+            || IsAssignableToTypeName(type, "MegaCrit.Sts2.Core.Models.CardModel");
+    }
+
+    private static bool IsAssignableToTypeName(Type type, string expectedFullName)
+    {
+        for (Type? current = type; current is not null; current = current.BaseType)
+        {
+            if (string.Equals(current.FullName, expectedFullName, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        foreach (Type interfaceType in type.GetInterfaces())
+        {
+            if (string.Equals(interfaceType.FullName, expectedFullName, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static Type? FindTypeByFullName(string fullName)
+    {
+        foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            try
+            {
+                Type? type = assembly.GetType(fullName, throwOnError: false);
+                if (type is not null)
+                {
+                    return type;
+                }
+            }
+            catch
+            {
+                continue;
+            }
+        }
+
+        return null;
     }
 
     private static string BuildCardRuntimeMergeKey(object card)
@@ -1442,6 +1606,7 @@ internal static class CombatStateExporter
             }
 
             string cardInstanceId = ReadDictionaryString(card, "instance_id") ?? "hand_unknown";
+            int? combatCardId = ReadDictionaryInt(card, "combat_card_id");
             string cardName = ReadDictionaryString(card, "name")
                 ?? ReadDictionaryString(card, "card_id")
                 ?? cardInstanceId;
@@ -1460,6 +1625,7 @@ internal static class CombatStateExporter
                     actions.Add(CreatePlayCardAction(
                         $"play_{cardInstanceId}_{targetId}",
                         cardInstanceId,
+                        combatCardId,
                         targetId,
                         energyCost,
                         $"Play {cardName} on {enemyName}.",
@@ -1471,6 +1637,7 @@ internal static class CombatStateExporter
                 actions.Add(CreatePlayCardAction(
                     $"play_{cardInstanceId}_no_target",
                     cardInstanceId,
+                    combatCardId,
                     null,
                     energyCost,
                     $"Play {cardName} with no target.",
@@ -1495,6 +1662,7 @@ internal static class CombatStateExporter
     private static Dictionary<string, object?> CreatePlayCardAction(
         string actionId,
         string cardInstanceId,
+        int? combatCardId,
         string? targetId,
         int? energyCost,
         string summary,
@@ -1505,6 +1673,7 @@ internal static class CombatStateExporter
             ["action_id"] = SanitizeActionId(actionId),
             ["type"] = "play_card",
             ["card_instance_id"] = cardInstanceId,
+            ["combat_card_id"] = combatCardId,
             ["target_id"] = targetId,
             ["energy_cost"] = energyCost,
             ["summary"] = summary,
@@ -2852,4 +3021,10 @@ internal static class CombatStateExporter
     }
 
     private sealed record ObjectNode(string Path, object? Value, int Depth);
+
+    private sealed record StableCardIdentity(
+        string InstanceId,
+        uint? CombatCardId,
+        string Source,
+        string FallbackInstanceId);
 }

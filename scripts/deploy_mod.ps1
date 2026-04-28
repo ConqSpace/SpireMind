@@ -29,7 +29,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 [xml]$projectXml = Get-Content -Raw $resolvedProjectPath
-$targetFramework = $projectXml.Project.PropertyGroup.TargetFramework
+$targetFramework = @(
+    $projectXml.Project.PropertyGroup |
+        ForEach-Object { $_.TargetFramework } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -First 1
+)
+$targetFramework = ([string]$targetFramework).Trim()
 if ([string]::IsNullOrWhiteSpace($targetFramework)) {
     throw "TargetFramework was not found in the project file."
 }
