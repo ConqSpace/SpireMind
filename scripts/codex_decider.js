@@ -126,8 +126,46 @@ function isPlainObject(value) {
 }
 
 function readNumber(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function compactRecentHistory(request) {
+  const history = isPlainObject(request.recent_history) ? request.recent_history : null;
+  if (!history) {
+    return null;
+  }
+
+  const combatEvents = Array.isArray(history.combat_events)
+    ? history.combat_events.filter(isPlainObject)
+    : [];
+  const decisions = Array.isArray(history.decisions)
+    ? history.decisions.filter(isPlainObject)
+    : [];
+
+  return {
+    combat_events: combatEvents.map((event) => ({
+      event_type: typeof event.event_type === "string" ? event.event_type : null,
+      status: typeof event.status === "string" ? event.status : null,
+      result: typeof event.result === "string" ? event.result : null,
+      reason: typeof event.reason === "string" ? event.reason : null,
+      selected_action_id: typeof event.selected_action_id === "string" ? event.selected_action_id : null,
+      plan_status: typeof event.plan_status === "string" ? event.plan_status : null,
+      completed_count: readNumber(event.completed_count),
+      state_delta: isPlainObject(event.state_delta) ? event.state_delta : null
+    })),
+    decisions: decisions.map((record) => ({
+      status: typeof record.status === "string" ? record.status : null,
+      decision: isPlainObject(record.decision) ? record.decision : null,
+      state_delta: isPlainObject(record.state_delta) ? record.state_delta : null,
+      wait_error: typeof record.wait_error === "string" ? record.wait_error : null,
+      submit_error: typeof record.submit_error === "string" ? record.submit_error : null
+    }))
+  };
 }
 
 function compactRequest(request) {
@@ -141,6 +179,7 @@ function compactRequest(request) {
   return {
     play_session_id: typeof request.play_session_id === "string" ? request.play_session_id : null,
     state_version: readNumber(request.state_version),
+    recent_history: compactRecentHistory(request),
     player: {
       hp: readNumber(player.hp),
       max_hp: readNumber(player.max_hp),
@@ -236,6 +275,7 @@ function buildCodexPrompt(request) {
     "- 여러 카드를 순서대로 쓸 수 있으면 actions 배열에 순서대로 넣는다.",
     "- actions 배열 안에서는 selected_action_id를 사용하지 않는다.",
     "- 더 할 행동이 없으면 end_turn을 포함한다.",
+    "- recent_history가 있으면 이전 판단 결과와 체력 변화를 참고하되, 현재 legal_actions를 더 우선한다.",
     "- 출력은 JSON 객체 하나뿐이어야 한다.",
     "- 마크다운, 설명문, 코드블록은 출력하지 않는다.",
     "",

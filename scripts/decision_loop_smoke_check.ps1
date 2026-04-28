@@ -287,6 +287,25 @@ try {
         throw "combat_log.jsonl에 판단 전후 변화량이 기록되지 않았습니다."
     }
 
+    $historyCommandScript = "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',(chunk)=>input+=chunk);process.stdin.on('end',()=>{const request=JSON.parse(input);if(!request.recent_history||!Array.isArray(request.recent_history.combat_events)||request.recent_history.combat_events.length<1){process.exit(2);}process.stdout.write(JSON.stringify({selected_action_id:'end_turn',reason:'recent history observed'}));});"
+    $historyDryRunText = & node $decisionLoopPath `
+        --bridge-url $BridgeUrl `
+        --mode command `
+        --command node `
+        --command-arg "-e" `
+        --command-arg $historyCommandScript `
+        --once `
+        --dry-run `
+        --run-log-dir $runLogDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "최근 기록이 command 판단 요청에 전달되지 않았습니다."
+    }
+
+    $historyDryRun = $historyDryRunText | ConvertFrom-Json
+    if ($historyDryRun.status -ne "dry_run" -or $historyDryRun.decision.reason -ne "recent history observed") {
+        throw "최근 기록 확인용 dry-run 결과가 올바르지 않습니다."
+    }
+
     $combatStopState = $combatStateJson | ConvertFrom-Json
     $combatStopState.state_id = "combat_loop_stop_test_" + [guid]::NewGuid().ToString("N")
     $combatStopState.phase = "combat_turn"

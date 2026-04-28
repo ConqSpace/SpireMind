@@ -120,6 +120,23 @@ Codex CLI를 붙일 때는 `scripts/codex_decider.js`를 사용한다. 자세한
 
 같은 정보는 `combat_log.jsonl`의 `action_result_observed` 이벤트에도 남는다. 따라서 한 판단이 어떤 행동을 냈고, 그 행동 뒤에 전투 상태가 어떻게 바뀌었는지 한 줄 단위로 추적할 수 있다.
 
+## 최근 기록 전달
+
+`command` 모드에서 `--run-log-dir`를 함께 쓰면 의사결정 루프는 최근 `combat_log.jsonl`과 `decisions.jsonl` 일부를 읽어 외부 판단기에 `recent_history`로 보낸다.
+
+기본 전달 개수는 최근 8개다. 바꾸려면 다음 옵션을 쓴다.
+
+```powershell
+node .\bridge\spiremind_decision_loop.js `
+  --mode command `
+  --command node `
+  --command-arg .\scripts\codex_decider.js `
+  --recent-history-limit 12 `
+  --run-log-dir "$env:APPDATA\SlayTheSpire2\SpireMind\runs\combat_001"
+```
+
+`recent_history`에는 판단 결과, 행동 결과, `state_delta`가 들어간다. 판단기는 이전 턴에 체력을 얼마나 잃었는지, 적 체력을 얼마나 줄였는지, 어떤 계획이 실패했는지 참고할 수 있다. 단, 현재 턴에서 실제로 실행 가능한 행동은 항상 최신 `legal_actions`가 결정한다.
+
 ## 검증
 
 브리지와 의사결정 루프만 빠르게 확인할 때:

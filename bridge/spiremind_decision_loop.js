@@ -24,6 +24,7 @@ function parseArgs(argv) {
     maxDecisions: 1,
     maxDecisionsWasSet: false,
     maxActionsPerTurn: 3,
+    recentHistoryLimit: parsePositiveInt(process.env.SPIREMIND_RECENT_HISTORY_LIMIT, 8),
     pollMs: DEFAULT_POLL_MS,
     timeoutMs: DEFAULT_TIMEOUT_MS,
     resultTimeoutMs: 60000,
@@ -145,6 +146,12 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (token === "--recent-history-limit" && index + 1 < argv.length) {
+      options.recentHistoryLimit = parsePositiveInt(argv[index + 1], options.recentHistoryLimit);
+      index += 1;
+      continue;
+    }
+
     if (token === "--poll-ms" && index + 1 < argv.length) {
       options.pollMs = parsePositiveInt(argv[index + 1], options.pollMs);
       index += 1;
@@ -188,6 +195,7 @@ function showHelp() {
     "  --run-log-dir <dir>   decisions.jsonl, metrics.json, decider_config.json을 기록한다.",
     "  --wait-result         제출한 계획이 completed 또는 failed가 될 때까지 기다린다.",
     "  --until-combat-end    전투 턴을 반복 판단하고, 전투 종료나 비전투 상태를 감지하면 멈춘다.",
+    "  --recent-history-limit <n> command 모드 판단기에 전달할 최근 기록 수. 기본값 8.",
     "  --scenario-id <id>    내부 기록용 시나리오 식별자다. 외부 판단기에는 보내지 않는다.",
     "  --play-session-id <id> 외부 판단기에 보내도 되는 플레이 세션 식별자다.",
     "",
@@ -317,6 +325,19 @@ function writeJsonFile(filePath, value) {
 
 function appendJsonLine(filePath, value) {
   fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`, "utf8");
+}
+
+function readJsonLines(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return [];
+  }
+
+  return fs.readFileSync(filePath, "utf8")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== "")
+    .map((line) => safeJsonParse(line))
+    .filter(isPlainObject);
 }
 
 function nowIsoString() {
@@ -785,6 +806,7 @@ function ensureRunRecordFiles(runLogDir, options) {
       command: options.mode === "command" ? options.command : null,
       command_args_count: options.mode === "command" ? options.commandArgs.length : 0,
       max_actions_per_turn: options.maxActionsPerTurn,
+      recent_history_limit: options.recentHistoryLimit,
       wait_result: options.waitResult,
       decision_timeout_ms: options.timeoutMs,
       result_timeout_ms: options.resultTimeoutMs,
@@ -865,6 +887,62 @@ function createCombatStoppedEvent(options, stateSummary, reason, decisions) {
     player: stateSummary.player,
     live_enemy_count: countLiveEnemies(stateSummary),
     hand_count: stateSummary.hand.length
+  };
+}
+
+function pickRecentEventFields(event) {
+  const eventType = typeof event.event_type === "string" ? event.event_type : null;
+  return {
+    event_type: eventType,
+    recorded_at: typeof event.recorded_at === "string" ? event.recorded_at : null,
+    decision_id: typeof event.decision_id === "string" ? event.decision_id : null,
+    status: typeof event.status === "string" ? event.status : null,
+    result: typeof event.result === "string" ? event.result : null,
+    reason: typeof event.reason === "string" ? event.reason : null,
+    selected_action_id: typeof event.selected_action_id === "string" ? event.selected_action_id : null,
+    plan_status: typeof event.plan_status === "string" ? event.plan_status : null,
+    completed_count: readNumber(event.completed_count),
+    state_delta: isPlainObject(event.state_delta) ? event.state_delta : null
+  };
+}
+
+function pickRecentDecisionFields(record) {
+  return {
+    recorded_at: typeof record.recorded_at === "string" ? record.recorded_at : null,
+    decision_id: typeof record.decision_id === "string" ? record.decision_id : null,
+    status: typeof record.status === "string" ? record.status : null,
+    decision: isPlainObject(record.decision) ? record.decision : null,
+    state_delta: isPlainObject(record.state_delta) ? record.state_delta : null,
+    wait_error: typeof record.wait_error === "string" ? record.wait_error : null,
+    submit_error: typeof record.submit_error === "string" ? record.submit_error : null
+  };
+}
+
+function buildRecentHistory(runLogDir, limit) {
+  if (!runLogDir) {
+    return null;
+  }
+
+  const normalizedLimit = Math.max(0, readNumber(limit) ?? 0);
+  if (normalizedLimit <= 0) {
+    return null;
+  }
+
+  const combatEvents = readJsonLines(path.join(runLogDir, "combat_log.jsonl"))
+    .map(pickRecentEventFields)
+    .slice(-normalizedLimit);
+  const decisions = readJsonLines(path.join(runLogDir, "decisions.jsonl"))
+    .map(pickRecentDecisionFields)
+    .slice(-normalizedLimit);
+
+  if (combatEvents.length === 0 && decisions.length === 0) {
+    return null;
+  }
+
+  return {
+    limit: normalizedLimit,
+    combat_events: combatEvents,
+    decisions
   };
 }
 
@@ -1009,10 +1087,12 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
 }
 
 function buildCommandPrompt(options, snapshot) {
+  const recentHistory = buildRecentHistory(options.resolvedRunLogDir, options.recentHistoryLimit);
   return JSON.stringify(
     {
       task: "Slay the Spire 2 전투 상태를 보고 다음 행동을 JSON으로만 결정하세요.",
       play_session_id: options.playSessionId,
+      recent_history: recentHistory,
       response_contract: {
         actions: [
           {
@@ -1160,6 +1240,7 @@ async function main() {
   }
 
   const runLogDir = ensureRunLogDir(options.runLogDir);
+  options.resolvedRunLogDir = runLogDir;
   ensureRunRecordFiles(runLogDir, options);
 
   let decisions = 0;
