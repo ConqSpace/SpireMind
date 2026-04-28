@@ -43,6 +43,21 @@ node .\bridge\spiremind_decision_loop.js `
   --run-log-dir "$env:APPDATA\SlayTheSpire2\SpireMind\runs\manual_001"
 ```
 
+전투가 끝날 때까지 반복 판단할 때:
+
+```powershell
+node .\bridge\spiremind_decision_loop.js `
+  --mode command `
+  --command node `
+  --command-arg .\scripts\codex_decider.js `
+  --until-combat-end `
+  --wait-result `
+  --max-decisions 20 `
+  --run-log-dir "$env:APPDATA\SlayTheSpire2\SpireMind\runs\combat_001"
+```
+
+이 모드는 `phase`가 `combat_turn`이고 살아 있는 적과 가능한 행동이 있을 때만 판단한다. 적 턴, 애니메이션, 전환처럼 아직 판단할 수 없는 전투 상태는 기다린다. 플레이어가 쓰러졌거나, 살아 있는 적이 없거나, 전투 밖 화면으로 넘어가면 `combat_loop_stopped` 이벤트를 남기고 멈춘다.
+
 ### `command`
 
 LLM 또는 Codex CLI 같은 외부 판단기를 붙이기 위한 모드다.
@@ -55,6 +70,8 @@ node .\bridge\spiremind_decision_loop.js `
   --command node `
   --command-arg .\scripts\my_decider.js
 ```
+
+Codex CLI를 붙일 때는 `scripts/codex_decider.js`를 사용한다. 자세한 내용은 [codex_decider.md](./codex_decider.md)를 따른다.
 
 반환 형식:
 

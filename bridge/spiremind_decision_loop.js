@@ -18,9 +18,11 @@ function parseArgs(argv) {
     command: process.env.SPIREMIND_DECIDER_COMMAND || "",
     commandArgs: [],
     once: false,
+    untilCombatEnd: false,
     dryRun: false,
     waitResult: false,
     maxDecisions: 1,
+    maxDecisionsWasSet: false,
     maxActionsPerTurn: 3,
     pollMs: DEFAULT_POLL_MS,
     timeoutMs: DEFAULT_TIMEOUT_MS,
@@ -75,6 +77,15 @@ function parseArgs(argv) {
     if (token === "--once") {
       options.once = true;
       options.maxDecisions = 1;
+      options.maxDecisionsWasSet = true;
+      continue;
+    }
+
+    if (token === "--until-combat-end") {
+      options.untilCombatEnd = true;
+      if (!options.maxDecisionsWasSet) {
+        options.maxDecisions = 50;
+      }
       continue;
     }
 
@@ -123,6 +134,7 @@ function parseArgs(argv) {
 
     if (token === "--max-decisions" && index + 1 < argv.length) {
       options.maxDecisions = parsePositiveInt(argv[index + 1], options.maxDecisions);
+      options.maxDecisionsWasSet = true;
       index += 1;
       continue;
     }
@@ -175,6 +187,7 @@ function showHelp() {
     "Run record options:",
     "  --run-log-dir <dir>   decisions.jsonl, metrics.json, decider_config.json을 기록한다.",
     "  --wait-result         제출한 계획이 completed 또는 failed가 될 때까지 기다린다.",
+    "  --until-combat-end    전투 턴을 반복 판단하고, 전투 종료나 비전투 상태를 감지하면 멈춘다.",
     "  --scenario-id <id>    내부 기록용 시나리오 식별자다. 외부 판단기에는 보내지 않는다.",
     "  --play-session-id <id> 외부 판단기에 보내도 되는 플레이 세션 식별자다.",
     "",
@@ -363,6 +376,78 @@ function summarizeState(snapshot) {
   };
 }
 
+function countLiveEnemies(stateSummary) {
+  if (!isPlainObject(stateSummary) || !Array.isArray(stateSummary.enemies)) {
+    return 0;
+  }
+
+  return stateSummary.enemies.filter((enemy) => {
+    const hp = readNumber(enemy.hp);
+    const combatId = readNumber(enemy.combat_id);
+    return hp !== null ? hp > 0 : combatId !== null;
+  }).length;
+}
+
+function classifyCombatReadiness(snapshot) {
+  const stateSummary = summarizeState(snapshot);
+  const phase = typeof stateSummary.phase === "string" ? stateSummary.phase.trim() : "";
+  const playerHp = readNumber(stateSummary.player.hp);
+  const liveEnemyCount = countLiveEnemies(stateSummary);
+  const hasLegalActions = stateSummary.legal_action_count > 0;
+
+  if (!isPlainObject(snapshot.state)) {
+    return {
+      stateSummary,
+      readyForDecision: false,
+      shouldStop: false,
+      reason: "state_missing"
+    };
+  }
+
+  if (playerHp !== null && playerHp <= 0) {
+    return {
+      stateSummary,
+      readyForDecision: false,
+      shouldStop: true,
+      reason: "player_defeated"
+    };
+  }
+
+  if (liveEnemyCount <= 0) {
+    return {
+      stateSummary,
+      readyForDecision: false,
+      shouldStop: true,
+      reason: "no_live_enemies"
+    };
+  }
+
+  if (phase !== "" && phase !== "combat_turn") {
+    return {
+      stateSummary,
+      readyForDecision: false,
+      shouldStop: !phase.startsWith("combat"),
+      reason: phase.startsWith("combat") ? `waiting_${phase}` : `non_combat_phase:${phase}`
+    };
+  }
+
+  if (!hasLegalActions) {
+    return {
+      stateSummary,
+      readyForDecision: false,
+      shouldStop: false,
+      reason: "legal_actions_missing"
+    };
+  }
+
+  return {
+    stateSummary,
+    readyForDecision: true,
+    shouldStop: false,
+    reason: "combat_turn_ready"
+  };
+}
+
 function readMetrics(metricsPath) {
   if (!fs.existsSync(metricsPath)) {
     return {
@@ -374,9 +459,13 @@ function readMetrics(metricsPath) {
       actions_applied: 0,
       stale_retries: 0,
       invalid_actions: 0,
+      submit_failures: 0,
+      result_timeouts: 0,
+      stale_before_submit: 0,
       observed_combats: 0,
       combat_turn_decisions: 0,
       end_turns_applied: 0,
+      combat_stop_events: 0,
       total_decision_ms: 0,
       average_decision_ms: 0,
       last_updated_at: null
@@ -413,8 +502,12 @@ function updateMetrics(runLogDir, record) {
     actions_applied: 0,
     stale_retries: 0,
     invalid_actions: 0,
+    submit_failures: 0,
+    result_timeouts: 0,
+    stale_before_submit: 0,
     total_decision_ms: 0,
     average_decision_ms: 0,
+    combat_stop_events: 0,
     last_updated_at: null,
     ...readMetrics(metricsPath)
   };
@@ -460,6 +553,18 @@ function updateMetrics(runLogDir, record) {
     metrics.invalid_actions += 1;
   }
 
+  if (record.status === "result_timeout") {
+    metrics.result_timeouts = (readNumber(metrics.result_timeouts) ?? 0) + 1;
+  }
+
+  if (record.status === "submit_failed") {
+    metrics.submit_failures = (readNumber(metrics.submit_failures) ?? 0) + 1;
+  }
+
+  if (record.status === "decision_stale_before_submit") {
+    metrics.stale_before_submit = (readNumber(metrics.stale_before_submit) ?? 0) + 1;
+  }
+
   const finalLatestAction = isPlainObject(record.final_latest_action) ? record.final_latest_action : null;
   if (!finalPlan && finalLatestAction && finalLatestAction.result === "applied") {
     metrics.actions_applied += 1;
@@ -471,6 +576,37 @@ function updateMetrics(runLogDir, record) {
     metrics.end_turns_applied += 1;
   }
 
+  metrics.last_updated_at = nowIsoString();
+  writeJsonFile(metricsPath, metrics);
+  return metrics;
+}
+
+function updateCombatStopMetrics(runLogDir) {
+  if (!runLogDir) {
+    return null;
+  }
+
+  const metricsPath = path.join(runLogDir, "metrics.json");
+  const metrics = {
+    decisions: 0,
+    submitted_decisions: 0,
+    dry_run_decisions: 0,
+    plans_completed: 0,
+    plans_failed: 0,
+    actions_applied: 0,
+    stale_retries: 0,
+    invalid_actions: 0,
+    submit_failures: 0,
+    result_timeouts: 0,
+    stale_before_submit: 0,
+    total_decision_ms: 0,
+    average_decision_ms: 0,
+    combat_stop_events: 0,
+    last_updated_at: null,
+    ...readMetrics(metricsPath)
+  };
+
+  metrics.combat_stop_events = (readNumber(metrics.combat_stop_events) ?? 0) + 1;
   metrics.last_updated_at = nowIsoString();
   writeJsonFile(metricsPath, metrics);
   return metrics;
@@ -583,6 +719,35 @@ function createActionResultObservedEvent(options, decisionId, finalLatest, final
   };
 }
 
+function createCombatStoppedEvent(options, stateSummary, reason, decisions) {
+  return {
+    event_type: "combat_loop_stopped",
+    recorded_at: nowIsoString(),
+    play_session_id: options.playSessionId,
+    reason,
+    decisions,
+    state_version: stateSummary.state_version,
+    state_id: stateSummary.state_id,
+    phase: stateSummary.phase,
+    player: stateSummary.player,
+    live_enemy_count: countLiveEnemies(stateSummary),
+    hand_count: stateSummary.hand.length
+  };
+}
+
+function hasStateChangedSinceDecision(snapshot, latestSnapshot) {
+  const originalVersion = readNumber(snapshot.state_version);
+  const latestVersion = readNumber(latestSnapshot.state_version);
+  const originalStateId = typeof snapshot.state_id === "string" ? snapshot.state_id : "";
+  const latestStateId = typeof latestSnapshot.state_id === "string" ? latestSnapshot.state_id : "";
+
+  if (originalVersion !== null && latestVersion !== null && originalVersion !== latestVersion) {
+    return true;
+  }
+
+  return originalStateId !== "" && latestStateId !== "" && originalStateId !== latestStateId;
+}
+
 async function waitForSubmittedResult(options, planId, submissionId) {
   const deadline = Date.now() + options.resultTimeoutMs;
   let lastLatest = null;
@@ -595,6 +760,18 @@ async function waitForSubmittedResult(options, planId, submissionId) {
     }
 
     const latestAction = isPlainObject(latest.latest_action) ? latest.latest_action : null;
+    if (planId
+      && plan
+      && latestAction
+      && latestAction.plan_id === planId
+      && latestAction.result !== null
+      && Array.isArray(plan.actions)) {
+      const actionIndex = readNumber(latestAction.plan_action_index);
+      if (actionIndex !== null && actionIndex >= plan.actions.length - 1) {
+        return latest;
+      }
+    }
+
     if (!planId
       && latestAction
       && latestAction.submission_id === submissionId
@@ -805,6 +982,32 @@ async function waitForReadySnapshot(options, lastSeenVersion) {
   throw new Error(`결정 가능한 상태를 기다리다 시간 초과했습니다. 마지막 상태: ${JSON.stringify(lastSnapshot)}`);
 }
 
+async function waitForCombatDecisionOrStop(options, lastSeenVersion) {
+  const deadline = Date.now() + options.timeoutMs;
+  let lastSnapshot = null;
+  let lastReadiness = null;
+  while (Date.now() <= deadline) {
+    const snapshot = await getCurrentState(options.bridgeUrl, options.timeoutMs);
+    lastSnapshot = snapshot;
+    const stateVersion = readNumber(snapshot.state_version) ?? 0;
+    if (snapshot.status === "ready" && stateVersion >= lastSeenVersion && !hasPendingAction(snapshot)) {
+      const readiness = classifyCombatReadiness(snapshot);
+      lastReadiness = readiness;
+      if (readiness.readyForDecision || readiness.shouldStop) {
+        return {
+          snapshot,
+          stateSummary: readiness.stateSummary,
+          stopReason: readiness.shouldStop ? readiness.reason : null
+        };
+      }
+    }
+
+    await sleep(options.pollMs);
+  }
+
+  throw new Error(`전투 판단 가능 상태를 기다리다 시간 초과했습니다. 마지막 판정=${JSON.stringify(lastReadiness)}, 마지막 상태=${JSON.stringify(lastSnapshot)}`);
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
@@ -824,12 +1027,32 @@ async function main() {
 
   let decisions = 0;
   let lastSeenVersion = 0;
+  let combatLoopStopped = false;
   const observedCombatIds = new Set();
   while (decisions < options.maxDecisions) {
-    const snapshot = await waitForReadySnapshot(options, lastSeenVersion);
+    const readiness = options.untilCombatEnd
+      ? await waitForCombatDecisionOrStop(options, lastSeenVersion)
+      : null;
+    if (readiness && readiness.stopReason) {
+      combatLoopStopped = true;
+      appendCombatLog(runLogDir, createCombatStoppedEvent(options, readiness.stateSummary, readiness.stopReason, decisions));
+      updateCombatStopMetrics(runLogDir);
+      process.stdout.write(`${JSON.stringify({
+        status: "combat_loop_stopped",
+        reason: readiness.stopReason,
+        decisions,
+        state_version: readiness.stateSummary.state_version,
+        state_id: readiness.stateSummary.state_id,
+        phase: readiness.stateSummary.phase,
+        live_enemy_count: countLiveEnemies(readiness.stateSummary)
+      }, null, 2)}\n`);
+      break;
+    }
+
+    const snapshot = readiness ? readiness.snapshot : await waitForReadySnapshot(options, lastSeenVersion);
     const stateVersion = readNumber(snapshot.state_version) ?? 0;
     const decisionId = createDecisionId();
-    const stateSummary = summarizeState(snapshot);
+    const stateSummary = readiness ? readiness.stateSummary : summarizeState(snapshot);
     const combatKey = stateSummary.state_id || `state_version_${stateVersion}`;
     const combatObserved = stateSummary.phase === "combat_turn" && !observedCombatIds.has(combatKey);
     if (combatObserved) {
@@ -863,13 +1086,70 @@ async function main() {
       }
       process.stdout.write(`${JSON.stringify({ status: "dry_run", state_version: stateVersion, decision }, null, 2)}\n`);
     } else {
-      const submitted = await submitDecision(
-        options.bridgeUrl,
-        decision,
-        stateVersion,
-        `spiremind-decision-loop:${options.mode}`,
-        options.timeoutMs
-      );
+      if (options.untilCombatEnd) {
+        const latestBeforeSubmit = await getCurrentState(options.bridgeUrl, options.timeoutMs);
+        if (hasStateChangedSinceDecision(snapshot, latestBeforeSubmit)) {
+          const latestBeforeSubmitSummary = summarizeState(latestBeforeSubmit);
+          const record = {
+            event_type: "decision_recorded",
+            decision_id: decisionId,
+            recorded_at: nowIsoString(),
+            status: "decision_stale_before_submit",
+            decider_type: options.mode,
+            state_version: stateVersion,
+            state_summary: stateSummary,
+            latest_state_summary: latestBeforeSubmitSummary,
+            play_session_id: options.playSessionId,
+            combat_observed: combatObserved,
+            decision,
+            decision_ms: decisionMs
+          };
+          if (runLogDir) {
+            appendJsonLine(path.join(runLogDir, "decisions.jsonl"), record);
+            updateMetrics(runLogDir, record);
+          }
+          process.stdout.write(`${JSON.stringify({
+            status: "decision_stale_before_submit",
+            state_version: stateVersion,
+            latest_state_version: readNumber(latestBeforeSubmit.state_version),
+            decision
+          }, null, 2)}\n`);
+          decisions += 1;
+          lastSeenVersion = readNumber(latestBeforeSubmit.state_version) ?? stateVersion;
+          continue;
+        }
+      }
+
+      let submitted = null;
+      try {
+        submitted = await submitDecision(
+          options.bridgeUrl,
+          decision,
+          stateVersion,
+          `spiremind-decision-loop:${options.mode}`,
+          options.timeoutMs
+        );
+      } catch (error) {
+        const record = {
+          event_type: "decision_recorded",
+          decision_id: decisionId,
+          recorded_at: nowIsoString(),
+          status: "submit_failed",
+          decider_type: options.mode,
+          state_version: stateVersion,
+          state_summary: stateSummary,
+          play_session_id: options.playSessionId,
+          combat_observed: combatObserved,
+          decision,
+          submit_error: error instanceof Error ? error.message : String(error),
+          decision_ms: decisionMs
+        };
+        if (runLogDir) {
+          appendJsonLine(path.join(runLogDir, "decisions.jsonl"), record);
+          updateMetrics(runLogDir, record);
+        }
+        throw error;
+      }
       appendCombatLog(runLogDir, createDecisionSubmittedEvent(options, decisionId, stateSummary, decision, submitted));
       const submittedPlan = isPlainObject(submitted.action_plan) ? submitted.action_plan : null;
       const planId = submittedPlan ? submittedPlan.plan_id : null;
@@ -879,12 +1159,23 @@ async function main() {
         && submittedAction
         && submittedAction.valid === true
         && submittedAction.execution_status !== "invalid";
-      const finalLatest = shouldWaitResult
-        ? await waitForSubmittedResult(options, planId, submissionId)
-        : (options.waitResult ? { latest_action: submitted.latest_action || null, action_plan: submitted.action_plan || null } : null);
+      let waitError = null;
+      let finalLatest = null;
+      if (shouldWaitResult) {
+        try {
+          finalLatest = await waitForSubmittedResult(options, planId, submissionId);
+        } catch (error) {
+          waitError = error;
+          finalLatest = { latest_action: submitted.latest_action || null, action_plan: submitted.action_plan || null };
+        }
+      } else if (options.waitResult) {
+        finalLatest = { latest_action: submitted.latest_action || null, action_plan: submitted.action_plan || null };
+      }
       const finalPlan = finalLatest && isPlainObject(finalLatest.action_plan) ? finalLatest.action_plan : null;
       const finalLatestAction = finalLatest && isPlainObject(finalLatest.latest_action) ? finalLatest.latest_action : null;
-      const finalStatus = finalPlan && (finalPlan.status === "completed" || finalPlan.status === "failed")
+      const finalStatus = waitError
+        ? "result_timeout"
+        : finalPlan && (finalPlan.status === "completed" || finalPlan.status === "failed")
         ? finalPlan.status
         : (finalLatestAction && typeof finalLatestAction.result === "string" ? finalLatestAction.result : null)
           || (finalLatestAction && typeof finalLatestAction.execution_status === "string" ? finalLatestAction.execution_status : null)
@@ -904,6 +1195,7 @@ async function main() {
         action_plan: submitted.action_plan || null,
         final_latest_action: finalLatest ? finalLatest.latest_action || null : null,
         final_action_plan: finalPlan,
+        wait_error: waitError ? waitError.message : null,
         decision_ms: decisionMs
       };
       if (runLogDir) {
@@ -912,6 +1204,9 @@ async function main() {
       }
       if (finalLatest) {
         appendCombatLog(runLogDir, createActionResultObservedEvent(options, decisionId, finalLatest, finalStatus));
+      }
+      if (waitError) {
+        throw waitError;
       }
       process.stdout.write(`${JSON.stringify({
         status: finalStatus,
@@ -929,6 +1224,14 @@ async function main() {
     if (options.once) {
       break;
     }
+  }
+
+  if (options.untilCombatEnd && !combatLoopStopped && decisions >= options.maxDecisions) {
+    process.stdout.write(`${JSON.stringify({
+      status: "max_decisions_reached",
+      decisions,
+      max_decisions: options.maxDecisions
+    }, null, 2)}\n`);
   }
 }
 

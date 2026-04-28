@@ -22,6 +22,7 @@
 - [development_roadmap.md](./development_roadmap.md): 구현 단계, 산출물, 검증 기준, 주요 위험
 - [strategic_roadmap.md](./strategic_roadmap.md): 연구 방향, 장기 단계, 의사결정 지점
 - [decision_loop.md](./decision_loop.md): 브리지 상태를 읽고 행동 묶음을 제출하는 의사결정 루프
+- [codex_decider.md](./codex_decider.md): Codex CLI를 외부 판단기로 연결하는 방법
 - [run_memory_logging.md](./run_memory_logging.md): 전투 로그, 런 로그, 판단 기록, LLM 기억 요약 설계
 
 ## 현재 잠글 범위

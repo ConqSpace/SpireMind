@@ -106,6 +106,7 @@ if (-not (Test-Path $CombatStatePath)) {
 $bridgeUri = [Uri]$BridgeUrl
 $bridgePath = Join-Path $ProjectRoot "bridge\spiremind_bridge.js"
 $decisionLoopPath = Join-Path $ProjectRoot "bridge\spiremind_decision_loop.js"
+$codexDeciderPath = Join-Path $ProjectRoot "scripts\codex_decider.js"
 
 if (-not (Test-Path $bridgePath)) {
     throw "브리지 파일을 찾지 못했습니다: $bridgePath"
@@ -113,6 +114,10 @@ if (-not (Test-Path $bridgePath)) {
 
 if (-not (Test-Path $decisionLoopPath)) {
     throw "의사결정 루프 파일을 찾지 못했습니다: $decisionLoopPath"
+}
+
+if (-not (Test-Path $codexDeciderPath)) {
+    throw "Codex 판단기 파일을 찾지 못했습니다: $codexDeciderPath"
 }
 
 $startedBridge = $null
@@ -143,6 +148,22 @@ try {
     $dryRun = $dryRunText | ConvertFrom-Json
     if ($dryRun.status -ne "dry_run") {
         throw "dry-run 결과 상태가 올바르지 않습니다: $($dryRun.status)"
+    }
+
+    $previousFakeDecision = $env:SPIREMIND_CODEX_FAKE_DECISION
+    try {
+        $env:SPIREMIND_CODEX_FAKE_DECISION = '{"selected_action_id":"end_turn","reason":"smoke codex adapter"}'
+        $codexDryRunText = & node $decisionLoopPath --bridge-url $BridgeUrl --mode command --command node --command-arg $codexDeciderPath --once --dry-run
+        if ($LASTEXITCODE -ne 0) {
+            throw "Codex 판단기 dry-run이 실패했습니다."
+        }
+
+        $codexDryRun = $codexDryRunText | ConvertFrom-Json
+        if ($codexDryRun.status -ne "dry_run" -or $codexDryRun.decision.selected_action_id -ne "end_turn") {
+            throw "Codex 판단기 dry-run 결과가 올바르지 않습니다."
+        }
+    } finally {
+        $env:SPIREMIND_CODEX_FAKE_DECISION = $previousFakeDecision
     }
 
     $runLogDir = Join-Path ([System.IO.Path]::GetTempPath()) ("spiremind_run_record_" + [guid]::NewGuid().ToString("N"))
@@ -254,6 +275,47 @@ try {
         throw "combat_log.jsonl에 필요한 최소 이벤트가 기록되지 않았습니다."
     }
 
+    $combatStopState = $combatStateJson | ConvertFrom-Json
+    $combatStopState.state_id = "combat_loop_stop_test_" + [guid]::NewGuid().ToString("N")
+    $combatStopState.phase = "combat_turn"
+    $combatStopState.enemies = @()
+    $combatStopState.legal_actions = @()
+    $combatStopStateJson = $combatStopState | ConvertTo-Json -Depth 100
+    $null = Invoke-RestMethod `
+        -Method Post `
+        -Uri "$BridgeUrl/state" `
+        -ContentType "application/json; charset=utf-8" `
+        -Body $combatStopStateJson `
+        -TimeoutSec 5
+
+    $combatStopRunLogDir = Join-Path ([System.IO.Path]::GetTempPath()) ("spiremind_combat_stop_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $combatStopRunLogDir | Out-Null
+    $combatStopText = & node $decisionLoopPath --bridge-url $BridgeUrl --mode heuristic --until-combat-end --max-decisions 3 --run-log-dir $combatStopRunLogDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "전투 반복 루프 종료 감지 검증이 실패했습니다."
+    }
+
+    $combatStop = $combatStopText | ConvertFrom-Json
+    if ($combatStop.status -ne "combat_loop_stopped" -or $combatStop.reason -ne "no_live_enemies") {
+        throw "전투 반복 루프 종료 감지 결과가 올바르지 않습니다: $combatStopText"
+    }
+
+    $combatStopLogPath = Join-Path $combatStopRunLogDir "combat_log.jsonl"
+    if (-not (Test-Path $combatStopLogPath)) {
+        throw "전투 반복 루프 종료 로그가 생성되지 않았습니다."
+    }
+    $combatStopLogText = Get-Content -Raw -Encoding UTF8 $combatStopLogPath
+    if ($combatStopLogText -notmatch '"event_type":"combat_loop_stopped"') {
+        throw "전투 반복 루프 종료 이벤트가 기록되지 않았습니다."
+    }
+
+    $null = Invoke-RestMethod `
+        -Method Post `
+        -Uri "$BridgeUrl/state" `
+        -ContentType "application/json; charset=utf-8" `
+        -Body $combatStateJson `
+        -TimeoutSec 5
+
     $submitText = & node $decisionLoopPath --bridge-url $BridgeUrl --mode heuristic --once --max-actions-per-turn 2
     if ($LASTEXITCODE -ne 0) {
         throw "의사결정 루프 제출이 실패했습니다."
@@ -293,23 +355,34 @@ try {
         -Body $staleClaimBody `
         -TimeoutSec 5
 
-    if ($staleClaim.status -ne "stale_retry_queued") {
-        throw "stale claim 재시도가 큐에 들어가지 않았습니다: $($staleClaim.status)"
-    }
-
     $retryLatest = Invoke-RestMethod -Method Get -Uri "$BridgeUrl/action/latest" -TimeoutSec 5
-    if ($retryLatest.latest_action.execution_status -ne "pending") {
-        throw "재시도 행동이 pending 상태가 아닙니다: $($retryLatest.latest_action.execution_status)"
+    if ($staleClaim.status -eq "stale_retry_queued") {
+        if ($retryLatest.latest_action.execution_status -ne "pending") {
+            throw "재시도 행동이 pending 상태가 아닙니다: $($retryLatest.latest_action.execution_status)"
+        }
+    } elseif ($staleClaim.status -eq "stale") {
+        if ($null -ne $retryLatest.action_plan) {
+            $planFailure = $retryLatest.action_plan.failure
+            if ($null -eq $planFailure -or [string]::IsNullOrWhiteSpace([string]$planFailure.reason)) {
+                throw "stale claim이 재시도 없이 종료됐지만 실패 사유가 기록되지 않았습니다."
+            }
+        } elseif ($retryLatest.latest_action.execution_status -ne "stale" -or $retryLatest.latest_action.result -ne "stale") {
+            throw "단일 행동 stale 결과가 latest_action에 기록되지 않았습니다."
+        }
+    } else {
+        throw "stale claim 결과가 올바르지 않습니다: $($staleClaim.status)"
     }
 
     [pscustomobject]@{
         status = "PASS"
         bridge_url = $BridgeUrl
         dry_run_decision = $dryRun.decision
+        codex_adapter_decision = $codexDryRun.decision
         wait_result_status = $waitResult.status
         run_log_dir = $runLogDir
         metrics = $metrics
         scenario_id = $scenarioConfig.scenario_id
+        combat_stop_reason = $combatStop.reason
         submitted_action = $latest.latest_action.selected_action_id
         stale_retry_status = $staleClaim.status
         retry_action = $retryLatest.latest_action.selected_action_id
