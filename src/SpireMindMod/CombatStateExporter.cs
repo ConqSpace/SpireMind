@@ -216,6 +216,27 @@ internal static class CombatStateExporter
         }
     }
 
+    internal static bool TryExportRewardStateIfVisible()
+    {
+        try
+        {
+            object? rewardScreen = FindRewardScreen();
+            if (rewardScreen is null)
+            {
+                return false;
+            }
+
+            Dictionary<string, object?> state = BuildRewardState(rewardScreen);
+            WriteState(rewardScreen, state, "reward", force: false, tickAfterExport: false);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"보상 화면 상태 추출에 실패했습니다. 게임 진행은 멈추지 않습니다. {exception.GetType().Name}: {exception.Message}");
+            return false;
+        }
+    }
+
     private static void TryExport(object combatRoot)
     {
 
@@ -230,40 +251,7 @@ internal static class CombatStateExporter
 
         try
         {
-            Dictionary<string, object?> state = BuildState(combatRoot);
-            string stateFingerprint = ComputeStateFingerprint(state);
-            state["state_id"] = $"combat_{stateFingerprint[..16]}";
-            state["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            Dictionary<string, object?> safeState = NormalizeStateForJson(state, "combat_state");
-            string json = JsonSerializer.Serialize(safeState, JsonOptions);
-            if (stateFingerprint == lastStateFingerprint)
-            {
-                CombatActionRuntimeContext.UpdateFromExport(combatRoot, json);
-                CombatStateBridgePoster.PostedStateSnapshot? postedState = CombatStateBridgePoster.GetLatestPostedState();
-                if (postedState is null || postedState.StateId != safeState["state_id"]?.ToString())
-                {
-                    CombatStateBridgePoster.TryPost(json);
-                }
-
-                ClearPendingExport();
-                CombatActionExecutor.TickMainThread();
-                return;
-            }
-
-            lastStateFingerprint = stateFingerprint;
-            string outputPath = GetOutputPath();
-            Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
-            File.WriteAllText(outputPath, json);
-            CombatActionRuntimeContext.UpdateFromExport(combatRoot, json);
-            CombatStateBridgePoster.TryPost(json);
-            ClearPendingExport();
-            CombatActionExecutor.TickMainThread();
-
-            if (!hasLoggedOutputPath)
-            {
-                hasLoggedOutputPath = true;
-                Logger.Info($"combat_state.v1 출력 경로: {outputPath}");
-            }
+            WriteState(combatRoot, BuildState(combatRoot), "combat", force: false, tickAfterExport: true);
         }
         catch (Exception exception)
         {
@@ -293,15 +281,24 @@ internal static class CombatStateExporter
 
     private static Dictionary<string, object?>? ExportNow(object combatRoot, bool force, bool tickAfterExport = true)
     {
-        Dictionary<string, object?> state = BuildState(combatRoot);
+        return WriteState(combatRoot, BuildState(combatRoot), "combat", force, tickAfterExport);
+    }
+
+    private static Dictionary<string, object?>? WriteState(
+        object runtimeRoot,
+        Dictionary<string, object?> state,
+        string stateIdPrefix,
+        bool force,
+        bool tickAfterExport)
+    {
         string stateFingerprint = ComputeStateFingerprint(state);
-        state["state_id"] = $"combat_{stateFingerprint[..16]}";
+        state["state_id"] = $"{stateIdPrefix}_{stateFingerprint[..16]}";
         state["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         Dictionary<string, object?> safeState = NormalizeStateForJson(state, "combat_state");
         string json = JsonSerializer.Serialize(safeState, JsonOptions);
         if (!force && stateFingerprint == lastStateFingerprint)
         {
-            CombatActionRuntimeContext.UpdateFromExport(combatRoot, json);
+            CombatActionRuntimeContext.UpdateFromExport(runtimeRoot, json);
             CombatStateBridgePoster.PostedStateSnapshot? postedState = CombatStateBridgePoster.GetLatestPostedState();
             if (postedState is null || postedState.StateId != safeState["state_id"]?.ToString())
             {
@@ -321,7 +318,7 @@ internal static class CombatStateExporter
         string outputPath = GetOutputPath();
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
         File.WriteAllText(outputPath, json);
-        CombatActionRuntimeContext.UpdateFromExport(combatRoot, json);
+        CombatActionRuntimeContext.UpdateFromExport(runtimeRoot, json);
         CombatStateBridgePoster.TryPost(json);
         ClearPendingExport();
         if (tickAfterExport)
@@ -465,6 +462,370 @@ internal static class CombatStateExporter
             ["legal_actions"] = BuildLegalActions(piles, enemies, playerState),
             ["relics"] = BuildRelics(relicsSource, graph),
             ["debug"] = BuildDebug(currentRoot, combatRoot, player, enemiesSource, graph)
+        };
+    }
+
+    private static Dictionary<string, object?> BuildRewardState(object rewardScreen)
+    {
+        object? managerCombatState = ReadCombatManagerDebugState(GetCombatManagerInstance());
+        if (managerCombatState is not null)
+        {
+            RememberObservedRoot(managerCombatState);
+        }
+
+        List<object> roots = new();
+        AddRoot(roots, rewardScreen);
+        AddRoot(roots, managerCombatState);
+        AddRoot(roots, recentCombatState);
+        AddRoot(roots, recentPlayerCombatState);
+        AddRoot(roots, recentPlayer);
+        ObjectGraph graph = ObjectGraph.Collect(roots, 3, 220);
+
+        object? player = recentPlayer
+            ?? recentPlayerCombatState
+            ?? FindFirst(graph, "Player", "PlayerCombatState");
+        object? relicsSource = FindMemberValue(player, "relics")
+            ?? FindMemberValue(managerCombatState, "relics")
+            ?? FindMemberValue(recentCombatState, "relics");
+        Dictionary<string, object?> reward = BuildRewardScreenState(rewardScreen);
+        List<Dictionary<string, object?>> rewards = ReadDictionaryList(reward, "rewards");
+
+        return new Dictionary<string, object?>
+        {
+            ["schema_version"] = "combat_state.v1",
+            ["phase"] = "reward",
+            ["state_id"] = "reward_pending",
+            ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["run"] = BuildRun(managerCombatState ?? recentCombatState ?? rewardScreen, graph),
+            ["player"] = player is null ? new Dictionary<string, object?>() : BuildPlayer(player),
+            ["piles"] = new Dictionary<string, object?>
+            {
+                ["hand"] = new List<Dictionary<string, object?>>(),
+                ["draw_pile"] = new List<Dictionary<string, object?>>(),
+                ["discard_pile"] = new List<Dictionary<string, object?>>(),
+                ["exhaust_pile"] = new List<Dictionary<string, object?>>()
+            },
+            ["enemies"] = new List<Dictionary<string, object?>>(),
+            ["reward"] = reward,
+            ["legal_actions"] = BuildRewardLegalActions(rewards),
+            ["relics"] = BuildRelics(relicsSource, graph),
+            ["debug"] = BuildRewardDebug(rewardScreen, graph)
+        };
+    }
+
+    private static object? FindRewardScreen()
+    {
+        object? screenContext = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext",
+            "Instance");
+        object? currentScreen = TryInvokeMethod(screenContext, "GetCurrentScreen");
+        if (IsRewardScreen(currentScreen))
+        {
+            return currentScreen;
+        }
+
+        object? overlayStack = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Screens.Overlays.NOverlayStack",
+            "Instance");
+        object? topOverlay = TryInvokeMethod(overlayStack, "Peek");
+        if (IsRewardScreen(topOverlay))
+        {
+            return topOverlay;
+        }
+
+        return null;
+    }
+
+    private static bool IsRewardScreen(object? source)
+    {
+        if (source is null)
+        {
+            return false;
+        }
+
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        if (typeName.Contains("NRewardsScreen", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        string? screenType = ReadString(source, "ScreenType", "screenType", "_screenType");
+        return !string.IsNullOrWhiteSpace(screenType)
+            && screenType.Contains("Rewards", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, object?> BuildRewardScreenState(object rewardScreen)
+    {
+        object? rewardButtonsSource = FindMemberValue(rewardScreen, "_rewardButtons", "RewardButtons", "rewardButtons");
+        object? skippedButtonsSource = FindMemberValue(rewardScreen, "_skippedRewardButtons", "SkippedRewardButtons", "skippedRewardButtons");
+        List<object> rewardButtons = EnumerateObjects(rewardButtonsSource).ToList();
+        List<object> skippedRewardButtons = EnumerateObjects(skippedButtonsSource).ToList();
+        List<Dictionary<string, object?>> rewards = new();
+        for (int index = 0; index < rewardButtons.Count; index++)
+        {
+            rewards.Add(BuildRewardEntryFromButton(rewardButtons[index], $"reward_{index}"));
+        }
+
+        bool? skipDisallowed = ReadBool(rewardScreen, "_skipDisallowed", "SkipDisallowed", "skipDisallowed");
+        return new Dictionary<string, object?>
+        {
+            ["screen_type"] = rewardScreen.GetType().FullName ?? rewardScreen.GetType().Name,
+            ["reward_count"] = rewards.Count,
+            ["skipped_reward_count"] = skippedRewardButtons.Count,
+            ["skip_disallowed"] = skipDisallowed,
+            ["can_skip"] = skipDisallowed is null ? null : !skipDisallowed.Value,
+            ["rewards"] = rewards
+        };
+    }
+
+    private static Dictionary<string, object?> BuildRewardEntryFromButton(object button, string rewardId)
+    {
+        object? reward = FindMemberValue(button, "Reward", "reward", "_reward")
+            ?? FindMemberValue(button, "LinkedRewardSet", "linkedRewardSet", "_linkedRewardSet");
+        if (reward is null)
+        {
+            return new Dictionary<string, object?>
+            {
+                ["reward_id"] = rewardId,
+                ["type"] = "unknown",
+                ["name"] = GetReadableName(button),
+                ["description"] = TryReadFormattedDescription(button),
+                ["type_name"] = null,
+                ["button_type_name"] = button.GetType().FullName ?? button.GetType().Name,
+                ["read_status"] = "reward_missing"
+            };
+        }
+
+        return BuildRewardEntry(reward, rewardId, button);
+    }
+
+    private static Dictionary<string, object?> BuildRewardEntry(object reward, string rewardId, object? button)
+    {
+        string rewardType = ClassifyRewardType(reward);
+        Dictionary<string, object?> entry = new()
+        {
+            ["reward_id"] = rewardId,
+            ["type"] = rewardType,
+            ["name"] = ReadRewardName(reward, rewardType),
+            ["description"] = TryReadFormattedDescription(reward) ?? ReadString(reward, "Description", "description"),
+            ["is_populated"] = ReadBool(reward, "IsPopulated", "isPopulated", "_isPopulated"),
+            ["reward_type"] = ReadString(reward, "RewardType", "rewardType", "_rewardType"),
+            ["rewards_set_index"] = ReadInt(reward, "RewardsSetIndex", "rewardsSetIndex", "_rewardsSetIndex"),
+            ["type_name"] = reward.GetType().FullName ?? reward.GetType().Name,
+            ["button_type_name"] = button?.GetType().FullName ?? button?.GetType().Name
+        };
+
+        if (rewardType == "card_reward")
+        {
+            entry["can_skip"] = ReadBool(reward, "CanSkip", "canSkip", "_canSkip");
+            entry["can_reroll"] = ReadBool(reward, "CanReroll", "canReroll", "_canReroll");
+            entry["cards"] = BuildRewardCards(FindMemberValue(reward, "Cards", "cards", "_cards"));
+        }
+        else if (rewardType == "gold")
+        {
+            entry["amount"] = ReadInt(reward, "Amount", "amount", "_amount");
+        }
+        else if (rewardType == "potion")
+        {
+            entry["potion"] = BuildItemSummary(FindMemberValue(reward, "Potion", "potion", "_potion", "ClaimedPotion", "claimedPotion"));
+        }
+        else if (rewardType == "relic")
+        {
+            entry["rarity"] = ReadString(reward, "Rarity", "rarity", "_rarity");
+            entry["relic"] = BuildItemSummary(FindMemberValue(reward, "_relic", "relic", "ClaimedRelic", "claimedRelic"));
+        }
+        else if (rewardType == "linked_reward_set")
+        {
+            List<Dictionary<string, object?>> nestedRewards = new();
+            List<object> nestedRewardObjects = EnumerateObjects(FindMemberValue(reward, "Rewards", "rewards", "_rewards")).ToList();
+            for (int nestedIndex = 0; nestedIndex < nestedRewardObjects.Count; nestedIndex++)
+            {
+                nestedRewards.Add(BuildRewardEntry(nestedRewardObjects[nestedIndex], $"{rewardId}_{nestedIndex}", button));
+            }
+
+            entry["rewards"] = nestedRewards;
+        }
+
+        return entry;
+    }
+
+    private static string ClassifyRewardType(object reward)
+    {
+        string typeName = reward.GetType().FullName ?? reward.GetType().Name;
+        if (typeName.Contains("CardReward", StringComparison.OrdinalIgnoreCase))
+        {
+            return "card_reward";
+        }
+
+        if (typeName.Contains("GoldReward", StringComparison.OrdinalIgnoreCase))
+        {
+            return "gold";
+        }
+
+        if (typeName.Contains("PotionReward", StringComparison.OrdinalIgnoreCase))
+        {
+            return "potion";
+        }
+
+        if (typeName.Contains("RelicReward", StringComparison.OrdinalIgnoreCase))
+        {
+            return "relic";
+        }
+
+        if (typeName.Contains("LinkedRewardSet", StringComparison.OrdinalIgnoreCase))
+        {
+            return "linked_reward_set";
+        }
+
+        return "unknown";
+    }
+
+    private static string ReadRewardName(object reward, string rewardType)
+    {
+        string? explicitName = ReadString(reward, "Name", "name", "DisplayName", "displayName", "Title", "title");
+        if (!string.IsNullOrWhiteSpace(explicitName))
+        {
+            return explicitName;
+        }
+
+        return rewardType switch
+        {
+            "card_reward" => "Card reward",
+            "gold" => "Gold reward",
+            "potion" => "Potion reward",
+            "relic" => "Relic reward",
+            "linked_reward_set" => "Linked reward set",
+            _ => GetReadableName(reward)
+        };
+    }
+
+    private static List<Dictionary<string, object?>> BuildRewardCards(object? source)
+    {
+        List<Dictionary<string, object?>> cards = new();
+        int index = 0;
+        foreach (object card in EnumerateCards(source))
+        {
+            string fallbackName = GetReadableName(card);
+            object? cardStats = FindMemberValue(card, "cardStats", "_cardStats", "stats", "_stats");
+            object? cardInfo = FindMemberValue(card, "cardInfo", "_cardInfo", "info", "_info", "baseCard", "_baseCard");
+            object? cardModel = FindMemberValue(card, "Model", "model", "_model", "cardModel", "_cardModel");
+            string cardName = ReadCardName(card, cardModel, cardInfo) ?? fallbackName;
+            cards.Add(new Dictionary<string, object?>
+            {
+                ["card_reward_index"] = index,
+                ["card_id"] = ReadFirstString(new[] { card, cardModel, cardInfo }, "id", "_id", "cardId", "_cardId", "key", "_key") ?? fallbackName,
+                ["name"] = cardName,
+                ["type"] = ReadFirstString(new[] { card, cardModel, cardInfo, cardStats }, "type", "_type", "cardType", "_cardType"),
+                ["cost"] = ReadFirstInt(new[] { card, cardModel, cardStats, cardInfo }, "cost", "_cost", "currentCost", "_currentCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost"),
+                ["base_cost"] = ReadFirstInt(new[] { card, cardModel, cardStats, cardInfo }, "baseCost", "_baseCost", "baseEnergyCost", "_baseEnergyCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost"),
+                ["rarity"] = ReadFirstString(new[] { card, cardModel, cardInfo }, "rarity", "_rarity", "cardRarity", "_cardRarity"),
+                ["upgraded"] = ReadBool(card, "upgraded", "isUpgraded"),
+                ["description"] = BuildCardDescription("reward", card, cardModel, cardInfo, cardStats)
+            });
+            index++;
+        }
+
+        return cards;
+    }
+
+    private static Dictionary<string, object?>? BuildItemSummary(object? source)
+    {
+        if (source is null)
+        {
+            return null;
+        }
+
+        string fallbackName = GetReadableName(source);
+        return new Dictionary<string, object?>
+        {
+            ["id"] = ReadString(source, "id", "_id", "key", "_key") ?? fallbackName,
+            ["name"] = ReadString(source, "name", "_name", "displayName", "_displayName", "title", "_title") ?? fallbackName,
+            ["description"] = TryReadFormattedDescription(source) ?? ReadString(source, "description", "_description", "desc", "_desc", "tooltip", "toolTip"),
+            ["rarity"] = ReadString(source, "rarity", "_rarity", "relicRarity", "potionRarity"),
+            ["type_name"] = source.GetType().FullName ?? source.GetType().Name
+        };
+    }
+
+    private static List<Dictionary<string, object?>> BuildRewardLegalActions(List<Dictionary<string, object?>> rewards)
+    {
+        List<Dictionary<string, object?>> actions = new();
+        AddRewardLegalActions(actions, rewards);
+        return actions;
+    }
+
+    private static void AddRewardLegalActions(List<Dictionary<string, object?>> actions, List<Dictionary<string, object?>> rewards)
+    {
+        foreach (Dictionary<string, object?> reward in rewards)
+        {
+            string rewardId = ReadDictionaryString(reward, "reward_id") ?? "reward_unknown";
+            string rewardType = ReadDictionaryString(reward, "type") ?? "unknown";
+            if (rewardType == "card_reward")
+            {
+                foreach (Dictionary<string, object?> card in ReadDictionaryList(reward, "cards"))
+                {
+                    int? cardIndex = ReadDictionaryInt(card, "card_reward_index");
+                    string cardName = ReadDictionaryString(card, "name") ?? ReadDictionaryString(card, "card_id") ?? "unknown_card";
+                    actions.Add(new Dictionary<string, object?>
+                    {
+                        ["action_id"] = SanitizeActionId($"choose_{rewardId}_card_{cardIndex?.ToString() ?? "unknown"}"),
+                        ["type"] = "choose_card_reward",
+                        ["reward_id"] = rewardId,
+                        ["card_reward_index"] = cardIndex,
+                        ["card_id"] = ReadDictionaryString(card, "card_id"),
+                        ["card_name"] = cardName,
+                        ["summary"] = $"{cardName} 카드를 보상으로 선택한다.",
+                        ["validation_note"] = "이번 단계에서는 관측용 후보만 생성한다. 실행기는 아직 보상 선택을 수행하지 않는다."
+                    });
+                }
+
+                if (ReadDictionaryBool(reward, "can_skip") == true)
+                {
+                    actions.Add(new Dictionary<string, object?>
+                    {
+                        ["action_id"] = SanitizeActionId($"skip_{rewardId}"),
+                        ["type"] = "skip_card_reward",
+                        ["reward_id"] = rewardId,
+                        ["summary"] = "카드 보상을 건너뛴다.",
+                        ["validation_note"] = "이번 단계에서는 관측용 후보만 생성한다. 실행기는 아직 보상 선택을 수행하지 않는다."
+                    });
+                }
+            }
+            else if (rewardType == "relic")
+            {
+                actions.Add(new Dictionary<string, object?>
+                {
+                    ["action_id"] = SanitizeActionId($"claim_{rewardId}"),
+                    ["type"] = "claim_relic_reward",
+                    ["reward_id"] = rewardId,
+                    ["summary"] = "유물 보상을 획득한다.",
+                    ["validation_note"] = "이번 단계에서는 관측용 후보만 생성한다. 실행기는 아직 보상 선택을 수행하지 않는다."
+                });
+            }
+            else if (rewardType == "potion")
+            {
+                actions.Add(new Dictionary<string, object?>
+                {
+                    ["action_id"] = SanitizeActionId($"claim_{rewardId}"),
+                    ["type"] = "claim_potion_reward",
+                    ["reward_id"] = rewardId,
+                    ["summary"] = "포션 보상을 획득한다.",
+                    ["validation_note"] = "이번 단계에서는 관측용 후보만 생성한다. 실행기는 아직 보상 선택을 수행하지 않는다."
+                });
+            }
+            else if (rewardType == "linked_reward_set")
+            {
+                AddRewardLegalActions(actions, ReadDictionaryList(reward, "rewards"));
+            }
+        }
+    }
+
+    private static Dictionary<string, object?> BuildRewardDebug(object rewardScreen, ObjectGraph graph)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["current_root_type"] = rewardScreen.GetType().FullName ?? rewardScreen.GetType().Name,
+            ["observed_types"] = LastObservedTypes.ToArray(),
+            ["graph_node_count"] = graph.Nodes.Count
         };
     }
 

@@ -573,21 +573,21 @@ function classifyCombatReadiness(snapshot) {
     };
   }
 
-  if (liveEnemyCount <= 0) {
-    return {
-      stateSummary,
-      readyForDecision: false,
-      shouldStop: true,
-      reason: "no_live_enemies"
-    };
-  }
-
   if (phase !== "" && phase !== "combat_turn") {
     return {
       stateSummary,
       readyForDecision: false,
       shouldStop: !phase.startsWith("combat"),
       reason: phase.startsWith("combat") ? `waiting_${phase}` : `non_combat_phase:${phase}`
+    };
+  }
+
+  if (liveEnemyCount <= 0) {
+    return {
+      stateSummary,
+      readyForDecision: false,
+      shouldStop: true,
+      reason: "no_live_enemies"
     };
   }
 

@@ -24,7 +24,7 @@
 ## 필드 규칙
 
 - `schema_version`: 상태 JSON 형식 버전이다.
-- `phase`: 현재 결정 종류다. 1차는 `combat_turn`만 사용한다.
+- `phase`: 현재 결정 종류다. 전투 중에는 `combat_turn`, 보상 화면에서는 `reward`를 사용한다.
 - `state_id`: 같은 상태인지 판별하기 위한 식별자다. LLM 응답 검증에 사용한다.
 - `exported_at_ms`: 로그 정렬용 시간이다.
 - `run`: 판 전체의 고정 정보다.
@@ -159,6 +159,42 @@
   }
 ]
 ```
+
+## reward
+
+전투 보상 화면에서는 같은 `combat_state.v1` 파일에 `phase: "reward"`를 기록한다. 이 상태는 아직 실행 대상이 아니라 다음 결정 영역을 관측하기 위한 자료다.
+
+```json
+{
+  "phase": "reward",
+  "reward": {
+    "screen_type": "MegaCrit.Sts2.Core.Nodes.Screens.NRewardsScreen",
+    "reward_count": 2,
+    "skip_disallowed": false,
+    "can_skip": true,
+    "rewards": [
+      {
+        "reward_id": "reward_0",
+        "type": "card_reward",
+        "can_skip": true,
+        "can_reroll": false,
+        "cards": [
+          {
+            "card_reward_index": 0,
+            "card_id": "StrikeCard",
+            "name": "Strike",
+            "cost": 1,
+            "rarity": "common",
+            "description": "Deal 6 damage."
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+보상 종류는 `card_reward`, `gold`, `potion`, `relic`, `linked_reward_set`, `unknown` 중 하나다.
 
 ## intent
 

@@ -357,6 +357,54 @@ try {
         throw "전투 반복 루프 종료 이벤트에 결과 요약이 기록되지 않았습니다."
     }
 
+    $rewardStopState = $combatStateJson | ConvertFrom-Json
+    $rewardStopState.state_id = "reward_loop_stop_test_" + [guid]::NewGuid().ToString("N")
+    $rewardStopState.phase = "reward"
+    $rewardStopState.enemies = @()
+    $rewardStopState.legal_actions = @(
+        [pscustomobject]@{
+            action_id = "choose_reward_0_card_0"
+            type = "choose_card_reward"
+            reward_id = "reward_0"
+            card_reward_index = 0
+        }
+    )
+    $rewardPayload = [pscustomobject]@{
+        reward_count = 1
+        rewards = @(
+            [pscustomobject]@{
+                reward_id = "reward_0"
+                type = "card_reward"
+                cards = @(
+                    [pscustomobject]@{
+                        card_reward_index = 0
+                        name = "Strike"
+                    }
+                )
+            }
+        )
+    }
+    $rewardStopState | Add-Member -NotePropertyName "reward" -NotePropertyValue $rewardPayload -Force
+    $rewardStopStateJson = $rewardStopState | ConvertTo-Json -Depth 100
+    $null = Invoke-RestMethod `
+        -Method Post `
+        -Uri "$BridgeUrl/state" `
+        -ContentType "application/json; charset=utf-8" `
+        -Body $rewardStopStateJson `
+        -TimeoutSec 5
+
+    $rewardStopRunLogDir = Join-Path ([System.IO.Path]::GetTempPath()) ("spiremind_reward_stop_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $rewardStopRunLogDir | Out-Null
+    $rewardStopText = & node $decisionLoopPath --bridge-url $BridgeUrl --mode heuristic --until-combat-end --max-decisions 3 --run-log-dir $rewardStopRunLogDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "보상 화면 반복 루프 종료 감지 검증이 실패했습니다."
+    }
+
+    $rewardStop = $rewardStopText | ConvertFrom-Json
+    if ($rewardStop.status -ne "combat_loop_stopped" -or $rewardStop.reason -ne "non_combat_phase:reward") {
+        throw "보상 화면 종료 감지 결과가 올바르지 않습니다: $rewardStopText"
+    }
+
     $null = Invoke-RestMethod `
         -Method Post `
         -Uri "$BridgeUrl/state" `
