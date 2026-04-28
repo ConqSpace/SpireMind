@@ -158,6 +158,38 @@ internal static class CombatStateExporter
         }
     }
 
+    internal static string? ReadLatestStateFilePhase(string reason)
+    {
+        string outputPath = GetOutputPath();
+        try
+        {
+            if (!File.Exists(outputPath))
+            {
+                return null;
+            }
+
+            string json = File.ReadAllText(outputPath, Encoding.UTF8);
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return null;
+            }
+
+            using JsonDocument document = JsonDocument.Parse(json);
+            JsonElement root = document.RootElement;
+            if (root.TryGetProperty("phase", out JsonElement phaseElement)
+                && phaseElement.ValueKind == JsonValueKind.String)
+            {
+                return phaseElement.GetString();
+            }
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"최신 combat_state.json 단계 확인 중 예외가 발생했습니다. 게임 진행은 멈추지 않습니다. reason={reason}, path={outputPath}, {exception.GetType().Name}: {exception.Message}");
+        }
+
+        return null;
+    }
+
     internal static bool HasPendingExport
     {
         get
@@ -567,12 +599,31 @@ internal static class CombatStateExporter
         string typeName = source.GetType().FullName ?? source.GetType().Name;
         if (typeName.Contains("NRewardsScreen", StringComparison.OrdinalIgnoreCase))
         {
-            return true;
+            return IsLiveVisibleControl(source);
         }
 
         string? screenType = ReadString(source, "ScreenType", "screenType", "_screenType");
         return !string.IsNullOrWhiteSpace(screenType)
-            && screenType.Contains("Rewards", StringComparison.OrdinalIgnoreCase);
+            && screenType.Contains("Rewards", StringComparison.OrdinalIgnoreCase)
+            && IsLiveVisibleControl(source);
+    }
+
+    private static bool IsLiveVisibleControl(object source)
+    {
+        bool? isQueuedForDeletion = TryInvokeBoolMethod(source, "IsQueuedForDeletion");
+        if (isQueuedForDeletion == true)
+        {
+            return false;
+        }
+
+        bool? isVisibleInTree = TryInvokeBoolMethod(source, "IsVisibleInTree");
+        if (isVisibleInTree is not null)
+        {
+            return isVisibleInTree.Value;
+        }
+
+        bool? visible = ReadBool(source, "Visible", "visible");
+        return visible == true;
     }
 
     private static Dictionary<string, object?> BuildRewardScreenState(object rewardScreen)
@@ -931,7 +982,8 @@ internal static class CombatStateExporter
 
         bool? isOpen = ReadBool(source, "IsOpen", "isOpen", "_isOpen");
         bool? visible = ReadBool(source, "Visible", "visible");
-        return isOpen == true || visible == true;
+        bool? isQueuedForDeletion = TryInvokeBoolMethod(source, "IsQueuedForDeletion");
+        return isQueuedForDeletion != true && (isOpen == true || visible == true);
     }
 
     private static Dictionary<string, object?> BuildMapScreenState(object mapScreen, object? runState, object? map)
@@ -3202,6 +3254,12 @@ internal static class CombatStateExporter
         {
             return null;
         }
+    }
+
+    private static bool? TryInvokeBoolMethod(object? source, string methodName)
+    {
+        object? value = TryInvokeMethod(source, methodName);
+        return value is bool result ? result : null;
     }
 
     private static object? TryInvokeMethod(object? source, MethodInfo method, params object?[] args)

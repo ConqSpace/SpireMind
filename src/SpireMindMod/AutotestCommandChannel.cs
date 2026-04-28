@@ -1248,7 +1248,7 @@ internal static class AutotestCommandChannel
                         RefreshContinueRunDiagnostics(diagnostics);
                         diagnostics["load_run_success"] = true;
                         ClearRetainedContinuationContext("command_applied");
-                        WriteCommandResult(command, "applied", "continue_run이 정상 UI 흐름으로 전투 상태까지 도달했습니다.", diagnostics);
+                        WriteCommandResult(command, "applied", "continue_run이 정상 UI 흐름으로 전투 또는 지도 상태까지 도달했습니다.", diagnostics);
                         Logger.Info($"continue_run deferred Continue 버튼 경로 완료: id={command.Id}");
                         Interlocked.Exchange(ref continueRunInFlight, 0);
                         return true;
@@ -1730,6 +1730,7 @@ internal static class AutotestCommandChannel
             exportReadyWaitCount++;
             long elapsedMs = Environment.TickCount64 - exportReadyWaitStartedAtMs;
             CombatStateExporter.CombatExportProbe fileProbe = CombatStateExporter.ReadLatestStateFileProbe("continue_run");
+            string? latestFilePhase = CombatStateExporter.ReadLatestStateFilePhase("continue_run");
             bool exportPending = CombatStateExporter.HasPendingExport;
             bool combatInProgress = IsCombatInProgress();
             bool combatPlayPhase = IsCombatPlayPhase();
@@ -1767,11 +1768,22 @@ internal static class AutotestCommandChannel
             diagnostics["export_ready_file_enemy_count"] = fileProbe.EnemyCount;
             diagnostics["export_ready_file_reason"] = fileProbe.Reason;
             diagnostics["export_ready_file_is_stable"] = fileProbe.IsStable;
+            diagnostics["export_ready_file_phase"] = latestFilePhase;
             diagnostics["export_ready_pending_export"] = exportPending;
             diagnostics["export_ready_pending_export_count"] = CombatStateExporter.PendingExportCount;
             diagnostics["export_ready_pending_export_age_ms"] = CombatStateExporter.PendingExportAgeMs;
             combatInProgress = combatInProgress || probe.IsInProgress;
             diagnostics["export_ready_combat_in_progress_for_file_fallback"] = combatInProgress;
+
+            if (!exportPending && string.Equals(latestFilePhase, "map", StringComparison.OrdinalIgnoreCase))
+            {
+                stage = "done";
+                diagnostics["export_ready_success_source"] = "latest_state_file";
+                diagnostics["export_ready_success_phase"] = "map";
+                ClearRetainedContinuationContext("export_ready_map");
+                WriteCommandResult(command, "running", "지도 상태 파일이 안정된 것을 확인했습니다.", diagnostics);
+                return false;
+            }
 
             // 대기 단계에서는 파일 기반 판정을 우선합니다.
             // 강제 export는 전투 준비가 안정적으로 보일 때만 낮은 빈도로 보조 확인합니다.
@@ -1779,6 +1791,7 @@ internal static class AutotestCommandChannel
             {
                 stage = "done";
                 diagnostics["export_ready_success_source"] = probe.IsStable ? "combat_manager_force_export" : "latest_state_file";
+                diagnostics["export_ready_success_phase"] = "combat_turn";
                 ClearRetainedContinuationContext("export_ready");
                 WriteCommandResult(command, "running", "전투 상태 export 또는 최신 상태 파일이 안정된 것을 확인했습니다.", diagnostics);
                 return false;
