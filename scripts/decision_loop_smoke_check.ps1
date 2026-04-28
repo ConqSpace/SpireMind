@@ -405,6 +405,58 @@ try {
         throw "보상 화면 종료 감지 결과가 올바르지 않습니다: $rewardStopText"
     }
 
+    $mapStopState = $combatStateJson | ConvertFrom-Json
+    $mapStopState.state_id = "map_loop_stop_test_" + [guid]::NewGuid().ToString("N")
+    $mapStopState.phase = "map"
+    $mapStopState.enemies = @()
+    $mapStopState.legal_actions = @(
+        [pscustomobject]@{
+            action_id = "choose_map_r1_c0"
+            type = "choose_map_node"
+            node_id = "map_r1_c0"
+            row = 1
+            column = 0
+            room_type = "Monster"
+        }
+    )
+    $mapPayload = [pscustomobject]@{
+        current = [pscustomobject]@{
+            node_id = $null
+            row = $null
+            column = $null
+            room_type = $null
+        }
+        available_next_nodes = @(
+            [pscustomobject]@{
+                node_id = "map_r1_c0"
+                row = 1
+                column = 0
+                room_type = "Monster"
+                reachable_now = $true
+            }
+        )
+    }
+    $mapStopState | Add-Member -NotePropertyName "map" -NotePropertyValue $mapPayload -Force
+    $mapStopStateJson = $mapStopState | ConvertTo-Json -Depth 100
+    $null = Invoke-RestMethod `
+        -Method Post `
+        -Uri "$BridgeUrl/state" `
+        -ContentType "application/json; charset=utf-8" `
+        -Body $mapStopStateJson `
+        -TimeoutSec 5
+
+    $mapStopRunLogDir = Join-Path ([System.IO.Path]::GetTempPath()) ("spiremind_map_stop_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $mapStopRunLogDir | Out-Null
+    $mapStopText = & node $decisionLoopPath --bridge-url $BridgeUrl --mode heuristic --until-combat-end --max-decisions 3 --run-log-dir $mapStopRunLogDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "지도 화면 반복 루프 종료 감지 검증이 실패했습니다."
+    }
+
+    $mapStop = $mapStopText | ConvertFrom-Json
+    if ($mapStop.status -ne "combat_loop_stopped" -or $mapStop.reason -ne "non_combat_phase:map") {
+        throw "지도 화면 종료 감지 결과가 올바르지 않습니다: $mapStopText"
+    }
+
     $null = Invoke-RestMethod `
         -Method Post `
         -Uri "$BridgeUrl/state" `

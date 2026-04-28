@@ -237,6 +237,27 @@ internal static class CombatStateExporter
         }
     }
 
+    internal static bool TryExportMapStateIfVisible()
+    {
+        try
+        {
+            object? mapScreen = FindMapScreen();
+            if (mapScreen is null)
+            {
+                return false;
+            }
+
+            Dictionary<string, object?> state = BuildMapState(mapScreen);
+            WriteState(mapScreen, state, "map", force: false, tickAfterExport: false);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"지도 화면 상태 추출에 실패했습니다. 게임 진행은 멈추지 않습니다. {exception.GetType().Name}: {exception.Message}");
+            return false;
+        }
+    }
+
     private static void TryExport(object combatRoot)
     {
 
@@ -824,6 +845,264 @@ internal static class CombatStateExporter
         return new Dictionary<string, object?>
         {
             ["current_root_type"] = rewardScreen.GetType().FullName ?? rewardScreen.GetType().Name,
+            ["observed_types"] = LastObservedTypes.ToArray(),
+            ["graph_node_count"] = graph.Nodes.Count
+        };
+    }
+
+    private static Dictionary<string, object?> BuildMapState(object mapScreen)
+    {
+        object? managerCombatState = ReadCombatManagerDebugState(GetCombatManagerInstance());
+        if (managerCombatState is not null)
+        {
+            RememberObservedRoot(managerCombatState);
+        }
+
+        object? runState = FindMemberValue(mapScreen, "_runState", "runState", "RunState")
+            ?? FindMemberValue(GetStaticPropertyValue("MegaCrit.Sts2.Core.Runs.RunManager", "Instance"), "RunState", "runState", "_runState", "State", "state");
+        object? player = recentPlayer
+            ?? recentPlayerCombatState
+            ?? EnumerateObjects(FindMemberValue(runState, "Players", "players", "_players")).FirstOrDefault();
+        object? map = FindMemberValue(mapScreen, "_map", "Map", "map")
+            ?? FindMemberValue(runState, "Map", "map", "_map");
+        object? relicsSource = FindMemberValue(player, "relics")
+            ?? FindMemberValue(runState, "relics");
+        List<object> roots = new();
+        AddRoot(roots, mapScreen);
+        AddRoot(roots, runState);
+        AddRoot(roots, map);
+        AddRoot(roots, player);
+        AddRoot(roots, recentPlayer);
+        ObjectGraph graph = ObjectGraph.Collect(roots, 3, 260);
+
+        Dictionary<string, object?> mapState = BuildMapScreenState(mapScreen, runState, map);
+        List<Dictionary<string, object?>> availableNextNodes = ReadDictionaryList(mapState, "available_next_nodes");
+
+        return new Dictionary<string, object?>
+        {
+            ["schema_version"] = "combat_state.v1",
+            ["phase"] = "map",
+            ["state_id"] = "map_pending",
+            ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["run"] = BuildRun(runState ?? managerCombatState ?? mapScreen, graph),
+            ["player"] = player is null ? new Dictionary<string, object?>() : BuildPlayer(player),
+            ["piles"] = new Dictionary<string, object?>
+            {
+                ["hand"] = new List<Dictionary<string, object?>>(),
+                ["draw_pile"] = new List<Dictionary<string, object?>>(),
+                ["discard_pile"] = new List<Dictionary<string, object?>>(),
+                ["exhaust_pile"] = new List<Dictionary<string, object?>>()
+            },
+            ["enemies"] = new List<Dictionary<string, object?>>(),
+            ["map"] = mapState,
+            ["legal_actions"] = BuildMapLegalActions(availableNextNodes),
+            ["relics"] = BuildRelics(relicsSource, graph),
+            ["debug"] = BuildMapDebug(mapScreen, runState, map, graph)
+        };
+    }
+
+    private static object? FindMapScreen()
+    {
+        object? screen = GetStaticPropertyValue("MegaCrit.Sts2.Core.Nodes.Screens.Map.NMapScreen", "Instance");
+        if (IsMapScreenOpen(screen))
+        {
+            return screen;
+        }
+
+        object? screenContext = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext",
+            "Instance");
+        object? currentScreen = TryInvokeMethod(screenContext, "GetCurrentScreen");
+        return IsMapScreenOpen(currentScreen) ? currentScreen : null;
+    }
+
+    private static bool IsMapScreenOpen(object? source)
+    {
+        if (source is null)
+        {
+            return false;
+        }
+
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        if (!typeName.Contains("NMapScreen", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        bool? isOpen = ReadBool(source, "IsOpen", "isOpen", "_isOpen");
+        bool? visible = ReadBool(source, "Visible", "visible");
+        return isOpen == true || visible == true;
+    }
+
+    private static Dictionary<string, object?> BuildMapScreenState(object mapScreen, object? runState, object? map)
+    {
+        Dictionary<string, object?> currentNode = BuildCurrentMapNode(runState);
+        List<Dictionary<string, object?>> availableNextNodes = BuildAvailableMapNodes(mapScreen);
+        return new Dictionary<string, object?>
+        {
+            ["screen_type"] = mapScreen.GetType().FullName ?? mapScreen.GetType().Name,
+            ["is_open"] = ReadBool(mapScreen, "IsOpen", "isOpen", "_isOpen"),
+            ["is_travel_enabled"] = ReadBool(mapScreen, "IsTravelEnabled", "isTravelEnabled", "_isTravelEnabled"),
+            ["is_traveling"] = ReadBool(mapScreen, "IsTraveling", "isTraveling", "_isTraveling"),
+            ["act_index"] = ReadInt(runState, "CurrentActIndex", "currentActIndex", "_currentActIndex"),
+            ["act_floor"] = ReadInt(runState, "ActFloor", "actFloor", "_actFloor"),
+            ["total_floor"] = ReadInt(runState, "TotalFloor", "totalFloor"),
+            ["row_count"] = TryInvokeMethod(map, "GetRowCount"),
+            ["column_count"] = TryInvokeMethod(map, "GetColumnCount"),
+            ["current"] = currentNode,
+            ["available_next_nodes"] = availableNextNodes,
+            ["available_next_node_count"] = availableNextNodes.Count,
+            ["future_expansion_note"] = "현재 구현은 즉시 선택 가능한 다음 노드만 내보낸다. 이후 전체 지도 그래프와 보스까지의 후보 경로 요약을 추가한다."
+        };
+    }
+
+    private static Dictionary<string, object?> BuildCurrentMapNode(object? runState)
+    {
+        object? currentPoint = FindMemberValue(runState, "CurrentMapPoint", "currentMapPoint");
+        if (currentPoint is not null)
+        {
+            return BuildMapPointSummary(currentPoint, null);
+        }
+
+        object? currentCoord = FindMemberValue(runState, "CurrentMapCoord", "currentMapCoord");
+        Dictionary<string, object?> coord = BuildMapCoordSummary(currentCoord);
+        return new Dictionary<string, object?>
+        {
+            ["node_id"] = BuildMapNodeId(coord),
+            ["column"] = ReadDictionaryInt(coord, "column"),
+            ["row"] = ReadDictionaryInt(coord, "row"),
+            ["room_type"] = null,
+            ["state"] = null,
+            ["is_current"] = currentCoord is not null
+        };
+    }
+
+    private static List<Dictionary<string, object?>> BuildAvailableMapNodes(object mapScreen)
+    {
+        List<Dictionary<string, object?>> result = new();
+        HashSet<string> seenNodeIds = new(StringComparer.Ordinal);
+        object? mapPointDictionary = FindMemberValue(mapScreen, "_mapPointDictionary", "mapPointDictionary", "MapPointDictionary");
+        object? mapPointNodesSource = FindMemberValue(mapPointDictionary, "Values", "values")
+            ?? FindMemberValue(mapScreen, "_points", "Points", "points");
+
+        foreach (object mapPointNode in EnumerateObjects(mapPointNodesSource))
+        {
+            if (!IsTravelableMapPointNode(mapPointNode))
+            {
+                continue;
+            }
+
+            Dictionary<string, object?> summary = BuildMapPointSummary(FindMemberValue(mapPointNode, "Point", "point", "_point"), mapPointNode);
+            string? nodeId = ReadDictionaryString(summary, "node_id");
+            if (string.IsNullOrWhiteSpace(nodeId) || !seenNodeIds.Add(nodeId))
+            {
+                continue;
+            }
+
+            summary["reachable_now"] = true;
+            result.Add(summary);
+        }
+
+        return result
+            .OrderBy(node => ReadDictionaryInt(node, "row") ?? int.MaxValue)
+            .ThenBy(node => ReadDictionaryInt(node, "column") ?? int.MaxValue)
+            .ToList();
+    }
+
+    private static bool IsTravelableMapPointNode(object source)
+    {
+        object? point = FindMemberValue(source, "Point", "point", "_point");
+        if (point is null)
+        {
+            return false;
+        }
+
+        string? state = ReadString(source, "State", "state", "_state");
+        if (string.Equals(state, "Travelable", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        bool? isEnabled = ReadBool(source, "IsEnabled", "isEnabled", "_isEnabled");
+        return isEnabled == true;
+    }
+
+    private static Dictionary<string, object?> BuildMapPointSummary(object? point, object? node)
+    {
+        Dictionary<string, object?> coord = BuildMapCoordSummary(FindMemberValue(point, "coord", "Coord", "_coord"));
+        string nodeId = BuildMapNodeId(coord);
+        List<string> childNodeIds = EnumerateObjects(FindMemberValue(point, "Children", "children", "_children"))
+            .Select(child => BuildMapNodeId(BuildMapCoordSummary(FindMemberValue(child, "coord", "Coord", "_coord"))))
+            .Where(nodeIdValue => !string.IsNullOrWhiteSpace(nodeIdValue))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        return new Dictionary<string, object?>
+        {
+            ["node_id"] = nodeId,
+            ["column"] = ReadDictionaryInt(coord, "column"),
+            ["row"] = ReadDictionaryInt(coord, "row"),
+            ["room_type"] = ReadString(point, "PointType", "pointType", "_pointType"),
+            ["state"] = ReadString(node, "State", "state", "_state"),
+            ["is_enabled"] = ReadBool(node, "IsEnabled", "isEnabled", "_isEnabled"),
+            ["child_node_ids"] = childNodeIds,
+            ["type_name"] = point?.GetType().FullName ?? point?.GetType().Name,
+            ["node_type_name"] = node?.GetType().FullName ?? node?.GetType().Name
+        };
+    }
+
+    private static Dictionary<string, object?> BuildMapCoordSummary(object? coord)
+    {
+        int? column = ReadInt(coord, "col", "Col", "column", "Column");
+        int? row = ReadInt(coord, "row", "Row");
+        return new Dictionary<string, object?>
+        {
+            ["column"] = column,
+            ["row"] = row
+        };
+    }
+
+    private static string BuildMapNodeId(Dictionary<string, object?> coord)
+    {
+        int? column = ReadDictionaryInt(coord, "column");
+        int? row = ReadDictionaryInt(coord, "row");
+        return column is null || row is null ? "map_unknown" : $"map_r{row.Value}_c{column.Value}";
+    }
+
+    private static List<Dictionary<string, object?>> BuildMapLegalActions(List<Dictionary<string, object?>> availableNextNodes)
+    {
+        List<Dictionary<string, object?>> actions = new();
+        foreach (Dictionary<string, object?> node in availableNextNodes)
+        {
+            string nodeId = ReadDictionaryString(node, "node_id") ?? "map_unknown";
+            string roomType = ReadDictionaryString(node, "room_type") ?? "unknown";
+            int? row = ReadDictionaryInt(node, "row");
+            int? column = ReadDictionaryInt(node, "column");
+            actions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = SanitizeActionId($"choose_{nodeId}"),
+                ["type"] = "choose_map_node",
+                ["node_id"] = nodeId,
+                ["row"] = row,
+                ["column"] = column,
+                ["room_type"] = roomType,
+                ["summary"] = $"지도에서 {roomType} 노드({row?.ToString() ?? "?"}, {column?.ToString() ?? "?"})를 선택한다.",
+                ["validation_note"] = "이번 단계에서는 관측용 후보만 생성한다. 실행기는 아직 지도 노드 선택을 수행하지 않는다."
+            });
+        }
+
+        return actions;
+    }
+
+    private static Dictionary<string, object?> BuildMapDebug(object mapScreen, object? runState, object? map, ObjectGraph graph)
+    {
+        object? mapPointDictionary = FindMemberValue(mapScreen, "_mapPointDictionary", "mapPointDictionary", "MapPointDictionary");
+        return new Dictionary<string, object?>
+        {
+            ["current_root_type"] = mapScreen.GetType().FullName ?? mapScreen.GetType().Name,
+            ["run_state_type"] = runState?.GetType().FullName ?? runState?.GetType().Name,
+            ["map_type"] = map?.GetType().FullName ?? map?.GetType().Name,
+            ["map_point_dictionary_type"] = mapPointDictionary?.GetType().FullName ?? mapPointDictionary?.GetType().Name,
             ["observed_types"] = LastObservedTypes.ToArray(),
             ["graph_node_count"] = graph.Nodes.Count
         };

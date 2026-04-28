@@ -32,7 +32,10 @@ internal static class AutotestMainThreadTicker
             Interlocked.Increment(ref tickCount);
             if (!CombatStateExporter.TryExportRewardStateIfVisible())
             {
-                CombatStateExporter.FlushPendingExportIfReady();
+                if (!CombatStateExporter.TryExportMapStateIfVisible())
+                {
+                    CombatStateExporter.FlushPendingExportIfReady();
+                }
             }
 
             CombatActionExecutor.TickMainThread();

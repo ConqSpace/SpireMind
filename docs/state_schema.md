@@ -24,7 +24,7 @@
 ## 필드 규칙
 
 - `schema_version`: 상태 JSON 형식 버전이다.
-- `phase`: 현재 결정 종류다. 전투 중에는 `combat_turn`, 보상 화면에서는 `reward`를 사용한다.
+- `phase`: 현재 결정 종류다. 전투 중에는 `combat_turn`, 보상 화면에서는 `reward`, 지도 화면에서는 `map`을 사용한다.
 - `state_id`: 같은 상태인지 판별하기 위한 식별자다. LLM 응답 검증에 사용한다.
 - `exported_at_ms`: 로그 정렬용 시간이다.
 - `run`: 판 전체의 고정 정보다.
@@ -195,6 +195,37 @@
 ```
 
 보상 종류는 `card_reward`, `gold`, `potion`, `relic`, `linked_reward_set`, `unknown` 중 하나다.
+
+## map
+
+지도 화면에서는 최소 구현으로 현재 위치와 지금 선택 가능한 다음 노드만 내보낸다.
+
+```json
+{
+  "phase": "map",
+  "map": {
+    "act_index": 0,
+    "act_floor": 3,
+    "current": {
+      "node_id": "map_r2_c3",
+      "row": 2,
+      "column": 3,
+      "room_type": "Monster"
+    },
+    "available_next_nodes": [
+      {
+        "node_id": "map_r3_c2",
+        "row": 3,
+        "column": 2,
+        "room_type": "Elite",
+        "reachable_now": true
+      }
+    ]
+  }
+}
+```
+
+후속 확장에서는 전체 지도 그래프, 보스까지 이어지는 후보 경로, 경로별 방 종류 집계를 추가한다. 그래도 실행 후보는 현재 누를 수 있는 다음 노드로 제한한다.
 
 ## intent
 

@@ -56,7 +56,7 @@ node .\bridge\spiremind_decision_loop.js `
   --run-log-dir "$env:APPDATA\SlayTheSpire2\SpireMind\runs\combat_001"
 ```
 
-이 모드는 `phase`가 `combat_turn`이고 살아 있는 적과 가능한 행동이 있을 때만 판단한다. 적 턴, 애니메이션, 전환처럼 아직 판단할 수 없는 전투 상태는 기다린다. 플레이어가 쓰러졌거나, 살아 있는 적이 없거나, 전투 밖 화면으로 넘어가면 `combat_ended`와 `combat_loop_stopped` 이벤트를 남기고 멈춘다. `phase: "reward"`는 전투 종료 뒤 보상 화면으로 판단해서 멈춘다.
+이 모드는 `phase`가 `combat_turn`이고 살아 있는 적과 가능한 행동이 있을 때만 판단한다. 적 턴, 애니메이션, 전환처럼 아직 판단할 수 없는 전투 상태는 기다린다. 플레이어가 쓰러졌거나, 살아 있는 적이 없거나, 전투 밖 화면으로 넘어가면 `combat_ended`와 `combat_loop_stopped` 이벤트를 남기고 멈춘다. `phase: "reward"`와 `phase: "map"`은 전투 밖 화면으로 판단해서 멈춘다.
 
 ### `command`
 
