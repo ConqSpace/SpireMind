@@ -1917,7 +1917,7 @@ internal static class CombatActionExecutor
 
     private static bool WaitForMapNodeSelection(object mapRoot, LegalActionSnapshot legalAction)
     {
-        const int timeoutMs = 8000;
+        const int timeoutMs = 45000;
         const int pollIntervalMs = 100;
         Stopwatch stopwatch = Stopwatch.StartNew();
         int stableCompletionPollCount = 0;
