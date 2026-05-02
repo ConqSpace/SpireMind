@@ -267,6 +267,14 @@ internal static class CombatActionExecutor
             {
                 applied = TryExecuteOpenTreasureChest(context.CombatRoot, out detail);
             }
+            else if (legalAction.ActionType.Equals("claim_treasure_relic", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecuteClaimTreasureRelic(legalAction, context.CombatRoot, out detail);
+            }
+            else if (legalAction.ActionType.Equals("proceed_treasure", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecuteTreasureProceed(context.CombatRoot, out detail);
+            }
             else if (legalAction.ActionType.Equals("buy_shop_item", StringComparison.OrdinalIgnoreCase))
             {
                 applied = TryExecuteBuyShopItem(legalAction, context.CombatRoot, out detail);
@@ -335,6 +343,8 @@ internal static class CombatActionExecutor
             || actionType.Equals("proceed_rest_site", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("proceed_shop", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("open_treasure_chest", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("claim_treasure_relic", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("proceed_treasure", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("buy_shop_item", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("remove_card_at_shop", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("choose_card_selection", StringComparison.OrdinalIgnoreCase)
@@ -618,6 +628,154 @@ internal static class CombatActionExecutor
         string currentScreenTypeName = GetCurrentScreenTypeName();
         string tried = invokedCandidates.Count == 0 ? "<none>" : string.Join(", ", invokedCandidates);
         detail = $"보물상자 버튼 호출 뒤 보상 UI 진입을 확인하지 못했습니다. tried={tried}, current_screen={currentScreenTypeName}, opened={IsTreasureChestOpened(treasureRoom)}";
+        return false;
+    }
+
+    private static bool TryExecuteClaimTreasureRelic(
+        LegalActionSnapshot legalAction,
+        object treasureRoot,
+        out string detail)
+    {
+        object? treasureRoom = ResolveTreasureRoom(treasureRoot);
+        if (treasureRoom is null)
+        {
+            string rootTypeName = treasureRoot.GetType().FullName ?? treasureRoot.GetType().Name;
+            detail = $"보물방 유물 획득은 현재 화면에서 실행할 수 없습니다. root={rootTypeName}";
+            return false;
+        }
+
+        if (!IsTreasureRelicCollectionOpen(treasureRoom))
+        {
+            detail = "보물방 유물 선택 UI가 아직 열려 있지 않습니다.";
+            return false;
+        }
+
+        if (legalAction.TreasureRelicIndex is null)
+        {
+            detail = "claim_treasure_relic에는 treasure_relic_index가 필요합니다.";
+            return false;
+        }
+
+        object? relicCollection = FindTreasureRelicCollection(treasureRoom);
+        if (relicCollection is null)
+        {
+            detail = "보물방 유물 컬렉션 노드를 찾지 못했습니다.";
+            return false;
+        }
+
+        object? holder = FindTreasureRelicHolder(relicCollection, legalAction.TreasureRelicIndex.Value);
+        if (holder is null)
+        {
+            detail = $"보물방 유물 홀더를 찾지 못했습니다. index={legalAction.TreasureRelicIndex.Value}, relic_id={legalAction.TreasureRelicId ?? "<none>"}";
+            return false;
+        }
+
+        if (ReadNamedMember(holder, "IsEnabled") is bool isEnabled && !isEnabled)
+        {
+            detail = $"보물방 유물 홀더가 비활성 상태입니다. index={legalAction.TreasureRelicIndex.Value}";
+            return false;
+        }
+
+        List<string> invokedCandidates = new();
+        List<(string Label, object? Source, string MethodName, object?[] Args)> candidates = new()
+        {
+            ("collection.PickRelic(holder)", relicCollection, "PickRelic", new object?[] { holder }),
+            ("holder.ForceClick", holder, "ForceClick", Array.Empty<object?>()),
+            ("holder.OnRelease", holder, "OnRelease", Array.Empty<object?>()),
+            ("holder.OnPressed", holder, "OnPressed", Array.Empty<object?>())
+        };
+
+        foreach ((string label, object? source, string methodName, object?[] args) in candidates)
+        {
+            if (!TryInvokeMethod(source, methodName, out _, args))
+            {
+                continue;
+            }
+
+            invokedCandidates.Add(label);
+            if (WaitForTreasureRelicClaim(treasureRoom))
+            {
+                detail = $"보물방 유물을 획득했고 진행 버튼 활성화를 확인했습니다. method={label}, index={legalAction.TreasureRelicIndex.Value}, relic_id={legalAction.TreasureRelicId ?? "<none>"}";
+                Logger.Info(detail);
+                return true;
+            }
+        }
+
+        string tried = invokedCandidates.Count == 0 ? "<none>" : string.Join(", ", invokedCandidates);
+        detail = $"보물방 유물 선택 호출 뒤 완료 상태를 확인하지 못했습니다. tried={tried}, index={legalAction.TreasureRelicIndex.Value}, relic_open={IsTreasureRelicCollectionOpen(treasureRoom)}, proceed_enabled={IsTreasureProceedEnabled(treasureRoom)}";
+        return false;
+    }
+
+    private static bool TryExecuteTreasureProceed(object treasureRoot, out string detail)
+    {
+        object? treasureRoom = ResolveTreasureRoom(treasureRoot);
+        if (treasureRoom is null)
+        {
+            string rootTypeName = treasureRoot.GetType().FullName ?? treasureRoot.GetType().Name;
+            detail = $"보물방 진행은 현재 화면에서 실행할 수 없습니다. root={rootTypeName}";
+            return false;
+        }
+
+        object? proceedButton = ReadNamedMember(treasureRoom, "ProceedButton")
+            ?? ReadNamedMember(treasureRoom, "_proceedButton")
+            ?? ReadNamedMember(treasureRoom, "proceedButton");
+        if (proceedButton is null)
+        {
+            detail = "보물방 진행 버튼을 찾지 못했습니다.";
+            return false;
+        }
+
+        if (ReadNamedMember(proceedButton, "IsEnabled") is bool isEnabled && !isEnabled)
+        {
+            detail = "보물방 진행 버튼이 아직 비활성 상태입니다.";
+            return false;
+        }
+
+        List<string> invokedCandidates = new();
+        if (TryCallDeferredNoArgs(proceedButton, "ForceClick", out string deferredFailureReason))
+        {
+            if (WaitForTreasureProceedTransitionToMap())
+            {
+                detail = "보물방 진행 버튼을 눌렀고 지도 화면 진입을 확인했습니다. method=button.CallDeferred(ForceClick)";
+                Logger.Info(detail);
+                return true;
+            }
+
+            invokedCandidates.Add("button.CallDeferred(ForceClick)");
+        }
+        else if (deferredFailureReason.Length > 0)
+        {
+            invokedCandidates.Add($"button.CallDeferred(ForceClick): {deferredFailureReason}");
+        }
+
+        List<(string Label, object? Source, string MethodName, object?[] Args)> candidates = new()
+        {
+            ("room.OnProceedButtonPressed(button)", treasureRoom, "OnProceedButtonPressed", new object?[] { proceedButton }),
+            ("room.OnProceedButtonReleased(button)", treasureRoom, "OnProceedButtonReleased", new object?[] { proceedButton }),
+            ("button.ForceClick", proceedButton, "ForceClick", Array.Empty<object?>()),
+            ("button.OnRelease", proceedButton, "OnRelease", Array.Empty<object?>()),
+            ("button.OnPressed", proceedButton, "OnPressed", Array.Empty<object?>())
+        };
+
+        foreach ((string label, object? source, string methodName, object?[] args) in candidates)
+        {
+            if (!TryInvokeMethod(source, methodName, out _, args))
+            {
+                continue;
+            }
+
+            invokedCandidates.Add(label);
+            if (WaitForTreasureProceedTransitionToMap())
+            {
+                detail = $"보물방 진행 버튼을 눌렀고 지도 화면 진입을 확인했습니다. method={label}";
+                Logger.Info(detail);
+                return true;
+            }
+        }
+
+        string currentScreenTypeName = GetCurrentScreenTypeName();
+        string tried = invokedCandidates.Count == 0 ? "<none>" : string.Join(", ", invokedCandidates);
+        detail = $"보물방 진행 버튼 호출 뒤 지도 화면 진입을 확인하지 못했습니다. tried={tried}, current_screen={currentScreenTypeName}";
         return false;
     }
 
@@ -1703,6 +1861,60 @@ internal static class CombatActionExecutor
         return false;
     }
 
+    private static bool WaitForTreasureRelicClaim(object treasureRoom)
+    {
+        const int timeoutMs = 45000;
+        const int pollIntervalMs = 100;
+        Stopwatch stopwatch = Stopwatch.StartNew();
+        int stableCompletionPollCount = 0;
+        while (stopwatch.ElapsedMilliseconds < timeoutMs)
+        {
+            Thread.Sleep(pollIntervalMs);
+            bool completed = !IsTreasureRelicCollectionOpen(treasureRoom) && IsTreasureProceedEnabled(treasureRoom);
+            if (completed)
+            {
+                stableCompletionPollCount++;
+                if (stableCompletionPollCount >= 3)
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                stableCompletionPollCount = 0;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool WaitForTreasureProceedTransitionToMap()
+    {
+        const int timeoutMs = 8000;
+        const int pollIntervalMs = 100;
+        Stopwatch stopwatch = Stopwatch.StartNew();
+        int stableMapPollCount = 0;
+        while (stopwatch.ElapsedMilliseconds < timeoutMs)
+        {
+            Thread.Sleep(pollIntervalMs);
+            object? currentScreen = GetCurrentScreen();
+            if (currentScreen is not null && IsMapScreen(currentScreen))
+            {
+                stableMapPollCount++;
+                if (stableMapPollCount >= 5)
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                stableMapPollCount = 0;
+            }
+        }
+
+        return false;
+    }
+
     private static bool WaitForMapNodeSelection(object mapRoot, LegalActionSnapshot legalAction)
     {
         const int timeoutMs = 8000;
@@ -1952,12 +2164,79 @@ internal static class CombatActionExecutor
             });
     }
 
+    private static object? FindTreasureRelicCollection(object treasureRoom)
+    {
+        object? relicCollection = ReadNamedMember(treasureRoom, "_relicCollection")
+            ?? ReadNamedMember(treasureRoom, "RelicCollection")
+            ?? ReadNamedMember(treasureRoom, "relicCollection");
+        if (relicCollection is not null)
+        {
+            return relicCollection;
+        }
+
+        return EnumerateNodeDescendants(treasureRoom)
+            .FirstOrDefault(node =>
+            {
+                string typeName = node.GetType().FullName ?? node.GetType().Name;
+                return typeName.Contains("NTreasureRoomRelicCollection", StringComparison.OrdinalIgnoreCase);
+            });
+    }
+
+    private static object? FindTreasureRelicHolder(object relicCollection, int relicIndex)
+    {
+        List<object> holders = ExpandValue(ReadNamedMember(relicCollection, "_holdersInUse"))
+            .Where(IsTreasureRelicHolder)
+            .ToList();
+        if (holders.Count == 0)
+        {
+            object? singleplayerHolder = ReadNamedMember(relicCollection, "SingleplayerRelicHolder");
+            if (IsTreasureRelicHolder(singleplayerHolder))
+            {
+                holders.Add(singleplayerHolder!);
+            }
+        }
+
+        if (holders.Count == 0)
+        {
+            holders = EnumerateNodeDescendants(relicCollection)
+                .Where(IsTreasureRelicHolder)
+                .ToList();
+        }
+
+        return holders.FirstOrDefault(holder => ReadInt(holder, "Index") == relicIndex)
+            ?? holders.Skip(relicIndex).FirstOrDefault();
+    }
+
+    private static bool IsTreasureRelicHolder(object? value)
+    {
+        if (value is null)
+        {
+            return false;
+        }
+
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return typeName.Contains("NTreasureRoomRelicHolder", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool IsTreasureChestOpened(object treasureRoom)
     {
         bool hasChestBeenOpened = ReadNamedMember(treasureRoom, "_hasChestBeenOpened") is bool opened && opened;
         bool isRelicCollectionOpen = ReadNamedMember(treasureRoom, "_isRelicCollectionOpen") is bool collectionOpen && collectionOpen;
         bool hasDefaultFocus = ReadNamedMember(treasureRoom, "DefaultFocusedControl") is not null;
         return hasChestBeenOpened || isRelicCollectionOpen || hasDefaultFocus;
+    }
+
+    private static bool IsTreasureRelicCollectionOpen(object treasureRoom)
+    {
+        return ReadNamedMember(treasureRoom, "_isRelicCollectionOpen") is bool collectionOpen && collectionOpen;
+    }
+
+    private static bool IsTreasureProceedEnabled(object treasureRoom)
+    {
+        object? proceedButton = ReadNamedMember(treasureRoom, "ProceedButton")
+            ?? ReadNamedMember(treasureRoom, "_proceedButton")
+            ?? ReadNamedMember(treasureRoom, "proceedButton");
+        return ReadNamedMember(proceedButton, "IsEnabled") is bool isEnabled && isEnabled;
     }
 
     private static object? FindMapPointForAction(object mapScreen, LegalActionSnapshot legalAction)

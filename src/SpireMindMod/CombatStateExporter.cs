@@ -1728,7 +1728,7 @@ internal static class CombatStateExporter
             ["piles"] = BuildEmptyPiles(),
             ["enemies"] = new List<Dictionary<string, object?>>(),
             ["treasure"] = treasureState,
-            ["legal_actions"] = BuildTreasureLegalActions(treasureState),
+            ["legal_actions"] = BuildTreasureLegalActionsV2(treasureState),
             ["relics"] = BuildRelics(relicsSource, graph),
             ["debug"] = BuildTreasureDebug(treasureRoom, currentRoom, synchronizer, graph)
         };
@@ -1793,6 +1793,7 @@ internal static class CombatStateExporter
     private static Dictionary<string, object?> BuildTreasureRoomState(object treasureRoom, object? currentRoom, object? synchronizer)
     {
         List<Dictionary<string, object?>> relicOptions = BuildTreasureRelicOptions(synchronizer);
+        object? proceedButton = FindMemberValue(treasureRoom, "ProceedButton", "_proceedButton", "proceedButton");
         return new Dictionary<string, object?>
         {
             ["screen_type"] = treasureRoom.GetType().FullName ?? treasureRoom.GetType().Name,
@@ -1802,6 +1803,7 @@ internal static class CombatStateExporter
             ["visible"] = ReadBool(treasureRoom, "Visible", "visible"),
             ["has_chest_been_opened"] = ReadBool(treasureRoom, "_hasChestBeenOpened", "HasChestBeenOpened", "hasChestBeenOpened"),
             ["is_relic_collection_open"] = ReadBool(treasureRoom, "_isRelicCollectionOpen", "IsRelicCollectionOpen", "isRelicCollectionOpen"),
+            ["proceed_button_enabled"] = ReadBool(proceedButton, "IsEnabled", "isEnabled"),
             ["default_focused_control_found"] = FindMemberValue(treasureRoom, "DefaultFocusedControl", "defaultFocusedControl") is not null,
             ["relic_options"] = relicOptions,
             ["relic_option_count"] = relicOptions.Count
@@ -1827,6 +1829,60 @@ internal static class CombatStateExporter
                 ["validation_note"] = "현재 보물방의 원래 Chest 버튼 해제 핸들러를 호출합니다."
             }
         };
+    }
+
+    private static List<Dictionary<string, object?>> BuildTreasureLegalActionsV2(Dictionary<string, object?> treasure)
+    {
+        bool chestOpened = ReadDictionaryBool(treasure, "has_chest_been_opened") == true;
+        bool relicCollectionOpen = ReadDictionaryBool(treasure, "is_relic_collection_open") == true;
+        if (!chestOpened && !relicCollectionOpen)
+        {
+            return new List<Dictionary<string, object?>>
+            {
+                new()
+                {
+                    ["action_id"] = "open_treasure_chest",
+                    ["type"] = "open_treasure_chest",
+                    ["summary"] = "보물상자를 열어 보상과 유물 선택을 표시합니다.",
+                    ["validation_note"] = "현재 보물방의 원래 Chest 버튼 해제 핸들러를 호출합니다."
+                }
+            };
+        }
+
+        List<Dictionary<string, object?>> actions = new();
+        if (relicCollectionOpen)
+        {
+            foreach (Dictionary<string, object?> relic in ReadDictionaryList(treasure, "relic_options"))
+            {
+                int? relicIndex = ReadDictionaryInt(relic, "index");
+                string relicId = ReadDictionaryString(relic, "id") ?? $"relic_{relicIndex?.ToString() ?? "unknown"}";
+                string relicName = ReadDictionaryString(relic, "name") ?? relicId;
+                actions.Add(new Dictionary<string, object?>
+                {
+                    ["action_id"] = SanitizeActionId($"claim_treasure_relic_{relicIndex?.ToString() ?? "unknown"}_{relicId}"),
+                    ["type"] = "claim_treasure_relic",
+                    ["treasure_relic_index"] = relicIndex,
+                    ["relic_id"] = relicId,
+                    ["name"] = relicName,
+                    ["summary"] = $"보물방 유물을 획득합니다: {relicName}",
+                    ["validation_note"] = "현재 보물방 유물 선택 UI의 실제 유물 홀더를 선택합니다."
+                });
+            }
+        }
+
+        bool proceedEnabled = ReadDictionaryBool(treasure, "proceed_button_enabled") == true;
+        if (chestOpened && !relicCollectionOpen && proceedEnabled)
+        {
+            actions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = "proceed_treasure",
+                ["type"] = "proceed_treasure",
+                ["summary"] = "보물방을 나가 다음 지도 선택으로 돌아갑니다.",
+                ["validation_note"] = "보물방 Proceed 버튼이 활성화된 뒤 원래 진행 버튼 경로를 호출합니다."
+            });
+        }
+
+        return actions;
     }
 
     private static List<Dictionary<string, object?>> BuildTreasureRelicOptions(object? synchronizer)

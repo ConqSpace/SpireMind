@@ -96,7 +96,9 @@ internal static class CombatActionRuntimeContext
                 ReadString(action, "locator_id"),
                 ReadInt(action, "potion_slot_index"),
                 ReadString(action, "potion_id"),
-                ReadBool(action, "requires_target")));
+                ReadBool(action, "requires_target"),
+                ReadInt(action, "treasure_relic_index"),
+                ReadString(action, "relic_id")));
         }
 
         return actions;
@@ -205,4 +207,6 @@ internal sealed record LegalActionSnapshot(
     string? ShopLocatorId,
     int? PotionSlotIndex,
     string? PotionId,
-    bool? RequiresTarget);
+    bool? RequiresTarget,
+    int? TreasureRelicIndex,
+    string? TreasureRelicId);

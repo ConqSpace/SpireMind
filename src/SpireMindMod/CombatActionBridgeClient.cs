@@ -51,6 +51,8 @@ internal static class CombatActionBridgeClient
                 "proceed_rest_site",
                 "proceed_shop",
                 "open_treasure_chest",
+                "claim_treasure_relic",
+                "proceed_treasure",
                 "buy_shop_item",
                 "remove_card_at_shop",
                 "choose_card_selection",
