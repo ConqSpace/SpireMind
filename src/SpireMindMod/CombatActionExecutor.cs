@@ -2064,7 +2064,10 @@ internal static class CombatActionExecutor
         }
 
         long nowMs = Environment.TickCount64;
-        if (nowMs - pending.StartedAtMs <= 10000)
+        long timeoutMs = pending.LegalAction.ActionType.Equals("use_potion", StringComparison.OrdinalIgnoreCase)
+            ? 45000
+            : 10000;
+        if (nowMs - pending.StartedAtMs <= timeoutMs)
         {
             return;
         }
@@ -2875,6 +2878,12 @@ internal static class CombatActionExecutor
     {
         try
         {
+            if (TryInvokeMethod(potion, "EnqueueManualUse", out _, target))
+            {
+                detail = "PotionModel.EnqueueManualUse를 호출했습니다.";
+                return true;
+            }
+
             Type? actionType = AccessTools.TypeByName("MegaCrit.Sts2.Core.GameActions.UsePotionAction");
             if (actionType is null)
             {

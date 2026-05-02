@@ -4060,10 +4060,13 @@ internal static class CombatStateExporter
 
         string? targetType = ReadFirstString(new[] { source }, "TargetType", "targetType", "_targetType", "Target", "target", "_target");
         bool requiresTarget = PotionRequiresTarget(targetType);
+        bool? isQueued = ReadBool(source, "IsQueued", "isQueued", "_isQueued");
+        bool? rawUsable = ReadBool(source, "IsUsable", "isUsable", "_isUsable", "CanUse", "canUse", "_canUse");
         summary["potion_id"] = summary["id"];
         summary["target_type"] = targetType;
         summary["requires_target"] = requiresTarget;
-        summary["is_usable_now"] = ReadBool(source, "IsUsable", "isUsable", "_isUsable", "CanUse", "canUse", "_canUse") ?? true;
+        summary["is_queued"] = isQueued;
+        summary["is_usable_now"] = isQueued == true ? false : rawUsable ?? true;
         return summary;
     }
 
