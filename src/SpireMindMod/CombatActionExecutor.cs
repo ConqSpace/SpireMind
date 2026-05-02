@@ -28,6 +28,7 @@ internal static class CombatActionExecutor
     private static long lastDiagnosticLogAtMs;
     private static PendingClaim? pendingClaim;
     private static PendingRewardCardSelection? pendingRewardCardSelection;
+    private static long roomEnteredSignalCount;
 
     public static void StartBackgroundPolling()
     {
@@ -1474,45 +1475,62 @@ internal static class CombatActionExecutor
             return false;
         }
 
+        long roomEnteredBaseline = Interlocked.Read(ref roomEnteredSignalCount);
+        bool roomEnteredSubscribed = TrySubscribeRoomEntered(out object? runManager, out Delegate? roomEnteredHandler, out string roomEnteredSubscribeDetail);
         List<string> invokedCandidates = new();
-        if (TryCallDeferredNoArgs(mapPoint, "ForceClick", out string deferredFailureReason))
+        try
         {
-            invokedCandidates.Add("point.CallDeferred(ForceClick)");
-            if (WaitForMapNodeSelection(mapRoot, legalAction))
+            if (!roomEnteredSubscribed && !string.IsNullOrWhiteSpace(roomEnteredSubscribeDetail))
             {
-                detail = $"지도 노드 선택을 완료했습니다. method=point.CallDeferred(ForceClick), node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}, row={legalAction.MapRow?.ToString() ?? "?"}, column={legalAction.MapColumn?.ToString() ?? "?"}";
-                Logger.Info(detail);
-                return true;
+                invokedCandidates.Add($"room_entered_subscribe: {roomEnteredSubscribeDetail}");
+            }
+
+            if (TryCallDeferredNoArgs(mapPoint, "ForceClick", out string deferredFailureReason))
+            {
+                invokedCandidates.Add("point.CallDeferred(ForceClick)");
+                if (WaitForMapNodeSelection(mapRoot, legalAction, roomEnteredBaseline))
+                {
+                    detail = $"지도 노드 선택을 완료했습니다. method=point.CallDeferred(ForceClick), node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}, row={legalAction.MapRow?.ToString() ?? "?"}, column={legalAction.MapColumn?.ToString() ?? "?"}";
+                    Logger.Info(detail);
+                    return true;
+                }
+            }
+
+            List<(string Label, object? Source, string MethodName, object?[] Args)> candidates = new()
+            {
+                ("point.ForceClick", mapPoint, "ForceClick", Array.Empty<object?>()),
+                ("point.OnRelease", mapPoint, "OnRelease", Array.Empty<object?>()),
+                ("point.OnPressed", mapPoint, "OnPressed", Array.Empty<object?>()),
+                ("map.OnMapPointSelectedLocally(point)", mapRoot, "OnMapPointSelectedLocally", new object?[] { mapPoint })
+            };
+
+            foreach ((string label, object? source, string methodName, object?[] args) in candidates)
+            {
+                if (!TryInvokeMethod(source, methodName, out _, args))
+                {
+                    continue;
+                }
+
+                invokedCandidates.Add(label);
+                if (WaitForMapNodeSelection(mapRoot, legalAction, roomEnteredBaseline))
+                {
+                    detail = $"지도 노드 선택을 완료했습니다. method={label}, node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}, row={legalAction.MapRow?.ToString() ?? "?"}, column={legalAction.MapColumn?.ToString() ?? "?"}";
+                    Logger.Info(detail);
+                    return true;
+                }
+            }
+
+            if (deferredFailureReason.Length > 0)
+            {
+                invokedCandidates.Insert(0, $"point.CallDeferred(ForceClick): {deferredFailureReason}");
             }
         }
-
-        List<(string Label, object? Source, string MethodName, object?[] Args)> candidates = new()
+        finally
         {
-            ("point.ForceClick", mapPoint, "ForceClick", Array.Empty<object?>()),
-            ("point.OnRelease", mapPoint, "OnRelease", Array.Empty<object?>()),
-            ("point.OnPressed", mapPoint, "OnPressed", Array.Empty<object?>()),
-            ("map.OnMapPointSelectedLocally(point)", mapRoot, "OnMapPointSelectedLocally", new object?[] { mapPoint })
-        };
-
-        foreach ((string label, object? source, string methodName, object?[] args) in candidates)
-        {
-            if (!TryInvokeMethod(source, methodName, out _, args))
+            if (roomEnteredSubscribed)
             {
-                continue;
+                UnsubscribeRoomEntered(runManager, roomEnteredHandler);
             }
-
-            invokedCandidates.Add(label);
-            if (WaitForMapNodeSelection(mapRoot, legalAction))
-            {
-                detail = $"지도 노드 선택을 완료했습니다. method={label}, node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}, row={legalAction.MapRow?.ToString() ?? "?"}, column={legalAction.MapColumn?.ToString() ?? "?"}";
-                Logger.Info(detail);
-                return true;
-            }
-        }
-
-        if (deferredFailureReason.Length > 0)
-        {
-            invokedCandidates.Insert(0, $"point.CallDeferred(ForceClick): {deferredFailureReason}");
         }
 
         string currentScreenTypeName = GetCurrentScreenTypeName();
@@ -1915,7 +1933,7 @@ internal static class CombatActionExecutor
         return false;
     }
 
-    private static bool WaitForMapNodeSelection(object mapRoot, LegalActionSnapshot legalAction)
+    private static bool WaitForMapNodeSelection(object mapRoot, LegalActionSnapshot legalAction, long roomEnteredBaseline)
     {
         const int timeoutMs = 45000;
         const int pollIntervalMs = 100;
@@ -1925,10 +1943,11 @@ internal static class CombatActionExecutor
         {
             Thread.Sleep(pollIntervalMs);
             object? currentScreen = GetCurrentScreen();
+            bool roomEntered = Interlocked.Read(ref roomEnteredSignalCount) > roomEnteredBaseline;
             bool screenLeftMap = currentScreen is not null && !IsMapScreen(currentScreen);
             bool traveling = ReadNamedMember(mapRoot, "IsTraveling") is bool isTraveling && isTraveling;
             bool arrivedAtTargetOnMap = !traveling && IsCurrentMapPointTarget(mapRoot, legalAction);
-            if (screenLeftMap || arrivedAtTargetOnMap)
+            if (roomEntered || screenLeftMap || arrivedAtTargetOnMap)
             {
                 stableCompletionPollCount++;
                 if (stableCompletionPollCount >= 5)
@@ -1943,6 +1962,72 @@ internal static class CombatActionExecutor
         }
 
         return false;
+    }
+
+    private static bool TrySubscribeRoomEntered(out object? runManager, out Delegate? handler, out string detail)
+    {
+        runManager = null;
+        handler = null;
+        detail = string.Empty;
+        try
+        {
+            Type? runManagerType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Runs.RunManager");
+            runManager = ReadStaticNamedMember(runManagerType, "Instance");
+            if (runManager is null)
+            {
+                detail = "RunManager.Instance를 찾지 못했습니다.";
+                return false;
+            }
+
+            EventInfo? roomEnteredEvent = runManager.GetType()
+                .GetEvent("RoomEntered", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (roomEnteredEvent?.EventHandlerType is null)
+            {
+                detail = "RunManager.RoomEntered 이벤트를 찾지 못했습니다.";
+                return false;
+            }
+
+            MethodInfo? handlerMethod = typeof(CombatActionExecutor)
+                .GetMethod(nameof(OnRoomEnteredForMapWait), BindingFlags.Static | BindingFlags.NonPublic);
+            if (handlerMethod is null)
+            {
+                detail = "RoomEntered 핸들러 메서드를 찾지 못했습니다.";
+                return false;
+            }
+
+            handler = Delegate.CreateDelegate(roomEnteredEvent.EventHandlerType, handlerMethod);
+            roomEnteredEvent.AddEventHandler(runManager, handler);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            detail = $"{exception.GetType().Name}: {exception.Message}";
+            return false;
+        }
+    }
+
+    private static void UnsubscribeRoomEntered(object? runManager, Delegate? handler)
+    {
+        if (runManager is null || handler is null)
+        {
+            return;
+        }
+
+        try
+        {
+            EventInfo? roomEnteredEvent = runManager.GetType()
+                .GetEvent("RoomEntered", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            roomEnteredEvent?.RemoveEventHandler(runManager, handler);
+        }
+        catch
+        {
+            // 이벤트 구독 해제 실패는 다음 실행에 영향을 주지 않도록 무시한다.
+        }
+    }
+
+    private static void OnRoomEnteredForMapWait()
+    {
+        Interlocked.Increment(ref roomEnteredSignalCount);
     }
 
     private static object? GetCurrentScreen()
