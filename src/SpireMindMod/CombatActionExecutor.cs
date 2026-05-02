@@ -263,6 +263,10 @@ internal static class CombatActionExecutor
             {
                 applied = TryExecuteShopProceed(context.CombatRoot, out detail);
             }
+            else if (legalAction.ActionType.Equals("open_treasure_chest", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecuteOpenTreasureChest(context.CombatRoot, out detail);
+            }
             else if (legalAction.ActionType.Equals("buy_shop_item", StringComparison.OrdinalIgnoreCase))
             {
                 applied = TryExecuteBuyShopItem(legalAction, context.CombatRoot, out detail);
@@ -330,6 +334,7 @@ internal static class CombatActionExecutor
             || actionType.Equals("choose_rest_site_option", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("proceed_rest_site", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("proceed_shop", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("open_treasure_chest", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("buy_shop_item", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("remove_card_at_shop", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("choose_card_selection", StringComparison.OrdinalIgnoreCase)
@@ -536,6 +541,83 @@ internal static class CombatActionExecutor
 
         string tried = invokedCandidates.Count == 0 ? "<none>" : string.Join(", ", invokedCandidates);
         detail = $"상점 진행 버튼 호출 뒤에도 지도 화면에 도달하지 못했습니다. tried={tried}, current_screen={currentScreenTypeName}";
+        return false;
+    }
+
+    private static bool TryExecuteOpenTreasureChest(object treasureRoot, out string detail)
+    {
+        object? treasureRoom = ResolveTreasureRoom(treasureRoot);
+        if (treasureRoom is null)
+        {
+            string rootTypeName = treasureRoot.GetType().FullName ?? treasureRoot.GetType().Name;
+            detail = $"보물상자 열기는 현재 화면에서 실행할 수 없습니다. root={rootTypeName}";
+            return false;
+        }
+
+        if (IsTreasureChestOpened(treasureRoom))
+        {
+            detail = "보물상자는 이미 열린 상태입니다.";
+            return true;
+        }
+
+        object? chestButton = FindTreasureChestButton(treasureRoom);
+        if (chestButton is null)
+        {
+            detail = "보물상자 Chest 버튼을 찾지 못했습니다.";
+            return false;
+        }
+
+        if (ReadNamedMember(chestButton, "IsEnabled") is bool isEnabled && !isEnabled)
+        {
+            detail = "보물상자 Chest 버튼이 아직 비활성 상태입니다.";
+            return false;
+        }
+
+        List<string> invokedCandidates = new();
+        if (TryCallDeferredNoArgs(chestButton, "ForceClick", out string deferredFailureReason))
+        {
+            if (WaitForTreasureChestOpen(treasureRoom))
+            {
+                detail = "보물상자를 열고 보상 UI 진입을 확인했습니다. method=button.CallDeferred(ForceClick)";
+                Logger.Info(detail);
+                return true;
+            }
+
+            invokedCandidates.Add("button.CallDeferred(ForceClick)");
+        }
+        else if (deferredFailureReason.Length > 0)
+        {
+            invokedCandidates.Add($"button.CallDeferred(ForceClick): {deferredFailureReason}");
+        }
+
+        List<(string Label, object? Source, string MethodName, object?[] Args)> candidates = new()
+        {
+            ("room.OnChestButtonReleased(button)", treasureRoom, "OnChestButtonReleased", new object?[] { chestButton }),
+            ("button.ForceClick", chestButton, "ForceClick", Array.Empty<object?>()),
+            ("button.OnRelease", chestButton, "OnRelease", Array.Empty<object?>()),
+            ("button.OnPressed", chestButton, "OnPressed", Array.Empty<object?>()),
+            ("button.EmitSignalPressed(button)", chestButton, "EmitSignalPressed", new object?[] { chestButton })
+        };
+
+        foreach ((string label, object? source, string methodName, object?[] args) in candidates)
+        {
+            if (!TryInvokeMethod(source, methodName, out _, args))
+            {
+                continue;
+            }
+
+            invokedCandidates.Add(label);
+            if (WaitForTreasureChestOpen(treasureRoom))
+            {
+                detail = $"보물상자를 열고 보상 UI 진입을 확인했습니다. method={label}";
+                Logger.Info(detail);
+                return true;
+            }
+        }
+
+        string currentScreenTypeName = GetCurrentScreenTypeName();
+        string tried = invokedCandidates.Count == 0 ? "<none>" : string.Join(", ", invokedCandidates);
+        detail = $"보물상자 버튼 호출 뒤 보상 UI 진입을 확인하지 못했습니다. tried={tried}, current_screen={currentScreenTypeName}, opened={IsTreasureChestOpened(treasureRoom)}";
         return false;
     }
 
@@ -1518,6 +1600,33 @@ internal static class CombatActionExecutor
             });
     }
 
+    private static object? ResolveTreasureRoom(object currentRoot)
+    {
+        string rootTypeName = currentRoot.GetType().FullName ?? currentRoot.GetType().Name;
+        if (rootTypeName.Contains("NTreasureRoom", StringComparison.OrdinalIgnoreCase))
+        {
+            return currentRoot;
+        }
+
+        Type? runType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Nodes.NRun");
+        object? run = ReadStaticNamedMember(runType, "Instance");
+        object? treasureRoom = ReadNamedMember(run, "TreasureRoom")
+            ?? ReadNamedMember(run, "_treasureRoom")
+            ?? ReadNamedMember(run, "treasureRoom");
+        string treasureRoomTypeName = treasureRoom?.GetType().FullName ?? treasureRoom?.GetType().Name ?? string.Empty;
+        if (treasureRoomTypeName.Contains("NTreasureRoom", StringComparison.OrdinalIgnoreCase))
+        {
+            return treasureRoom;
+        }
+
+        return EnumerateNodeDescendants(currentRoot)
+            .FirstOrDefault(node =>
+            {
+                string typeName = node.GetType().FullName ?? node.GetType().Name;
+                return typeName.Contains("NTreasureRoom", StringComparison.OrdinalIgnoreCase);
+            });
+    }
+
     private static object? ResolveCardSelectionScreen(object currentRoot)
     {
         if (IsCardSelectionScreen(currentRoot))
@@ -1562,6 +1671,32 @@ internal static class CombatActionExecutor
             else
             {
                 stableMapPollCount = 0;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool WaitForTreasureChestOpen(object treasureRoom)
+    {
+        const int timeoutMs = 10000;
+        const int pollIntervalMs = 100;
+        Stopwatch stopwatch = Stopwatch.StartNew();
+        int stableOpenPollCount = 0;
+        while (stopwatch.ElapsedMilliseconds < timeoutMs)
+        {
+            Thread.Sleep(pollIntervalMs);
+            if (IsTreasureChestOpened(treasureRoom))
+            {
+                stableOpenPollCount++;
+                if (stableOpenPollCount >= 3)
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                stableOpenPollCount = 0;
             }
         }
 
@@ -1795,6 +1930,34 @@ internal static class CombatActionExecutor
     {
         string typeName = value.GetType().FullName ?? value.GetType().Name;
         return typeName.Contains("NRestSiteButton", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static object? FindTreasureChestButton(object treasureRoom)
+    {
+        object? chestButton = ReadNamedMember(treasureRoom, "_chestButton")
+            ?? ReadNamedMember(treasureRoom, "ChestButton")
+            ?? ReadNamedMember(treasureRoom, "chestButton");
+        if (chestButton is not null)
+        {
+            return chestButton;
+        }
+
+        return EnumerateNodeDescendants(treasureRoom)
+            .FirstOrDefault(node =>
+            {
+                string typeName = node.GetType().FullName ?? node.GetType().Name;
+                string nodeName = ReadNamedMember(node, "Name")?.ToString() ?? string.Empty;
+                return typeName.Contains("NButton", StringComparison.OrdinalIgnoreCase)
+                    && nodeName.Contains("Chest", StringComparison.OrdinalIgnoreCase);
+            });
+    }
+
+    private static bool IsTreasureChestOpened(object treasureRoom)
+    {
+        bool hasChestBeenOpened = ReadNamedMember(treasureRoom, "_hasChestBeenOpened") is bool opened && opened;
+        bool isRelicCollectionOpen = ReadNamedMember(treasureRoom, "_isRelicCollectionOpen") is bool collectionOpen && collectionOpen;
+        bool hasDefaultFocus = ReadNamedMember(treasureRoom, "DefaultFocusedControl") is not null;
+        return hasChestBeenOpened || isRelicCollectionOpen || hasDefaultFocus;
     }
 
     private static object? FindMapPointForAction(object mapScreen, LegalActionSnapshot legalAction)

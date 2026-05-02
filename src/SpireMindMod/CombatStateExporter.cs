@@ -1716,6 +1716,7 @@ internal static class CombatStateExporter
         AddRoot(roots, synchronizer);
         ObjectGraph graph = ObjectGraph.Collect(roots, 3, 260);
 
+        Dictionary<string, object?> treasureState = BuildTreasureRoomState(treasureRoom, currentRoom, synchronizer);
         return new Dictionary<string, object?>
         {
             ["schema_version"] = "combat_state.v1",
@@ -1726,8 +1727,8 @@ internal static class CombatStateExporter
             ["player"] = player is null ? new Dictionary<string, object?>() : BuildPlayer(player),
             ["piles"] = BuildEmptyPiles(),
             ["enemies"] = new List<Dictionary<string, object?>>(),
-            ["treasure"] = BuildTreasureRoomState(treasureRoom, currentRoom, synchronizer),
-            ["legal_actions"] = new List<Dictionary<string, object?>>(),
+            ["treasure"] = treasureState,
+            ["legal_actions"] = BuildTreasureLegalActions(treasureState),
             ["relics"] = BuildRelics(relicsSource, graph),
             ["debug"] = BuildTreasureDebug(treasureRoom, currentRoom, synchronizer, graph)
         };
@@ -1799,9 +1800,32 @@ internal static class CombatStateExporter
             ["room_kind"] = ClassifyRoomKind(currentRoom?.GetType().FullName, currentRoom is null ? null : GetReadableName(currentRoom)),
             ["is_inside_tree"] = TryInvokeBoolMethod(treasureRoom, "IsInsideTree"),
             ["visible"] = ReadBool(treasureRoom, "Visible", "visible"),
+            ["has_chest_been_opened"] = ReadBool(treasureRoom, "_hasChestBeenOpened", "HasChestBeenOpened", "hasChestBeenOpened"),
+            ["is_relic_collection_open"] = ReadBool(treasureRoom, "_isRelicCollectionOpen", "IsRelicCollectionOpen", "isRelicCollectionOpen"),
             ["default_focused_control_found"] = FindMemberValue(treasureRoom, "DefaultFocusedControl", "defaultFocusedControl") is not null,
             ["relic_options"] = relicOptions,
             ["relic_option_count"] = relicOptions.Count
+        };
+    }
+
+    private static List<Dictionary<string, object?>> BuildTreasureLegalActions(Dictionary<string, object?> treasure)
+    {
+        bool chestOpened = ReadDictionaryBool(treasure, "has_chest_been_opened") == true;
+        bool relicCollectionOpen = ReadDictionaryBool(treasure, "is_relic_collection_open") == true;
+        if (chestOpened || relicCollectionOpen)
+        {
+            return new List<Dictionary<string, object?>>();
+        }
+
+        return new List<Dictionary<string, object?>>
+        {
+            new()
+            {
+                ["action_id"] = "open_treasure_chest",
+                ["type"] = "open_treasure_chest",
+                ["summary"] = "보물상자를 열어 보상과 유물 선택을 표시합니다.",
+                ["validation_note"] = "현재 보물방의 원래 Chest 버튼 해제 핸들러를 호출합니다."
+            }
         };
     }
 
