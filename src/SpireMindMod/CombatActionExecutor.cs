@@ -242,6 +242,10 @@ internal static class CombatActionExecutor
             {
                 applied = TryExecutePlayCard(legalAction, context.CombatRoot, out detail);
             }
+            else if (legalAction.ActionType.Equals("use_potion", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecuteUsePotion(legalAction, context.CombatRoot, out detail);
+            }
             else if (legalAction.ActionType.Equals("choose_event_option", StringComparison.OrdinalIgnoreCase))
             {
                 applied = TryExecuteEventOption(legalAction, context.CombatRoot, out detail);
@@ -313,6 +317,7 @@ internal static class CombatActionExecutor
     {
         return actionType.Equals("end_turn", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("play_card", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("use_potion", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("claim_gold_reward", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("claim_relic_reward", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("claim_potion_reward", StringComparison.OrdinalIgnoreCase)
@@ -482,7 +487,10 @@ internal static class CombatActionExecutor
 
         if (!TryInvokeMethod(shopRoom, "OnProceedButtonReleased", out _, proceedButton)
             && !TryInvokeMethod(shopRoom, "OnProceedPressed", out _, proceedButton)
-            && !TryInvokeMethod(shopRoom, "Proceed", out _))
+            && !TryInvokeMethod(shopRoom, "Proceed", out _)
+            && !TryInvokeMethod(proceedButton, "OnRelease", out _)
+            && !TryInvokeMethod(proceedButton, "OnPressed", out _)
+            && !TryInvokeMethod(proceedButton, "EmitSignalPressed", out _, proceedButton))
         {
             detail = "상점 진행 버튼 호출에 실패했습니다.";
             return false;
@@ -1756,6 +1764,272 @@ internal static class CombatActionExecutor
         return isCompleted is bool completed && completed;
     }
 
+    private static bool TryExecuteUsePotion(LegalActionSnapshot legalAction, object combatRoot, out string detail)
+    {
+        if (legalAction.PotionSlotIndex is null)
+        {
+            detail = "use_potion 행동에는 potion_slot_index가 필요합니다.";
+            return false;
+        }
+
+        object? player = ResolveRuntimePlayerForAction();
+        if (player is null)
+        {
+            detail = "포션 사용에 필요한 플레이어 객체를 찾지 못했습니다.";
+            return false;
+        }
+
+        List<object?> potionSlots = ResolvePotionSlots(player).ToList();
+        int slotIndex = legalAction.PotionSlotIndex.Value;
+        if (slotIndex < 0 || slotIndex >= potionSlots.Count)
+        {
+            detail = $"포션 슬롯 인덱스가 범위를 벗어났습니다. index={slotIndex}, count={potionSlots.Count}";
+            return false;
+        }
+
+        object? potion = ExtractRuntimePotionModel(potionSlots[slotIndex]);
+        if (potion is null)
+        {
+            detail = $"선택한 포션 슬롯이 비어 있습니다. index={slotIndex}";
+            return false;
+        }
+
+        string? runtimePotionId = ReadObjectId(potion);
+        if (!string.IsNullOrWhiteSpace(legalAction.PotionId)
+            && !string.IsNullOrWhiteSpace(runtimePotionId)
+            && !IsSameShopModelId(runtimePotionId, legalAction.PotionId))
+        {
+            detail = $"포션 슬롯의 포션이 바뀌었습니다. expected={legalAction.PotionId}, actual={runtimePotionId}";
+            return false;
+        }
+
+        if (!TryResolvePotionTarget(legalAction, potion, combatRoot, out object? target, out detail))
+        {
+            return false;
+        }
+
+        if (!TryEnqueueUsePotionAction(potion, target, out detail))
+        {
+            return false;
+        }
+
+        string targetText = target is null
+            ? "대상 없음"
+            : ReadNamedMember(target, "LogName")?.ToString()
+                ?? ReadNamedMember(target, "Name")?.ToString()
+                ?? legalAction.TargetId
+                ?? "대상";
+        detail = $"UsePotionAction 입력 성공: potion={runtimePotionId ?? legalAction.PotionId ?? "<unknown>"}, slot={slotIndex}, target={targetText}";
+        Logger.Info(detail);
+        return true;
+    }
+
+    private static object? ResolveRuntimePlayerForAction()
+    {
+        object? player = CombatStateExporter.GetLatestRuntimePlayer();
+        if (player is not null)
+        {
+            return player;
+        }
+
+        Type? localContextType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Context.LocalContext");
+        return localContextType is null
+            ? null
+            : InvokeStaticNoArgMethod(localContextType, "GetMe");
+    }
+
+    private static IEnumerable<object?> ResolvePotionSlots(object player)
+    {
+        object? slots = ReadNamedMember(player, "PotionSlots")
+            ?? ReadNamedMember(player, "potionSlots")
+            ?? ReadNamedMember(player, "_potionSlots")
+            ?? ReadNamedMember(player, "Potions")
+            ?? ReadNamedMember(player, "potions")
+            ?? ReadNamedMember(player, "_potions");
+
+        if (slots is IEnumerable enumerable && slots is not string)
+        {
+            foreach (object? slot in enumerable)
+            {
+                yield return slot;
+            }
+        }
+    }
+
+    private static object? ExtractRuntimePotionModel(object? source)
+    {
+        if (source is null)
+        {
+            return null;
+        }
+
+        object? nested = ReadNamedMember(source, "Potion")
+            ?? ReadNamedMember(source, "potion")
+            ?? ReadNamedMember(source, "_potion")
+            ?? ReadNamedMember(source, "PotionModel")
+            ?? ReadNamedMember(source, "potionModel")
+            ?? ReadNamedMember(source, "_potionModel")
+            ?? ReadNamedMember(source, "Model")
+            ?? ReadNamedMember(source, "model")
+            ?? ReadNamedMember(source, "_model");
+        if (nested is not null)
+        {
+            return nested;
+        }
+
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        return typeName.Contains("Potion", StringComparison.OrdinalIgnoreCase)
+            && !typeName.Contains("Slot", StringComparison.OrdinalIgnoreCase)
+            ? source
+            : null;
+    }
+
+    private static bool TryResolvePotionTarget(
+        LegalActionSnapshot legalAction,
+        object potion,
+        object combatRoot,
+        out object? target,
+        out string detail)
+    {
+        target = null;
+        bool requiresTarget = legalAction.RequiresTarget == true || RuntimePotionRequiresTarget(potion);
+        if (!requiresTarget)
+        {
+            detail = "대상이 필요 없는 포션입니다.";
+            return true;
+        }
+
+        object? combatState = FindCombatState(potion)
+            ?? FindCombatState(combatRoot)
+            ?? FindCombatState(CombatStateExporter.GetLatestRuntimePlayer());
+        if (combatState is null)
+        {
+            detail = "포션 대상을 찾기 위한 CombatState를 찾지 못했습니다.";
+            return false;
+        }
+
+        if (legalAction.TargetCombatId is not null)
+        {
+            target = FindCreatureByCombatId(combatState, legalAction.TargetCombatId.Value);
+            if (target is not null)
+            {
+                detail = $"target_combat_id={legalAction.TargetCombatId.Value} 대상을 찾았습니다.";
+                return true;
+            }
+        }
+
+        if (TryParseEnemyIndex(legalAction.TargetId, out int enemyIndex))
+        {
+            target = EnumerateEnemies(combatState).Skip(enemyIndex).FirstOrDefault();
+            if (target is not null)
+            {
+                detail = $"target_id={legalAction.TargetId} 순서 대상을 찾았습니다.";
+                return true;
+            }
+        }
+
+        detail = $"포션 대상을 찾지 못했습니다. target_id={legalAction.TargetId}, target_combat_id={legalAction.TargetCombatId?.ToString() ?? "<none>"}";
+        return false;
+    }
+
+    private static bool RuntimePotionRequiresTarget(object potion)
+    {
+        string? targetType = ReadNamedMember(potion, "TargetType")?.ToString()
+            ?? ReadNamedMember(potion, "targetType")?.ToString()
+            ?? ReadNamedMember(potion, "_targetType")?.ToString();
+        return !string.IsNullOrWhiteSpace(targetType)
+            && ContainsAny(targetType, "Enemy", "Target", "Monster", "Creature")
+            && !ContainsAny(targetType, "None", "Self", "Player", "All", "Random");
+    }
+
+    private static bool TryEnqueueUsePotionAction(object potion, object? target, out string detail)
+    {
+        try
+        {
+            Type? actionType = AccessTools.TypeByName("MegaCrit.Sts2.Core.GameActions.UsePotionAction");
+            if (actionType is null)
+            {
+                detail = "UsePotionAction 타입을 찾지 못했습니다.";
+                return false;
+            }
+
+            object? combatManager = ReadStaticNamedMember(AccessTools.TypeByName("MegaCrit.Sts2.Core.Combat.CombatManager"), "Instance");
+            bool isInProgress = ReadBool(combatManager, "IsInProgress") ?? true;
+            object? action = Activator.CreateInstance(actionType, potion, target, isInProgress);
+            if (action is null)
+            {
+                detail = "UsePotionAction 인스턴스 생성에 실패했습니다.";
+                return false;
+            }
+
+            InvokePotionBeforeUse(potion);
+            SetPotionQueued(potion);
+
+            object? synchronizer = ResolveActionQueueSynchronizer();
+            if (synchronizer is null)
+            {
+                detail = "ActionQueueSynchronizer를 찾지 못했습니다.";
+                return false;
+            }
+
+            MethodInfo? requestEnqueue = FindRequestEnqueueMethod(synchronizer, action);
+            if (requestEnqueue is null)
+            {
+                detail = "ActionQueueSynchronizer.RequestEnqueue 메서드를 찾지 못했습니다.";
+                return false;
+            }
+
+            requestEnqueue.Invoke(synchronizer, new[] { action });
+            detail = "UsePotionAction을 큐에 입력했습니다.";
+            return true;
+        }
+        catch (TargetInvocationException exception) when (exception.InnerException is not null)
+        {
+            detail = $"{exception.InnerException.GetType().Name}: {exception.InnerException.Message}";
+            return false;
+        }
+        catch (Exception exception)
+        {
+            detail = $"{exception.GetType().Name}: {exception.Message}";
+            return false;
+        }
+    }
+
+    private static void InvokePotionBeforeUse(object potion)
+    {
+        object? beforeUse = ReadNamedMember(potion, "BeforeUse")
+            ?? ReadNamedMember(potion, "BeforePotionUsed")
+            ?? ReadNamedMember(potion, "_beforeUse")
+            ?? ReadNamedMember(potion, "_beforePotionUsed");
+        if (beforeUse is Action action)
+        {
+            action.Invoke();
+        }
+    }
+
+    private static void SetPotionQueued(object potion)
+    {
+        SetNamedMember(potion, "IsQueued", true);
+        SetNamedMember(potion, "isQueued", true);
+        SetNamedMember(potion, "_isQueued", true);
+    }
+
+    private static object? ResolveActionQueueSynchronizer()
+    {
+        Type? runManagerType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Runs.RunManager");
+        object? runManager = ReadStaticNamedMember(runManagerType, "Instance");
+        return ReadNamedMember(runManager, "ActionQueueSynchronizer");
+    }
+
+    private static MethodInfo? FindRequestEnqueueMethod(object synchronizer, object action)
+    {
+        return synchronizer.GetType()
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .FirstOrDefault(method => method.Name.Equals("RequestEnqueue", StringComparison.OrdinalIgnoreCase)
+                && method.GetParameters().Length == 1
+                && IsArgumentCompatible(method.GetParameters()[0].ParameterType, action));
+    }
+
     private static bool TryExecutePlayCard(LegalActionSnapshot legalAction, object combatRoot, out string detail)
     {
         if (legalAction.CombatCardId is null)
@@ -2397,6 +2671,37 @@ internal static class CombatActionExecutor
             .GetMember(memberName, flags)
             .FirstOrDefault(candidate => candidate is FieldInfo or PropertyInfo);
         return member is null ? null : ReadMember(source, member);
+    }
+
+    private static bool SetNamedMember(object? source, string memberName, object? value)
+    {
+        if (source is null)
+        {
+            return false;
+        }
+
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        MemberInfo? member = source.GetType()
+            .GetMember(memberName, flags)
+            .FirstOrDefault(candidate => candidate is FieldInfo or PropertyInfo);
+        try
+        {
+            switch (member)
+            {
+                case FieldInfo field:
+                    field.SetValue(source, value);
+                    return true;
+                case PropertyInfo property when property.SetMethod is not null:
+                    property.SetValue(source, value);
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static object? ReadStaticNamedMember(Type? type, string memberName)

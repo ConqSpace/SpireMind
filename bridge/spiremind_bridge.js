@@ -476,6 +476,47 @@ function resolveLegalActionForPlannedStep(stateObject, actionObject) {
     };
   }
 
+  if (actionType === "use_potion") {
+    const requestedSlotIndex = readOptionalInteger(actionObject.potion_slot_index);
+    const requestedPotionId = readTrimmedString(actionObject.potion_id);
+    const requestedTargetCombatId = readOptionalInteger(actionObject.target_combat_id);
+    const requestedTargetId = normalizeOptionalTargetId(actionObject.target_id);
+    const legalAction = getLegalActions(stateObject).find((candidate) => {
+      if (readTrimmedString(candidate.type) !== "use_potion") {
+        return false;
+      }
+
+      if (requestedSlotIndex !== null && readOptionalInteger(candidate.potion_slot_index) !== requestedSlotIndex) {
+        return false;
+      }
+
+      if (requestedPotionId !== "" && readTrimmedString(candidate.potion_id) !== requestedPotionId) {
+        return false;
+      }
+
+      if (requestedTargetCombatId !== null) {
+        return readOptionalInteger(candidate.target_combat_id) === requestedTargetCombatId;
+      }
+
+      if (requestedTargetId !== null) {
+        return normalizeOptionalTargetId(candidate.target_id) === requestedTargetId;
+      }
+
+      return requestedSlotIndex !== null || requestedPotionId !== "";
+    });
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: "현재 legal_actions에서 요청한 use_potion을 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
   if (actionType === "choose_card_selection") {
     const requestedSelectionId = readTrimmedString(actionObject.card_selection_id);
     const requestedCardId = readTrimmedString(actionObject.card_id);

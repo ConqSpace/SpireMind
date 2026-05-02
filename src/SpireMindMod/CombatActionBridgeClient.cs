@@ -38,6 +38,7 @@ internal static class CombatActionBridgeClient
             {
                 "end_turn",
                 "play_card",
+                "use_potion",
                 "claim_gold_reward",
                 "claim_relic_reward",
                 "claim_potion_reward",

@@ -3,6 +3,26 @@
   "scope": "operation_semantics_only",
   "benchmark_guardrail": "This file describes adapter control flow and state transitions only. It intentionally excludes card, relic, potion, and strategy ratings.",
   "actions": {
+    "play_card": {
+      "meaning": "Play one legal card from the current hand.",
+      "preconditions": [
+        "The current state phase is combat_turn.",
+        "The selected action is present in legal_actions.",
+        "The same combat_card_id is still in hand.",
+        "If the action has a target, target_combat_id or target_id still resolves to a legal target."
+      ],
+      "expected_immediate_result": "The card play is queued and the combat state is posted again after the game processes it.",
+      "next_decision": "Observe the refreshed combat state before choosing another action."
+    },
+    "end_turn": {
+      "meaning": "End the current player turn.",
+      "preconditions": [
+        "The current state phase is combat_turn.",
+        "The end_turn action is present in legal_actions."
+      ],
+      "expected_immediate_result": "The player turn ends and the game advances to enemy actions or the next observable combat state.",
+      "next_decision": "Wait for the next posted state before deciding again."
+    },
     "buy_shop_item": {
       "meaning": "Purchase one legal shop card, relic, or potion.",
       "preconditions": [
@@ -22,6 +42,17 @@
       ],
       "expected_immediate_result": "The next state should be a card_selection screen when the service opens.",
       "next_decision": "Choose exactly one choose_card_selection action, then confirm_card_selection. Use cancel_card_selection only when no target should be chosen."
+    },
+    "use_potion": {
+      "meaning": "Use one legal combat potion from a specific potion slot.",
+      "preconditions": [
+        "The current state phase is combat_turn.",
+        "The selected action is present in legal_actions.",
+        "The same potion is still in the same potion_slot_index.",
+        "If requires_target is true, target_combat_id or target_id still resolves to a live target."
+      ],
+      "expected_immediate_result": "The potion effect is queued, the potion slot may become empty, and the combat state is posted again.",
+      "next_decision": "Observe the refreshed combat state before choosing another action."
     },
     "choose_card_selection": {
       "meaning": "Select one card shown by the active card selection screen.",
@@ -68,6 +99,11 @@
       "remove_card_at_shop",
       "proceed_shop"
     ],
+    "combat_turn": [
+      "play_card",
+      "use_potion",
+      "end_turn"
+    ],
     "card_selection": [
       "choose_card_selection",
       "confirm_card_selection",
@@ -77,6 +113,7 @@
   "state_fields": {
     "shop.potion_slots": "Current potion slots if visible through runtime state.",
     "shop.has_open_potion_slots": "False means potion purchases should be treated as blocked even when the player has enough gold.",
+    "combat_turn.player.potion_slots": "Current combat potion slots. Filled slots expose potion_id, target_type, requires_target, and is_usable_now when available.",
     "shop_visit_history": "Recent shop and card_selection actions from decisions.jsonl. This is procedural memory, not strategic evaluation."
   }
 }

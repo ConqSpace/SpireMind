@@ -3540,7 +3540,8 @@ internal static class CombatStateExporter
             int index = 0;
             foreach (object? slot in enumerable)
             {
-                Dictionary<string, object?>? potion = BuildItemSummary(slot);
+                object? potionModel = ExtractPotionModel(slot);
+                Dictionary<string, object?>? potion = BuildPotionSummary(potionModel);
                 slots.Add(new Dictionary<string, object?>
                 {
                     ["slot_index"] = index,
@@ -3560,6 +3561,64 @@ internal static class CombatStateExporter
             ["max_potion_slots"] = maxSlots == 0 ? null : maxSlots,
             ["has_open_potion_slots"] = maxSlots == 0 ? null : filledSlots < maxSlots
         };
+    }
+
+    private static object? ExtractPotionModel(object? source)
+    {
+        if (source is null)
+        {
+            return null;
+        }
+
+        object? nested = FindMemberValue(
+            source,
+            "Potion",
+            "potion",
+            "_potion",
+            "PotionModel",
+            "potionModel",
+            "_potionModel",
+            "Model",
+            "model",
+            "_model");
+        if (nested is not null)
+        {
+            return nested;
+        }
+
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        return typeName.Contains("Potion", StringComparison.OrdinalIgnoreCase)
+            && !typeName.Contains("Slot", StringComparison.OrdinalIgnoreCase)
+            ? source
+            : null;
+    }
+
+    private static Dictionary<string, object?>? BuildPotionSummary(object? source)
+    {
+        Dictionary<string, object?>? summary = BuildItemSummary(source);
+        if (summary is null)
+        {
+            return null;
+        }
+
+        string? targetType = ReadFirstString(new[] { source }, "TargetType", "targetType", "_targetType", "Target", "target", "_target");
+        bool requiresTarget = PotionRequiresTarget(targetType);
+        summary["potion_id"] = summary["id"];
+        summary["target_type"] = targetType;
+        summary["requires_target"] = requiresTarget;
+        summary["is_usable_now"] = ReadBool(source, "IsUsable", "isUsable", "_isUsable", "CanUse", "canUse", "_canUse") ?? true;
+        return summary;
+    }
+
+    private static bool PotionRequiresTarget(string? targetType)
+    {
+        if (string.IsNullOrWhiteSpace(targetType))
+        {
+            return false;
+        }
+
+        return ContainsAny(targetType, "Enemy", "Target", "Monster", "Creature")
+            && !ContainsAny(targetType, "None", "Self", "Player", "All", "Random");
     }
 
     private static Dictionary<string, object?> BuildPiles(object combatRoot, object? player, ObjectGraph graph)
@@ -4228,6 +4287,7 @@ internal static class CombatStateExporter
             .Where(IsEnemyTargetCandidate)
             .ToList();
         int? playerEnergy = ReadDictionaryInt(player, "energy");
+        List<Dictionary<string, object?>> potionSlots = ReadDictionaryList(player, "potion_slots");
 
         foreach (Dictionary<string, object?> card in hand)
         {
@@ -4286,6 +4346,69 @@ internal static class CombatStateExporter
             }
         }
 
+        foreach (Dictionary<string, object?> potionSlot in potionSlots)
+        {
+            if (ReadDictionaryBool(potionSlot, "empty") == true)
+            {
+                continue;
+            }
+
+            Dictionary<string, object?>? potion = ReadDictionaryObject(potionSlot, "potion");
+            if (potion is null || ReadDictionaryBool(potion, "is_usable_now") == false)
+            {
+                continue;
+            }
+
+            int? potionSlotIndex = ReadDictionaryInt(potionSlot, "slot_index");
+            if (potionSlotIndex is null)
+            {
+                continue;
+            }
+
+            string potionId = ReadDictionaryString(potion, "potion_id")
+                ?? ReadDictionaryString(potion, "id")
+                ?? $"potion_slot_{potionSlotIndex.Value}";
+            string potionName = ReadDictionaryString(potion, "name") ?? potionId;
+            string? targetType = ReadDictionaryString(potion, "target_type");
+            bool requiresTarget = ReadDictionaryBool(potion, "requires_target") ?? PotionRequiresTarget(targetType);
+
+            if (requiresTarget)
+            {
+                foreach (Dictionary<string, object?> enemy in liveEnemies)
+                {
+                    string? targetId = ReadDictionaryString(enemy, "id");
+                    if (string.IsNullOrWhiteSpace(targetId))
+                    {
+                        continue;
+                    }
+
+                    string enemyName = ReadDictionaryString(enemy, "name") ?? targetId;
+                    int? targetCombatId = ReadDictionaryInt(enemy, "combat_id");
+                    actions.Add(CreateUsePotionAction(
+                        $"use_potion_{potionSlotIndex.Value}_{potionId}_{targetId}",
+                        potionSlotIndex.Value,
+                        potionId,
+                        targetType,
+                        true,
+                        targetId,
+                        targetCombatId,
+                        $"Use {potionName} on {enemyName}."));
+                }
+            }
+            else
+            {
+                actions.Add(CreateUsePotionAction(
+                    $"use_potion_{potionSlotIndex.Value}_{potionId}_no_target",
+                    potionSlotIndex.Value,
+                    potionId,
+                    targetType,
+                    false,
+                    null,
+                    null,
+                    $"Use {potionName}."));
+            }
+        }
+
         actions.Add(new Dictionary<string, object?>
         {
             ["action_id"] = "end_turn",
@@ -4321,6 +4444,31 @@ internal static class CombatStateExporter
             ["energy_cost"] = energyCost,
             ["summary"] = summary,
             ["validation_note"] = validationNote
+        };
+    }
+
+    private static Dictionary<string, object?> CreateUsePotionAction(
+        string actionId,
+        int potionSlotIndex,
+        string potionId,
+        string? targetType,
+        bool requiresTarget,
+        string? targetId,
+        int? targetCombatId,
+        string summary)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["action_id"] = SanitizeActionId(actionId),
+            ["type"] = "use_potion",
+            ["potion_slot_index"] = potionSlotIndex,
+            ["potion_id"] = potionId,
+            ["target_type"] = targetType,
+            ["requires_target"] = requiresTarget,
+            ["target_id"] = targetId,
+            ["target_combat_id"] = targetCombatId,
+            ["summary"] = summary,
+            ["validation_note"] = "Runtime validation checks the same potion slot, potion id, target requirement, and target liveness before enqueueing UsePotionAction."
         };
     }
 
@@ -4534,6 +4682,13 @@ internal static class CombatStateExporter
         }
 
         return value as Dictionary<string, object?> ?? new Dictionary<string, object?>();
+    }
+
+    private static Dictionary<string, object?>? ReadDictionaryObject(Dictionary<string, object?> source, string key)
+    {
+        return source.TryGetValue(key, out object? value)
+            ? value as Dictionary<string, object?>
+            : null;
     }
 
     private static List<Dictionary<string, object?>> ReadDictionaryList(Dictionary<string, object?> source, string key)

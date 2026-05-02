@@ -1250,7 +1250,7 @@ function buildRecentHistory(runLogDir, limit) {
 function buildActionMetadata(options, snapshot) {
   const state = isPlainObject(snapshot.state) ? snapshot.state : {};
   const phase = typeof state.phase === "string" ? state.phase : "";
-  if (phase !== "shop" && phase !== "card_selection") {
+  if (phase !== "shop" && phase !== "card_selection" && phase !== "combat_turn") {
     return null;
   }
 
@@ -1802,6 +1802,7 @@ function buildCommandPrompt(options, snapshot) {
         "action_metadata는 조작 절차와 화면 전환만 설명합니다. 카드, 유물, 포션의 가치 평가는 포함하지 않습니다.",
         "상점에서 remove_card_at_shop을 고르면 다음 상태는 보통 card_selection입니다. 이후 choose_card_selection 하나를 고르고 confirm_card_selection으로 확정합니다.",
         "card_selection에서 적절한 대상이 없고 cancel_card_selection이 legal_actions에 있으면 취소할 수 있습니다.",
+        "전투에서 use_potion을 고를 때는 potion_slot_index와 target_combat_id가 이미 legal_actions에 고정되어 있는 action_id를 선택하세요.",
         "카드 선택 화면에서는 selected_count, min_select, max_select를 보고 다음에 필요한 카드 선택 또는 확인 행동 하나만 고르세요.",
         "전투에서도 한 번에 카드 한 장 또는 턴 종료 하나만 선택하세요. 실행 후 상태를 다시 관찰합니다.",
         "설명 없이 JSON 객체만 출력하세요."

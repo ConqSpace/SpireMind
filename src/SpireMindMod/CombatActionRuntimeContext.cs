@@ -93,7 +93,10 @@ internal static class CombatActionRuntimeContext
                 ReadInt(action, "cost"),
                 ReadString(action, "slot_group"),
                 ReadInt(action, "slot_index"),
-                ReadString(action, "locator_id")));
+                ReadString(action, "locator_id"),
+                ReadInt(action, "potion_slot_index"),
+                ReadString(action, "potion_id"),
+                ReadBool(action, "requires_target")));
         }
 
         return actions;
@@ -128,6 +131,32 @@ internal static class CombatActionRuntimeContext
 
         if (property.ValueKind == JsonValueKind.String
             && int.TryParse(property.GetString(), out int stringValue))
+        {
+            return stringValue;
+        }
+
+        return null;
+    }
+
+    private static bool? ReadBool(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out JsonElement property))
+        {
+            return null;
+        }
+
+        if (property.ValueKind == JsonValueKind.True)
+        {
+            return true;
+        }
+
+        if (property.ValueKind == JsonValueKind.False)
+        {
+            return false;
+        }
+
+        if (property.ValueKind == JsonValueKind.String
+            && bool.TryParse(property.GetString(), out bool stringValue))
         {
             return stringValue;
         }
@@ -173,4 +202,7 @@ internal sealed record LegalActionSnapshot(
     int? ShopCost,
     string? ShopSlotGroup,
     int? ShopSlotIndex,
-    string? ShopLocatorId);
+    string? ShopLocatorId,
+    int? PotionSlotIndex,
+    string? PotionId,
+    bool? RequiresTarget);
