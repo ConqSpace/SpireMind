@@ -1,4 +1,5 @@
 using System.Collections;
+using System.Diagnostics;
 using System.Reflection;
 using System.Threading;
 using HarmonyLib;
@@ -485,20 +486,57 @@ internal static class CombatActionExecutor
             return false;
         }
 
-        if (!TryInvokeMethod(shopRoom, "OnProceedButtonReleased", out _, proceedButton)
-            && !TryInvokeMethod(shopRoom, "OnProceedPressed", out _, proceedButton)
-            && !TryInvokeMethod(shopRoom, "Proceed", out _)
-            && !TryInvokeMethod(proceedButton, "OnRelease", out _)
-            && !TryInvokeMethod(proceedButton, "OnPressed", out _)
-            && !TryInvokeMethod(proceedButton, "EmitSignalPressed", out _, proceedButton))
+        if (TryCallDeferredNoArgs(proceedButton, "ForceClick", out string deferredFailureReason))
         {
-            detail = "상점 진행 버튼 호출에 실패했습니다.";
-            return false;
+            if (WaitForShopProceedTransitionToMap())
+            {
+                detail = "상점 진행 버튼을 눌렀고 지도 화면 진입을 확인했습니다. method=button.CallDeferred(ForceClick)";
+                Logger.Info(detail);
+                return true;
+            }
         }
 
-        detail = "상점 진행 버튼을 눌렀습니다.";
-        Logger.Info(detail);
-        return true;
+        List<(string Label, object? Source, string MethodName, object?[] Args)> candidates = new()
+        {
+            ("button.ForceClick", proceedButton, "ForceClick", Array.Empty<object?>()),
+            ("button.OnRelease", proceedButton, "OnRelease", Array.Empty<object?>()),
+            ("button.OnPressed", proceedButton, "OnPressed", Array.Empty<object?>()),
+            ("room.OnProceedButtonReleased(button)", shopRoom, "OnProceedButtonReleased", new object?[] { proceedButton }),
+            ("room.OnProceedPressed(button)", shopRoom, "OnProceedPressed", new object?[] { proceedButton }),
+            ("room.Proceed", shopRoom, "Proceed", Array.Empty<object?>()),
+            ("button.EmitSignalPressed(button)", proceedButton, "EmitSignalPressed", new object?[] { proceedButton })
+        };
+
+        List<string> invokedCandidates = new();
+        foreach ((string label, object? source, string methodName, object?[] args) in candidates)
+        {
+            if (!TryInvokeMethod(source, methodName, out _, args))
+            {
+                continue;
+            }
+
+            invokedCandidates.Add(label);
+            if (WaitForShopProceedTransitionToMap())
+            {
+                detail = $"상점 진행 버튼을 눌렀고 지도 화면 진입을 확인했습니다. method={label}";
+                Logger.Info(detail);
+                return true;
+            }
+        }
+
+        string currentScreenTypeName = GetCurrentScreenTypeName();
+        if (deferredFailureReason.Length > 0)
+        {
+            invokedCandidates.Insert(0, $"button.CallDeferred(ForceClick): {deferredFailureReason}");
+        }
+        else
+        {
+            invokedCandidates.Insert(0, "button.CallDeferred(ForceClick)");
+        }
+
+        string tried = invokedCandidates.Count == 0 ? "<none>" : string.Join(", ", invokedCandidates);
+        detail = $"상점 진행 버튼 호출 뒤에도 지도 화면에 도달하지 못했습니다. tried={tried}, current_screen={currentScreenTypeName}";
+        return false;
     }
 
     private static bool TryExecuteBuyShopItem(
@@ -1462,6 +1500,151 @@ internal static class CombatActionExecutor
         object? currentScreen = null;
         _ = TryInvokeMethod(screenContext, "GetCurrentScreen", out currentScreen);
         return IsCardSelectionScreen(currentScreen) ? currentScreen : null;
+    }
+
+    private static bool WaitForShopProceedTransitionToMap()
+    {
+        const int timeoutMs = 5000;
+        const int pollIntervalMs = 100;
+        Stopwatch stopwatch = Stopwatch.StartNew();
+        int stableMapPollCount = 0;
+        while (stopwatch.ElapsedMilliseconds < timeoutMs)
+        {
+            Thread.Sleep(pollIntervalMs);
+            object? currentScreen = GetCurrentScreen();
+            if (currentScreen is not null && IsMapScreen(currentScreen))
+            {
+                stableMapPollCount++;
+                if (stableMapPollCount >= 5)
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                stableMapPollCount = 0;
+            }
+        }
+
+        return false;
+    }
+
+    private static object? GetCurrentScreen()
+    {
+        Type? screenContextType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext");
+        object? screenContext = ReadStaticNamedMember(screenContextType, "Instance");
+        object? currentScreen = null;
+        _ = TryInvokeMethod(screenContext, "GetCurrentScreen", out currentScreen);
+        return currentScreen;
+    }
+
+    private static string GetCurrentScreenTypeName()
+    {
+        object? currentScreen = GetCurrentScreen();
+        return currentScreen?.GetType().FullName ?? currentScreen?.GetType().Name ?? "<unknown>";
+    }
+
+    private static bool TryCallDeferredNoArgs(object source, string methodName, out string failureReason)
+    {
+        failureReason = string.Empty;
+        MethodInfo? targetMethod = source.GetType()
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .FirstOrDefault(method =>
+                method.Name.Equals(methodName, StringComparison.OrdinalIgnoreCase)
+                && method.GetParameters().Length == 0);
+        if (targetMethod is null)
+        {
+            failureReason = $"{methodName} 메서드를 찾지 못했습니다.";
+            return false;
+        }
+
+        MethodInfo? callDeferred = source.GetType()
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .FirstOrDefault(method =>
+            {
+                if (!method.Name.Equals("CallDeferred", StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
+                ParameterInfo[] parameters = method.GetParameters();
+                return parameters.Length == 2 && parameters[1].ParameterType.IsArray;
+            });
+        if (callDeferred is null)
+        {
+            failureReason = "Godot CallDeferred 메서드를 찾지 못했습니다.";
+            return false;
+        }
+
+        ParameterInfo[] callDeferredParameters = callDeferred.GetParameters();
+        object? deferredMethodName = CreateGodotStringName(callDeferredParameters[0].ParameterType, methodName);
+        if (deferredMethodName is null)
+        {
+            failureReason = "Godot StringName 값을 만들 수 없습니다.";
+            return false;
+        }
+
+        Type? argumentElementType = callDeferredParameters[1].ParameterType.GetElementType();
+        if (argumentElementType is null)
+        {
+            failureReason = "CallDeferred 인자 배열 타입을 해석하지 못했습니다.";
+            return false;
+        }
+
+        Array emptyArguments = Array.CreateInstance(argumentElementType, 0);
+        try
+        {
+            callDeferred.Invoke(source, new object[] { deferredMethodName, emptyArguments });
+            return true;
+        }
+        catch (TargetInvocationException exception) when (exception.InnerException is not null)
+        {
+            failureReason = $"{exception.InnerException.GetType().Name}: {exception.InnerException.Message}";
+            return false;
+        }
+        catch (Exception exception)
+        {
+            failureReason = $"{exception.GetType().Name}: {exception.Message}";
+            return false;
+        }
+    }
+
+    private static object? CreateGodotStringName(Type targetType, string value)
+    {
+        if (targetType == typeof(string))
+        {
+            return value;
+        }
+
+        ConstructorInfo? constructor = targetType.GetConstructor(new[] { typeof(string) });
+        if (constructor is not null)
+        {
+            return constructor.Invoke(new object[] { value });
+        }
+
+        MethodInfo? implicitOperator = targetType
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .FirstOrDefault(method =>
+                method.Name == "op_Implicit"
+                && method.ReturnType == targetType
+                && method.GetParameters().Length == 1
+                && method.GetParameters()[0].ParameterType == typeof(string));
+        return implicitOperator?.Invoke(null, new object[] { value });
+    }
+
+    private static bool IsShopScreen(object source)
+    {
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        return typeName.Contains("Merchant", StringComparison.OrdinalIgnoreCase)
+            || typeName.Contains("Shop", StringComparison.OrdinalIgnoreCase)
+            || typeName.Contains("Store", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsMapScreen(object source)
+    {
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        return typeName.Contains("NMapScreen", StringComparison.OrdinalIgnoreCase)
+            || typeName.Contains(".Map.", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsCardSelectionScreen(object? source)

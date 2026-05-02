@@ -378,6 +378,11 @@ internal static class CombatStateExporter
                 return false;
             }
 
+            if (FindMapScreen() is not null)
+            {
+                return false;
+            }
+
             Dictionary<string, object?> state = BuildShopState(shopScreen);
             WriteState(shopScreen, state, "shop", force: false, tickAfterExport: false);
             return true;
