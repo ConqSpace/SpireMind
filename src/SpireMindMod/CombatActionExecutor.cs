@@ -258,6 +258,14 @@ internal static class CombatActionExecutor
             {
                 applied = TryExecuteShopProceed(context.CombatRoot, out detail);
             }
+            else if (legalAction.ActionType.Equals("buy_shop_item", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecuteBuyShopItem(legalAction, context.CombatRoot, out detail);
+            }
+            else if (legalAction.ActionType.Equals("remove_card_at_shop", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryOpenShopCardRemoval(legalAction, context.CombatRoot, out detail);
+            }
             else if (legalAction.ActionType.Equals("choose_card_selection", StringComparison.OrdinalIgnoreCase))
             {
                 applied = TryExecuteCardSelectionChoice(legalAction, context.CombatRoot, out detail);
@@ -265,6 +273,10 @@ internal static class CombatActionExecutor
             else if (legalAction.ActionType.Equals("confirm_card_selection", StringComparison.OrdinalIgnoreCase))
             {
                 applied = TryExecuteCardSelectionConfirm(context.CombatRoot, out detail);
+            }
+            else if (legalAction.ActionType.Equals("cancel_card_selection", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecuteCardSelectionCancel(context.CombatRoot, out detail);
             }
             else if (legalAction.ActionType.Equals("choose_map_node", StringComparison.OrdinalIgnoreCase))
             {
@@ -312,8 +324,11 @@ internal static class CombatActionExecutor
             || actionType.Equals("choose_rest_site_option", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("proceed_rest_site", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("proceed_shop", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("buy_shop_item", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("remove_card_at_shop", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("choose_card_selection", StringComparison.OrdinalIgnoreCase)
-            || actionType.Equals("confirm_card_selection", StringComparison.OrdinalIgnoreCase);
+            || actionType.Equals("confirm_card_selection", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("cancel_card_selection", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool TryExecuteEventOption(
@@ -478,6 +493,530 @@ internal static class CombatActionExecutor
         return true;
     }
 
+    private static bool TryExecuteBuyShopItem(
+        LegalActionSnapshot legalAction,
+        object shopRoot,
+        out string detail)
+    {
+        object? shopRoom = ResolveShopRoom(shopRoot);
+        if (shopRoom is null)
+        {
+            string rootTypeName = shopRoot.GetType().FullName ?? shopRoot.GetType().Name;
+            detail = $"상점 구매는 현재 화면에서 실행할 수 없습니다. root={rootTypeName}";
+            return false;
+        }
+
+        object? runtimeInventory = ResolveRuntimeMerchantInventory(shopRoom)
+            ?? ResolveRuntimeMerchantInventoryFromRunManager();
+        if (runtimeInventory is null)
+        {
+            detail = "상점 구매에 필요한 MerchantInventory를 찾지 못했습니다.";
+            return false;
+        }
+
+        ShopPurchaseCandidate? candidate = FindShopPurchaseCandidate(runtimeInventory, legalAction, out string findDetail);
+        if (candidate is null)
+        {
+            detail = findDetail;
+            return false;
+        }
+
+        if (!candidate.IsStocked)
+        {
+            detail = $"상점 물품이 이미 품절입니다. model_id={candidate.ModelId}, cost={candidate.Cost?.ToString() ?? "<unknown>"}";
+            return false;
+        }
+
+        if (!candidate.IsAffordable)
+        {
+            detail = $"상점 물품을 살 골드가 부족합니다. model_id={candidate.ModelId}, cost={candidate.Cost?.ToString() ?? "<unknown>"}";
+            return false;
+        }
+
+        if (!TryInvokePurchaseWrapper(candidate.Entry, runtimeInventory, waitForCompletion: true, out object? purchaseResult, out string purchaseDetail))
+        {
+            detail = purchaseDetail;
+            return false;
+        }
+
+        detail = $"상점 구매 완료: kind={candidate.Kind}, model_id={candidate.ModelId}, cost={candidate.Cost?.ToString() ?? "<unknown>"} result={DescribeResult(purchaseResult)}";
+        Logger.Info(detail);
+        return true;
+    }
+
+    private static bool TryOpenShopCardRemoval(
+        LegalActionSnapshot legalAction,
+        object shopRoot,
+        out string detail)
+    {
+        object? shopRoom = ResolveShopRoom(shopRoot);
+        if (shopRoom is null)
+        {
+            string rootTypeName = shopRoot.GetType().FullName ?? shopRoot.GetType().Name;
+            detail = $"카드 제거 서비스는 현재 화면에서 실행할 수 없습니다. root={rootTypeName}";
+            return false;
+        }
+
+        object? runtimeInventory = ResolveRuntimeMerchantInventory(shopRoom)
+            ?? ResolveRuntimeMerchantInventoryFromRunManager();
+        if (runtimeInventory is null)
+        {
+            detail = "카드 제거 서비스에 필요한 MerchantInventory를 찾지 못했습니다.";
+            return false;
+        }
+
+        ShopPurchaseCandidate? candidate = FindShopCardRemovalCandidate(runtimeInventory, legalAction, out string findDetail);
+        if (candidate is null)
+        {
+            detail = findDetail;
+            return false;
+        }
+
+        if (!candidate.IsStocked)
+        {
+            detail = $"카드 제거 서비스가 이미 사용됐거나 비활성화됐습니다. cost={candidate.Cost?.ToString() ?? "<unknown>"}";
+            return false;
+        }
+
+        if (!candidate.IsAffordable)
+        {
+            detail = $"카드 제거 서비스를 이용할 골드가 부족합니다. cost={candidate.Cost?.ToString() ?? "<unknown>"}";
+            return false;
+        }
+
+        if (!TryInvokePurchaseWrapper(candidate.Entry, runtimeInventory, waitForCompletion: false, out object? purchaseResult, out string purchaseDetail))
+        {
+            detail = purchaseDetail;
+            return false;
+        }
+
+        detail = $"카드 제거 서비스 선택 완료: cost={candidate.Cost?.ToString() ?? "<unknown>"} result={DescribeResult(purchaseResult)}. 다음 상태에서 제거할 카드를 choose_card_selection으로 선택해야 합니다.";
+        Logger.Info(detail);
+        return true;
+    }
+
+    private static object? ResolveRuntimeMerchantInventory(object shopRoom)
+    {
+        object? directInventory = ReadNamedMember(shopRoom, "Inventory")
+            ?? ReadNamedMember(shopRoom, "_inventory")
+            ?? ReadNamedMember(shopRoom, "MerchantInventory")
+            ?? ReadNamedMember(shopRoom, "_merchantInventory");
+        object? runtimeInventory = NormalizeRuntimeMerchantInventory(directInventory);
+        if (runtimeInventory is not null)
+        {
+            return runtimeInventory;
+        }
+
+        return EnumerateNodeDescendants(shopRoom)
+            .Select(NormalizeRuntimeMerchantInventory)
+            .FirstOrDefault(candidate => candidate is not null);
+    }
+
+    private static object? ResolveRuntimeMerchantInventoryFromRunManager()
+    {
+        Type? runManagerType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Runs.RunManager");
+        object? runManager = ReadStaticNamedMember(runManagerType, "Instance");
+        object? currentRoom = ReadNamedMember(runManager, "CurrentRoom")
+            ?? ReadNamedMember(runManager, "_currentRoom")
+            ?? ReadNamedMember(ReadNamedMember(runManager, "Run"), "CurrentRoom")
+            ?? ReadNamedMember(ReadNamedMember(runManager, "CurrentRun"), "CurrentRoom");
+        object? roomInventory = ReadNamedMember(currentRoom, "Inventory")
+            ?? ReadNamedMember(currentRoom, "_inventory")
+            ?? ReadNamedMember(currentRoom, "MerchantInventory")
+            ?? ReadNamedMember(currentRoom, "_merchantInventory");
+        return NormalizeRuntimeMerchantInventory(roomInventory);
+    }
+
+    private static object? NormalizeRuntimeMerchantInventory(object? source)
+    {
+        if (source is null)
+        {
+            return null;
+        }
+
+        if (HasShopEntryMembers(source))
+        {
+            return source;
+        }
+
+        object? nestedInventory = ReadNamedMember(source, "Inventory")
+            ?? ReadNamedMember(source, "_inventory");
+        if (!ReferenceEquals(nestedInventory, source) && HasShopEntryMembers(nestedInventory))
+        {
+            return nestedInventory;
+        }
+
+        return null;
+    }
+
+    private static bool HasShopEntryMembers(object? source)
+    {
+        return source is not null
+            && (ReadNamedMember(source, "CharacterCardEntries") is not null
+                || ReadNamedMember(source, "ColorlessCardEntries") is not null
+                || ReadNamedMember(source, "RelicEntries") is not null
+                || ReadNamedMember(source, "PotionEntries") is not null);
+    }
+
+    private static ShopPurchaseCandidate? FindShopPurchaseCandidate(
+        object runtimeInventory,
+        LegalActionSnapshot legalAction,
+        out string detail)
+    {
+        List<ShopPurchaseCandidate> candidates = EnumerateShopPurchaseCandidates(runtimeInventory).ToList();
+        IEnumerable<ShopPurchaseCandidate> matches = candidates;
+
+        if (!string.IsNullOrWhiteSpace(legalAction.ShopKind))
+        {
+            matches = matches.Where(candidate => candidate.Kind.Equals(legalAction.ShopKind, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(legalAction.ShopModelId))
+        {
+            matches = matches.Where(candidate => IsSameShopModelId(candidate.ModelId, legalAction.ShopModelId));
+        }
+
+        if (legalAction.ShopCost is not null)
+        {
+            matches = matches.Where(candidate => candidate.Cost == legalAction.ShopCost.Value);
+        }
+
+        List<ShopPurchaseCandidate> exactMatches = matches.ToList();
+        if (exactMatches.Count == 0)
+        {
+            string candidateSummary = string.Join(", ", candidates.Take(8).Select(candidate =>
+                $"{candidate.Kind}:{candidate.ModelId}:{candidate.Cost?.ToString() ?? "<null>"}:{candidate.SlotIndex}"));
+            detail = $"상점 구매 후보를 찾지 못했습니다. kind={legalAction.ShopKind ?? "<none>"}, model_id={legalAction.ShopModelId ?? "<none>"}, cost={legalAction.ShopCost?.ToString() ?? "<none>"}, candidates=[{candidateSummary}]";
+            return null;
+        }
+
+        if (exactMatches.Count == 1)
+        {
+            detail = "상점 구매 후보를 찾았습니다.";
+            return exactMatches[0];
+        }
+
+        if (legalAction.ShopSlotIndex is not null)
+        {
+            ShopPurchaseCandidate? slotMatch = exactMatches.FirstOrDefault(candidate => candidate.SlotIndex == legalAction.ShopSlotIndex.Value);
+            if (slotMatch is not null)
+            {
+                detail = "상점 구매 후보를 슬롯 번호로 확정했습니다.";
+                return slotMatch;
+            }
+        }
+
+        detail = $"상점 구매 후보가 여러 개입니다. model_id={legalAction.ShopModelId ?? "<none>"}, count={exactMatches.Count}";
+        return null;
+    }
+
+    private static IEnumerable<ShopPurchaseCandidate> EnumerateShopPurchaseCandidates(object runtimeInventory)
+    {
+        int cardIndex = 0;
+        List<ShopPurchaseCandidate> characterCards = EnumerateCardPurchaseCandidates(runtimeInventory, "CharacterCardEntries", "character_card", cardIndex).ToList();
+        foreach (ShopPurchaseCandidate candidate in characterCards)
+        {
+            yield return candidate;
+        }
+        cardIndex += characterCards.Count;
+
+        foreach (ShopPurchaseCandidate candidate in EnumerateCardPurchaseCandidates(runtimeInventory, "ColorlessCardEntries", "colorless_card", cardIndex))
+        {
+            yield return candidate;
+        }
+
+        foreach (ShopPurchaseCandidate candidate in EnumerateModelPurchaseCandidates(runtimeInventory, "RelicEntries", "relic"))
+        {
+            yield return candidate;
+        }
+
+        foreach (ShopPurchaseCandidate candidate in EnumerateModelPurchaseCandidates(runtimeInventory, "PotionEntries", "potion"))
+        {
+            yield return candidate;
+        }
+    }
+
+    private static ShopPurchaseCandidate? FindShopCardRemovalCandidate(
+        object runtimeInventory,
+        LegalActionSnapshot legalAction,
+        out string detail)
+    {
+        object? entry = ReadNamedMember(runtimeInventory, "CardRemovalEntry")
+            ?? ReadNamedMember(runtimeInventory, "cardRemovalEntry")
+            ?? ReadNamedMember(runtimeInventory, "_cardRemovalEntry");
+        if (entry is null)
+        {
+            detail = "상점 카드 제거 엔트리를 찾지 못했습니다.";
+            return null;
+        }
+
+        ShopPurchaseCandidate candidate = BuildShopPurchaseCandidate(
+            entry,
+            kind: "service",
+            modelId: "CARD_REMOVAL",
+            slotGroup: "service",
+            slotIndex: 0,
+            rawSlotGroup: "service",
+            rawSlotIndex: 0);
+
+        if (legalAction.ShopCost is not null && candidate.Cost != legalAction.ShopCost.Value)
+        {
+            detail = $"카드 제거 서비스 가격이 현재 상태와 다릅니다. expected={legalAction.ShopCost.Value}, actual={candidate.Cost?.ToString() ?? "<unknown>"}";
+            return null;
+        }
+
+        detail = "상점 카드 제거 엔트리를 찾았습니다.";
+        return candidate;
+    }
+
+    private static IEnumerable<ShopPurchaseCandidate> EnumerateCardPurchaseCandidates(
+        object runtimeInventory,
+        string entriesMemberName,
+        string rawSlotGroup,
+        int startSlotIndex)
+    {
+        object? entries = ReadNamedMember(runtimeInventory, entriesMemberName)
+            ?? ReadNamedMember(runtimeInventory, "_" + entriesMemberName)
+            ?? ReadNamedMember(runtimeInventory, ToCamelCase(entriesMemberName));
+        int rawIndex = 0;
+        int visibleIndex = 0;
+        foreach (object entry in ExpandValue(entries))
+        {
+            object? creationResult = ReadNamedMember(entry, "CreationResult")
+                ?? ReadNamedMember(entry, "creationResult")
+                ?? ReadNamedMember(entry, "_creationResult");
+            object? card = ReadNamedMember(creationResult, "Card")
+                ?? ReadNamedMember(creationResult, "card")
+                ?? ReadNamedMember(creationResult, "_card");
+            string? modelId = ReadObjectId(card);
+            if (!string.IsNullOrWhiteSpace(modelId))
+            {
+                yield return BuildShopPurchaseCandidate(
+                    entry,
+                    kind: "card",
+                    modelId: modelId,
+                    slotGroup: "card",
+                    slotIndex: startSlotIndex + visibleIndex,
+                    rawSlotGroup: rawSlotGroup,
+                    rawSlotIndex: rawIndex);
+                visibleIndex++;
+            }
+
+            rawIndex++;
+        }
+    }
+
+    private static IEnumerable<ShopPurchaseCandidate> EnumerateModelPurchaseCandidates(
+        object runtimeInventory,
+        string entriesMemberName,
+        string kind)
+    {
+        object? entries = ReadNamedMember(runtimeInventory, entriesMemberName)
+            ?? ReadNamedMember(runtimeInventory, "_" + entriesMemberName)
+            ?? ReadNamedMember(runtimeInventory, ToCamelCase(entriesMemberName));
+        int index = 0;
+        foreach (object entry in ExpandValue(entries))
+        {
+            object? model = ReadNamedMember(entry, "Model")
+                ?? ReadNamedMember(entry, "model")
+                ?? ReadNamedMember(entry, "_model");
+            string? modelId = ReadObjectId(model);
+            if (!string.IsNullOrWhiteSpace(modelId))
+            {
+                yield return BuildShopPurchaseCandidate(
+                    entry,
+                    kind,
+                    modelId,
+                    slotGroup: kind,
+                    slotIndex: index,
+                    rawSlotGroup: kind,
+                    rawSlotIndex: index);
+            }
+
+            index++;
+        }
+    }
+
+    private static ShopPurchaseCandidate BuildShopPurchaseCandidate(
+        object entry,
+        string kind,
+        string modelId,
+        string slotGroup,
+        int slotIndex,
+        string rawSlotGroup,
+        int rawSlotIndex)
+    {
+        int? cost = ReadShopCost(entry);
+        bool stocked = ReadBool(entry, "IsStocked") ?? ReadBool(entry, "isStocked") ?? ReadBool(entry, "_isStocked") ?? true;
+        bool soldOut = ReadBool(entry, "SoldOut") ?? ReadBool(entry, "soldOut") ?? ReadBool(entry, "_soldOut") ?? false;
+        bool affordable = ReadBool(entry, "EnoughGold")
+            ?? ReadBool(entry, "enoughGold")
+            ?? ReadBool(entry, "_enoughGold")
+            ?? ReadBool(entry, "CanAfford")
+            ?? ReadBool(entry, "canAfford")
+            ?? true;
+
+        return new ShopPurchaseCandidate(
+            entry,
+            kind,
+            modelId,
+            cost,
+            slotGroup,
+            slotIndex,
+            rawSlotGroup,
+            rawSlotIndex,
+            stocked && !soldOut,
+            affordable);
+    }
+
+    private static int? ReadShopCost(object? entry)
+    {
+        return ReadInt(entry, "price")
+            ?? ReadInt(entry, "_price")
+            ?? ReadInt(entry, "Price")
+            ?? ReadInt(entry, "cost")
+            ?? ReadInt(entry, "_cost")
+            ?? ReadInt(entry, "Cost")
+            ?? ReadInt(entry, "goldCost")
+            ?? ReadInt(entry, "_goldCost")
+            ?? ReadInt(entry, "GoldCost")
+            ?? ReadInt(entry, "shopPrice")
+            ?? ReadInt(entry, "_shopPrice")
+            ?? ReadInt(entry, "ShopPrice");
+    }
+
+    private static bool TryInvokePurchaseWrapper(
+        object entry,
+        object runtimeInventory,
+        bool waitForCompletion,
+        out object? result,
+        out string detail)
+    {
+        result = null;
+        if (!TryInvokePurchaseMethod(entry, runtimeInventory, out object? invocationResult))
+        {
+            detail = $"상점 구매 메서드 호출에 실패했습니다. entry={entry.GetType().FullName ?? entry.GetType().Name}, methods=[{DescribePurchaseMethods(entry)}]";
+            return false;
+        }
+
+        result = invocationResult;
+        if (!waitForCompletion)
+        {
+            detail = "상점 구매/서비스 메서드를 호출했고 비동기 완료 대기는 생략했습니다.";
+            return true;
+        }
+
+        if (invocationResult is Task<bool> booleanTask)
+        {
+            result = booleanTask.GetAwaiter().GetResult();
+            if (result is bool ok && !ok)
+            {
+                detail = "상점 구매 메서드가 false를 반환했습니다.";
+                return false;
+            }
+        }
+        else if (invocationResult is Task task)
+        {
+            task.GetAwaiter().GetResult();
+            result = task;
+        }
+        else if (invocationResult is bool ok && !ok)
+        {
+            detail = "상점 구매 메서드가 false를 반환했습니다.";
+            return false;
+        }
+
+        detail = "상점 구매 메서드를 호출했습니다.";
+        return true;
+    }
+
+    private static bool TryInvokePurchaseMethod(object entry, object runtimeInventory, out object? result)
+    {
+        if (TryInvokeMethod(entry, "OnTryPurchaseWrapper", out result, runtimeInventory, false)
+            || TryInvokeMethod(entry, "OnTryPurchase", out result, runtimeInventory, false)
+            || TryInvokeMethod(entry, "TryPurchase", out result, runtimeInventory, false)
+            || TryInvokeMethod(entry, "Purchase", out result, runtimeInventory, false)
+            || TryInvokeMethod(entry, "OnTryPurchaseWrapper", out result, runtimeInventory)
+            || TryInvokeMethod(entry, "OnTryPurchase", out result, runtimeInventory)
+            || TryInvokeMethod(entry, "TryPurchase", out result, runtimeInventory)
+            || TryInvokeMethod(entry, "Purchase", out result, runtimeInventory)
+            || TryInvokeMethod(entry, "OnTryPurchaseWrapper", out result)
+            || TryInvokeMethod(entry, "OnTryPurchase", out result)
+            || TryInvokeMethod(entry, "TryPurchase", out result)
+            || TryInvokeMethod(entry, "Purchase", out result))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static string DescribePurchaseMethods(object entry)
+    {
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        return string.Join("; ", entry.GetType()
+            .GetMethods(flags)
+            .Where(method => method.Name.Contains("Purchase", StringComparison.OrdinalIgnoreCase))
+            .Select(method =>
+            {
+                string parameters = string.Join(",", method.GetParameters().Select(parameter => parameter.ParameterType.Name));
+                return $"{method.Name}({parameters}):{method.ReturnType.Name}";
+            })
+            .Take(12));
+    }
+
+    private static string? ReadObjectId(object? source)
+    {
+        object? id = ReadNamedMember(source, "Id")
+            ?? ReadNamedMember(source, "id")
+            ?? ReadNamedMember(source, "_id");
+        if (id is null)
+        {
+            return null;
+        }
+
+        object? entry = ReadNamedMember(id, "Entry")
+            ?? ReadNamedMember(id, "entry")
+            ?? ReadNamedMember(id, "_entry");
+        return entry?.ToString() ?? id.ToString();
+    }
+
+    private static bool IsSameShopModelId(string left, string right)
+    {
+        return left.Equals(right, StringComparison.OrdinalIgnoreCase)
+            || StripShopModelPrefix(left).Equals(StripShopModelPrefix(right), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string StripShopModelPrefix(string value)
+    {
+        int dotIndex = value.LastIndexOf('.');
+        return dotIndex >= 0 && dotIndex + 1 < value.Length
+            ? value[(dotIndex + 1)..]
+            : value;
+    }
+
+    private static string ToCamelCase(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return value;
+        }
+
+        return char.ToLowerInvariant(value[0]) + value[1..];
+    }
+
+    private sealed record ShopPurchaseCandidate(
+        object Entry,
+        string Kind,
+        string ModelId,
+        int? Cost,
+        string SlotGroup,
+        int SlotIndex,
+        string RawSlotGroup,
+        int RawSlotIndex,
+        bool IsStocked,
+        bool IsAffordable);
+
     private static bool TryExecuteCardSelectionChoice(
         LegalActionSnapshot legalAction,
         object currentRoot,
@@ -565,6 +1104,48 @@ internal static class CombatActionExecutor
         }
 
         detail = "카드 선택 확인 메서드와 확인 버튼을 찾지 못했습니다.";
+        return false;
+    }
+
+    private static bool TryExecuteCardSelectionCancel(object currentRoot, out string detail)
+    {
+        object? selectionScreen = ResolveCardSelectionScreen(currentRoot);
+        if (selectionScreen is null)
+        {
+            string rootTypeName = currentRoot.GetType().FullName ?? currentRoot.GetType().Name;
+            detail = $"카드 선택 취소를 실행할 화면을 찾지 못했습니다. root={rootTypeName}";
+            return false;
+        }
+
+        foreach (string methodName in new[]
+        {
+            "CancelSelection",
+            "Cancel",
+            "OnCancel",
+            "OnCancelPressed",
+            "OnBackButtonPressed",
+            "Back",
+            "Close",
+            "Dismiss"
+        })
+        {
+            if (TryInvokeMethod(selectionScreen, methodName, out _))
+            {
+                detail = $"카드 선택 취소를 요청했습니다. method={methodName}";
+                Logger.Info(detail);
+                return true;
+            }
+        }
+
+        object? cancelButton = FindCardSelectionCancelButton(selectionScreen);
+        if (cancelButton is not null && TryInvokeMethod(cancelButton, "OnRelease", out _))
+        {
+            detail = "카드 선택 취소 버튼을 눌렀습니다.";
+            Logger.Info(detail);
+            return true;
+        }
+
+        detail = "카드 선택 취소 메서드나 취소 버튼을 찾지 못했습니다.";
         return false;
     }
 
@@ -1115,6 +1696,54 @@ internal static class CombatActionExecutor
             .Where(button => button is not null)
             .Cast<object>()
             .ToList();
+
+        return buttons.FirstOrDefault(button => ReadNamedMember(button, "IsEnabled") is bool isEnabled && isEnabled)
+            ?? buttons.FirstOrDefault();
+    }
+
+    private static object? FindCardSelectionCancelButton(object selectionScreen)
+    {
+        string[] memberNames =
+        {
+            "_cancelButton",
+            "CancelButton",
+            "cancelButton",
+            "_backButton",
+            "BackButton",
+            "backButton",
+            "_closeButton",
+            "CloseButton",
+            "closeButton",
+            "_returnButton",
+            "ReturnButton",
+            "returnButton"
+        };
+
+        List<object> buttons = memberNames
+            .Select(name => ReadNamedMember(selectionScreen, name))
+            .Where(button => button is not null)
+            .Cast<object>()
+            .ToList();
+
+        if (buttons.Count == 0)
+        {
+            buttons = EnumerateNodeDescendants(selectionScreen)
+                .Where(candidate =>
+                {
+                    string typeName = candidate.GetType().FullName ?? candidate.GetType().Name;
+                    string nodeName = ReadNamedMember(candidate, "Name")?.ToString() ?? string.Empty;
+                    if (string.IsNullOrWhiteSpace(nodeName)
+                        && TryInvokeMethod(candidate, "GetName", out object? invokedName))
+                    {
+                        nodeName = invokedName?.ToString() ?? string.Empty;
+                    }
+
+                    string label = $"{typeName} {nodeName}";
+                    return ContainsAny(typeName, "Button")
+                        && ContainsAny(label, "Cancel", "Back", "Close", "Return");
+                })
+                .ToList();
+        }
 
         return buttons.FirstOrDefault(button => ReadNamedMember(button, "IsEnabled") is bool isEnabled && isEnabled)
             ?? buttons.FirstOrDefault();
@@ -1839,6 +2468,27 @@ internal static class CombatActionExecutor
         {
             return null;
         }
+    }
+
+    private static bool? ReadBool(object? source, string memberName)
+    {
+        object? value = ReadNamedMember(source, memberName);
+        if (value is null)
+        {
+            return null;
+        }
+
+        if (value is bool boolean)
+        {
+            return boolean;
+        }
+
+        if (bool.TryParse(value.ToString(), out bool parsed))
+        {
+            return parsed;
+        }
+
+        return null;
     }
 
     private static bool ContainsAny(string text, params string[] parts)

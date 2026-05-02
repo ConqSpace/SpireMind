@@ -29,6 +29,8 @@ function parseArgs(argv) {
     timeoutMs: DEFAULT_TIMEOUT_MS,
     resultTimeoutMs: 60000,
     runLogDir: process.env.SPIREMIND_RUN_LOG_DIR || "",
+    actionMetadataPath: process.env.SPIREMIND_ACTION_METADATA_PATH
+      || path.resolve(__dirname, "..", "data", "sts2_knowledge", "action_flows.json"),
     scenarioId: process.env.SPIREMIND_SCENARIO_ID || "",
     playSessionId: process.env.SPIREMIND_PLAY_SESSION_ID || "",
     help: false
@@ -108,6 +110,17 @@ function parseArgs(argv) {
 
     if (token.startsWith("--run-log-dir=")) {
       options.runLogDir = token.slice("--run-log-dir=".length);
+      continue;
+    }
+
+    if (token === "--action-metadata-path" && index + 1 < argv.length) {
+      options.actionMetadataPath = argv[index + 1];
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--action-metadata-path=")) {
+      options.actionMetadataPath = token.slice("--action-metadata-path=".length);
       continue;
     }
 
@@ -193,6 +206,7 @@ function showHelp() {
     "",
     "Run record options:",
     "  --run-log-dir <dir>   decisions.jsonl, metrics.json, decider_config.json을 기록한다.",
+    "  --action-metadata-path <file> command 모드에 전달할 행동 절차 메타데이터 JSON 경로.",
     "  --wait-result         제출한 계획이 completed 또는 failed가 될 때까지 기다린다.",
     "  --until-combat-end    전투 턴을 반복 판단하고, 전투 종료나 비전투 상태를 감지하면 멈춘다.",
     "  --recent-history-limit <n> command 모드 판단기에 전달할 최근 기록 수. 기본값 8.",
@@ -200,8 +214,7 @@ function showHelp() {
     "  --play-session-id <id> 외부 판단기에 보내도 되는 플레이 세션 식별자다.",
     "",
     "Command mode output contract:",
-    "  { \"actions\": [{ \"type\": \"play_card\", \"combat_card_id\": 0, \"target_combat_id\": 1 }], \"reason\": \"...\" }",
-    "  또는 { \"selected_action_id\": \"end_turn\", \"reason\": \"...\" }",
+    "  { \"selected_action_id\": \"end_turn\", \"reason\": \"...\" }",
     ""
   ].join("\n"));
 }
@@ -1234,6 +1247,68 @@ function buildRecentHistory(runLogDir, limit) {
   };
 }
 
+function buildActionMetadata(options, snapshot) {
+  const state = isPlainObject(snapshot.state) ? snapshot.state : {};
+  const phase = typeof state.phase === "string" ? state.phase : "";
+  if (phase !== "shop" && phase !== "card_selection") {
+    return null;
+  }
+
+  const metadata = readJsonFile(options.actionMetadataPath);
+  return isPlainObject(metadata) ? metadata : null;
+}
+
+function buildShopVisitHistory(runLogDir, limit) {
+  if (!runLogDir) {
+    return null;
+  }
+
+  const normalizedLimit = Math.max(0, readNumber(limit) ?? 0);
+  if (normalizedLimit <= 0) {
+    return null;
+  }
+
+  const records = readJsonLines(path.join(runLogDir, "decisions.jsonl"));
+  const actions = records
+    .map((record) => {
+      const stateSummary = isPlainObject(record.state_summary) ? record.state_summary : {};
+      const afterStateSummary = isPlainObject(record.after_state_summary) ? record.after_state_summary : {};
+      const phase = typeof stateSummary.phase === "string" ? stateSummary.phase : null;
+      const afterPhase = typeof afterStateSummary.phase === "string" ? afterStateSummary.phase : null;
+      if (phase !== "shop" && phase !== "card_selection" && afterPhase !== "shop" && afterPhase !== "card_selection") {
+        return null;
+      }
+
+      const latestAction = isPlainObject(record.final_latest_action)
+        ? record.final_latest_action
+        : isPlainObject(record.latest_action)
+          ? record.latest_action
+          : null;
+      const decision = isPlainObject(record.decision) ? record.decision : {};
+      const selectedActionId = typeof decision.selected_action_id === "string"
+        ? decision.selected_action_id
+        : latestAction && typeof latestAction.selected_action_id === "string"
+          ? latestAction.selected_action_id
+          : null;
+
+      return {
+        recorded_at: typeof record.recorded_at === "string" ? record.recorded_at : null,
+        phase,
+        after_phase: afterPhase,
+        selected_action_id: selectedActionId,
+        status: typeof record.status === "string" ? record.status : null,
+        result: latestAction && typeof latestAction.result === "string" ? latestAction.result : null
+      };
+    })
+    .filter(Boolean)
+    .slice(-normalizedLimit);
+
+  return actions.length === 0 ? null : {
+    limit: normalizedLimit,
+    actions
+  };
+}
+
 function hasStateChangedSinceDecision(snapshot, latestSnapshot) {
   const originalVersion = readNumber(snapshot.state_version);
   const latestVersion = readNumber(latestSnapshot.state_version);
@@ -1708,35 +1783,27 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
 
 function buildCommandPrompt(options, snapshot) {
   const recentHistory = buildRecentHistory(options.resolvedRunLogDir, options.recentHistoryLimit);
+  const actionMetadata = buildActionMetadata(options, snapshot);
+  const shopVisitHistory = buildShopVisitHistory(options.resolvedRunLogDir, 12);
   return JSON.stringify(
     {
-      task: "Slay the Spire 2 전투 상태를 보고 다음 행동을 JSON으로만 결정하세요.",
+      task: "Slay the Spire 2 상태를 보고 현재 legal_actions 중 실행할 행동 하나를 JSON으로만 결정하세요.",
       play_session_id: options.playSessionId,
       recent_history: recentHistory,
+      action_metadata: actionMetadata,
+      shop_visit_history: shopVisitHistory,
       response_contract: {
-        actions: [
-          {
-            type: "play_card",
-            combat_card_id: "number",
-            target_combat_id: "number|null"
-          },
-          {
-            type: "choose_card_selection",
-            card_selection_index: "number"
-          },
-          {
-            type: "confirm_card_selection"
-          }
-        ],
-        selected_action_id: "string 선택 사항",
-        reason: "짧은 이유"
+        selected_action_id: "legal_actions 배열에 있는 action_id 문자열",
+        reason: "선택 이유를 한 문장으로 설명"
       },
       rules: [
-        "legal_actions에 있는 행동만 선택하세요.",
-        "여러 카드를 쓰려면 actions 배열을 사용하세요.",
-        "카드 선택 화면에서는 selected_count, min_select, max_select를 보고 필요한 수만큼 고른 뒤 confirm_card_selection을 선택하세요.",
-        "손패 순서 대신 combat_card_id를 우선 사용하세요.",
-        "대상은 target_combat_id를 우선 사용하세요.",
+        "반드시 legal_actions에 있는 action_id 하나만 selected_action_id로 선택하세요.",
+        "actions 배열을 사용하지 마세요. LLM command 모드의 기본 계약은 단일 행동입니다.",
+        "action_metadata는 조작 절차와 화면 전환만 설명합니다. 카드, 유물, 포션의 가치 평가는 포함하지 않습니다.",
+        "상점에서 remove_card_at_shop을 고르면 다음 상태는 보통 card_selection입니다. 이후 choose_card_selection 하나를 고르고 confirm_card_selection으로 확정합니다.",
+        "card_selection에서 적절한 대상이 없고 cancel_card_selection이 legal_actions에 있으면 취소할 수 있습니다.",
+        "카드 선택 화면에서는 selected_count, min_select, max_select를 보고 다음에 필요한 카드 선택 또는 확인 행동 하나만 고르세요.",
+        "전투에서도 한 번에 카드 한 장 또는 턴 종료 하나만 선택하세요. 실행 후 상태를 다시 관찰합니다.",
         "설명 없이 JSON 객체만 출력하세요."
       ],
       state_version: snapshot.state_version,

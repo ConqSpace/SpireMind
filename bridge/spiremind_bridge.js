@@ -459,6 +459,23 @@ function resolveLegalActionForPlannedStep(stateObject, actionObject) {
     };
   }
 
+  if (actionType === "cancel_card_selection") {
+    const legalAction = getLegalActions(stateObject).find((candidate) =>
+      readTrimmedString(candidate.type) === "cancel_card_selection"
+    );
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: "현재 legal_actions에서 cancel_card_selection을 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
   if (actionType === "choose_card_selection") {
     const requestedSelectionId = readTrimmedString(actionObject.card_selection_id);
     const requestedCardId = readTrimmedString(actionObject.card_id);

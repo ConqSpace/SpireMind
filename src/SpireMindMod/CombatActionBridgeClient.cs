@@ -49,8 +49,11 @@ internal static class CombatActionBridgeClient
                 "choose_rest_site_option",
                 "proceed_rest_site",
                 "proceed_shop",
+                "buy_shop_item",
+                "remove_card_at_shop",
                 "choose_card_selection",
-                "confirm_card_selection"
+                "confirm_card_selection",
+                "cancel_card_selection"
             }
         };
 

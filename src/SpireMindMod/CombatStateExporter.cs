@@ -870,13 +870,14 @@ internal static class CombatStateExporter
         int? minSelect = ReadInt(prefs, "MinSelect", "minSelect", "_minSelect");
         int? maxSelect = ReadInt(prefs, "MaxSelect", "maxSelect", "_maxSelect");
         object? prompt = FindMemberValue(prefs, "Prompt", "prompt", "_prompt");
+        string? promptText = ReadFormattedText(prompt);
         object? confirmButton = FindCardSelectionConfirmButton(cardSelectionScreen);
 
         return new Dictionary<string, object?>
         {
             ["screen_type"] = cardSelectionScreen.GetType().FullName ?? cardSelectionScreen.GetType().Name,
-            ["selection_kind"] = InferCardSelectionKind(cardSelectionScreen),
-            ["prompt"] = ReadFormattedText(prompt),
+            ["selection_kind"] = InferCardSelectionKind(cardSelectionScreen, promptText),
+            ["prompt"] = promptText,
             ["min_select"] = minSelect,
             ["max_select"] = maxSelect,
             ["selected_count"] = selectedCards.Count,
@@ -886,8 +887,14 @@ internal static class CombatStateExporter
         };
     }
 
-    private static string InferCardSelectionKind(object cardSelectionScreen)
+    private static string InferCardSelectionKind(object cardSelectionScreen, string? prompt)
     {
+        if (!string.IsNullOrWhiteSpace(prompt)
+            && ContainsAny(prompt, "Remove", "Removal", "Purge", "제거"))
+        {
+            return "remove";
+        }
+
         string typeName = cardSelectionScreen.GetType().FullName ?? cardSelectionScreen.GetType().Name;
         if (typeName.Contains("Enchant", StringComparison.OrdinalIgnoreCase))
         {
@@ -930,7 +937,10 @@ internal static class CombatStateExporter
             string name = ReadDictionaryString(cardState, "name")
                 ?? ReadCardName(card)
                 ?? GetReadableName(card);
-            string cardSelectionId = SanitizeActionId($"card_selection_{index}_{name}");
+            string cardId = ReadDictionaryString(cardState, "card_id")
+                ?? ReadString(card, "Id", "id", "_id")
+                ?? name;
+            string cardSelectionId = SanitizeActionId($"card_selection_{index}_{cardId}");
             cardState["card_selection_id"] = cardSelectionId;
             cardState["card_selection_index"] = index;
             cardState["selected"] = IsCardSelected(card, selectedCards);
@@ -1074,6 +1084,16 @@ internal static class CombatStateExporter
                 ["validation_note"] = "A card selection is already active."
             });
         }
+
+        actions.Add(new Dictionary<string, object?>
+        {
+            ["action_id"] = "cancel_card_selection",
+            ["type"] = "cancel_card_selection",
+            ["selection_kind"] = selectionKind,
+            ["selected_count"] = selectedCount,
+            ["summary"] = "Cancel the current card selection and return to the previous screen when the UI supports it.",
+            ["validation_note"] = "Visible card selection screen cancel/back action."
+        });
 
         return actions;
     }
@@ -1536,7 +1556,8 @@ internal static class CombatStateExporter
         AddRoot(roots, managerCombatState);
         ObjectGraph graph = ObjectGraph.Collect(roots, 3, 320);
 
-        Dictionary<string, object?> shop = BuildShopScreenState(shopScreen, graph);
+        Dictionary<string, object?> playerState = player is null ? new Dictionary<string, object?>() : BuildPlayer(player);
+        Dictionary<string, object?> shop = BuildShopScreenState(shopScreen, player, playerState, graph);
         List<Dictionary<string, object?>> items = ReadDictionaryList(shop, "items");
 
         return new Dictionary<string, object?>
@@ -1546,7 +1567,7 @@ internal static class CombatStateExporter
             ["state_id"] = "shop_pending",
             ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             ["run"] = BuildRun(runState ?? managerCombatState ?? shopScreen, graph),
-            ["player"] = player is null ? new Dictionary<string, object?>() : BuildPlayer(player),
+            ["player"] = playerState,
             ["piles"] = BuildEmptyPiles(),
             ["enemies"] = new List<Dictionary<string, object?>>(),
             ["shop"] = shop,
@@ -1599,14 +1620,29 @@ internal static class CombatStateExporter
             && IsLiveVisibleControl(source);
     }
 
-    private static Dictionary<string, object?> BuildShopScreenState(object shopScreen, ObjectGraph graph)
+    private static Dictionary<string, object?> BuildShopScreenState(
+        object shopScreen,
+        object? player,
+        Dictionary<string, object?> playerState,
+        ObjectGraph graph)
     {
         object? proceedButton = FindMemberValue(shopScreen, "_proceedButton", "proceedButton", "ProceedButton", "_continueButton", "continueButton");
-        List<Dictionary<string, object?>> items = BuildShopItems(shopScreen, graph);
+        object? inventory = FindShopInventory(shopScreen, graph);
+        object? runtimeInventory = FindRuntimeMerchantInventory(player, graph);
+        int? gold = ReadFirstInt(new[] { player, recentPlayer }, "gold", "_gold", "currentGold", "_currentGold");
+        List<Dictionary<string, object?>> items = BuildShopItems(shopScreen, runtimeInventory, graph);
+        NormalizeShopItems(items, gold, playerState);
 
         return new Dictionary<string, object?>
         {
             ["screen_type"] = shopScreen.GetType().FullName ?? shopScreen.GetType().Name,
+            ["gold"] = gold,
+            ["inventory_open"] = ReadBool(inventory, "IsOpen", "isOpen", "_isOpen") ?? ReadBool(shopScreen, "IsOpen", "isOpen", "_isOpen"),
+            ["card_removal_available"] = items.Any(IsAvailableShopRemovalService),
+            ["potion_slots"] = playerState.TryGetValue("potion_slots", out object? potionSlots) ? potionSlots : null,
+            ["filled_potion_slots"] = ReadDictionaryInt(playerState, "filled_potion_slots"),
+            ["max_potion_slots"] = ReadDictionaryInt(playerState, "max_potion_slots"),
+            ["has_open_potion_slots"] = ReadDictionaryBool(playerState, "has_open_potion_slots"),
             ["item_count"] = items.Count,
             ["items"] = items,
             ["proceed_button"] = BuildButtonState(proceedButton),
@@ -1615,11 +1651,12 @@ internal static class CombatStateExporter
         };
     }
 
-    private static List<Dictionary<string, object?>> BuildShopItems(object shopScreen, ObjectGraph graph)
+    private static List<Dictionary<string, object?>> BuildShopItems(object shopScreen, object? runtimeInventory, ObjectGraph graph)
     {
         List<Dictionary<string, object?>> items = new();
         HashSet<string> seenKeys = new(StringComparer.OrdinalIgnoreCase);
 
+        AddShopInventoryItems(runtimeInventory, items, seenKeys);
         AddShopCardItems(shopScreen, items, seenKeys);
         AddShopMerchantCardItems(shopScreen, items, seenKeys);
         AddShopItemCandidates(shopScreen, graph, items, seenKeys, "relic", "Relic");
@@ -1627,6 +1664,222 @@ internal static class CombatStateExporter
         AddShopServiceCandidates(shopScreen, graph, items, seenKeys);
 
         return items;
+    }
+
+    private static object? FindRuntimeMerchantInventory(object? player, ObjectGraph graph)
+    {
+        object? runState = FindMemberValue(player, "RunState", "runState", "_runState");
+        object? currentRoom = FindMemberValue(runState, "CurrentRoom", "currentRoom", "_currentRoom");
+        object? inventory = FindMemberValue(currentRoom, "Inventory", "inventory", "_inventory");
+        if (inventory is not null)
+        {
+            return inventory;
+        }
+
+        return graph.Nodes
+            .Select(node => node.Value)
+            .Where(value => value is not null)
+            .FirstOrDefault(value =>
+            {
+                string typeName = value!.GetType().FullName ?? value.GetType().Name;
+                return typeName.Contains("MegaCrit.Sts2.Core.Entities.Merchant.MerchantInventory", StringComparison.Ordinal);
+            });
+    }
+
+    private static object? FindShopInventory(object shopScreen, ObjectGraph graph)
+    {
+        object? directInventory = FindMemberValue(
+            shopScreen,
+            "Inventory",
+            "inventory",
+            "_inventory",
+            "MerchantInventory",
+            "merchantInventory",
+            "_merchantInventory");
+        if (directInventory is not null)
+        {
+            return directInventory;
+        }
+
+        return graph.Nodes
+            .Select(node => node.Value)
+            .Where(value => value is not null)
+            .FirstOrDefault(value =>
+            {
+                string typeName = value!.GetType().FullName ?? value.GetType().Name;
+                return ContainsAny(typeName, "MerchantInventory", "ShopInventory", "StoreInventory");
+            });
+    }
+
+    private static void AddShopInventoryItems(object? inventory, List<Dictionary<string, object?>> items, HashSet<string> seenKeys)
+    {
+        if (inventory is null)
+        {
+            return;
+        }
+
+        AddShopInventoryCardEntries(inventory, items, seenKeys, "CharacterCardEntries", "character_card");
+        AddShopInventoryCardEntries(inventory, items, seenKeys, "ColorlessCardEntries", "colorless_card");
+        AddShopInventoryModelEntries(inventory, items, seenKeys, "RelicEntries", "relic", "Model", "Relic");
+        AddShopInventoryModelEntries(inventory, items, seenKeys, "PotionEntries", "potion", "Model", "Potion");
+        AddShopInventoryRemovalEntry(inventory, items, seenKeys);
+    }
+
+    private static void AddShopInventoryCardEntries(
+        object inventory,
+        List<Dictionary<string, object?>> items,
+        HashSet<string> seenKeys,
+        string entriesMemberName,
+        string slotGroup)
+    {
+        object? entries = FindMemberValue(inventory, entriesMemberName, "_" + entriesMemberName, ToCamelCase(entriesMemberName));
+        List<object> entryList = EnumerateObjects(entries).ToList();
+        for (int index = 0; index < entryList.Count; index++)
+        {
+            object entry = entryList[index];
+            object? creationResult = FindMemberValue(entry, "CreationResult", "creationResult", "_creationResult");
+            object? card = FindMemberValue(creationResult, "Card", "card", "_card");
+            if (card is null)
+            {
+                continue;
+            }
+
+            Dictionary<string, object?> cardState = BuildCards("shop", new[] { card }).FirstOrDefault()
+                ?? new Dictionary<string, object?>();
+            string cardId = ReadDictionaryString(cardState, "card_id")
+                ?? ReadString(card, "Id", "id", "_id")
+                ?? "unknown_card";
+            string name = ReadDictionaryString(cardState, "name")
+                ?? ReadCardName(card)
+                ?? cardId;
+            string dedupeKey = $"card:{cardId}:{index}";
+            if (!seenKeys.Add(dedupeKey))
+            {
+                continue;
+            }
+
+            items.Add(BuildShopInventoryItem(
+                itemType: "card",
+                slotGroup: slotGroup,
+                slotIndex: index,
+                name: name,
+                modelId: cardId,
+                entry: entry,
+                nestedKey: "card",
+                nestedValue: cardState));
+        }
+    }
+
+    private static void AddShopInventoryModelEntries(
+        object inventory,
+        List<Dictionary<string, object?>> items,
+        HashSet<string> seenKeys,
+        string entriesMemberName,
+        string itemType,
+        string modelMemberName,
+        string fallbackTypeName)
+    {
+        object? entries = FindMemberValue(inventory, entriesMemberName, "_" + entriesMemberName, ToCamelCase(entriesMemberName));
+        List<object> entryList = EnumerateObjects(entries).ToList();
+        for (int index = 0; index < entryList.Count; index++)
+        {
+            object entry = entryList[index];
+            object? model = FindMemberValue(entry, modelMemberName, ToCamelCase(modelMemberName), "_" + ToCamelCase(modelMemberName));
+            Dictionary<string, object?>? summary = BuildItemSummary(model);
+            if (summary is null)
+            {
+                continue;
+            }
+
+            string modelId = ReadDictionaryString(summary, "id") ?? $"unknown_{itemType}";
+            string name = ReadDictionaryString(summary, "name") ?? modelId;
+            string dedupeKey = $"{itemType}:{modelId}:{name}";
+            if (!seenKeys.Add(dedupeKey))
+            {
+                continue;
+            }
+
+            items.Add(BuildShopInventoryItem(
+                itemType: itemType,
+                slotGroup: itemType,
+                slotIndex: index,
+                name: name,
+                modelId: modelId,
+                entry: entry,
+                nestedKey: itemType,
+                nestedValue: summary,
+                fallbackTypeName: fallbackTypeName));
+        }
+    }
+
+    private static void AddShopInventoryRemovalEntry(object inventory, List<Dictionary<string, object?>> items, HashSet<string> seenKeys)
+    {
+        object? entry = FindMemberValue(inventory, "CardRemovalEntry", "cardRemovalEntry", "_cardRemovalEntry");
+        if (entry is null || !seenKeys.Add("service:CARD_REMOVAL:0"))
+        {
+            return;
+        }
+
+        items.Add(BuildShopInventoryItem(
+            itemType: "service",
+            slotGroup: "service",
+            slotIndex: 0,
+            name: "Card Removal",
+            modelId: "CARD_REMOVAL",
+            entry: entry,
+            nestedKey: null,
+            nestedValue: null,
+            fallbackTypeName: "CardRemoval"));
+    }
+
+    private static Dictionary<string, object?> BuildShopInventoryItem(
+        string itemType,
+        string slotGroup,
+        int slotIndex,
+        string name,
+        string modelId,
+        object entry,
+        string? nestedKey,
+        object? nestedValue,
+        string? fallbackTypeName = null)
+    {
+        Dictionary<string, object?> item = new()
+        {
+            ["shop_item_id"] = SanitizeActionId($"{slotGroup}_{slotIndex}_{modelId}"),
+            ["shop_item_index"] = 0,
+            ["item_type"] = itemType,
+            ["kind"] = itemType,
+            ["name"] = name,
+            ["model_id"] = modelId,
+            ["price"] = ReadPrice(entry),
+            ["cost"] = ReadPrice(entry),
+            ["sold_out"] = ReadBool(entry, "SoldOut", "soldOut", "_soldOut", "IsSoldOut", "isSoldOut", "_isSoldOut"),
+            ["is_stocked"] = ReadBool(entry, "IsStocked", "isStocked", "_isStocked") ?? ReadBool(entry, "SoldOut", "soldOut", "_soldOut") != true,
+            ["is_affordable"] = ReadBool(entry, "EnoughGold", "enoughGold", "_enoughGold", "CanAfford", "canAfford", "_canAfford"),
+            ["is_on_sale"] = ReadBool(entry, "IsOnSale", "isOnSale", "_isOnSale"),
+            ["slot_group"] = slotGroup,
+            ["slot_index"] = slotIndex,
+            ["locator_id"] = $"{slotGroup}:{slotIndex}",
+            ["entry_type"] = entry.GetType().FullName ?? entry.GetType().Name,
+            ["model_type"] = fallbackTypeName
+        };
+
+        if (!string.IsNullOrWhiteSpace(nestedKey) && nestedValue is not null)
+        {
+            item[nestedKey] = nestedValue;
+        }
+
+        return item;
+    }
+
+    private static string ToCamelCase(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return value;
+        }
+
+        return char.ToLowerInvariant(value[0]) + value[1..];
     }
 
     private static void AddShopCardItems(object shopScreen, List<Dictionary<string, object?>> items, HashSet<string> seenKeys)
@@ -1868,9 +2121,154 @@ internal static class CombatStateExporter
         return source is null ? null : IsLiveVisibleControl(source);
     }
 
+    private static void NormalizeShopItems(
+        List<Dictionary<string, object?>> items,
+        int? gold,
+        Dictionary<string, object?> playerState)
+    {
+        bool? hasOpenPotionSlots = ReadDictionaryBool(playerState, "has_open_potion_slots");
+        Dictionary<string, int> nextSlotByKind = new(StringComparer.OrdinalIgnoreCase);
+        for (int index = 0; index < items.Count; index++)
+        {
+            Dictionary<string, object?> item = items[index];
+            string kind = ReadDictionaryString(item, "kind")
+                ?? ReadDictionaryString(item, "item_type")
+                ?? "unknown";
+            string slotGroup = BuildShopSlotGroup(kind);
+            int slotIndex = nextSlotByKind.TryGetValue(slotGroup, out int nextIndex) ? nextIndex : 0;
+            nextSlotByKind[slotGroup] = slotIndex + 1;
+
+            int? cost = ReadDictionaryInt(item, "cost") ?? ReadDictionaryInt(item, "price");
+            bool isStocked = ReadDictionaryBool(item, "is_stocked") ?? ReadDictionaryBool(item, "sold_out") != true;
+            bool isAffordable = cost is not null && gold is not null && gold.Value >= cost.Value;
+            string modelId = BuildShopItemModelId(item, kind);
+
+            item["kind"] = kind;
+            item["model_id"] = modelId;
+            item["cost"] = cost;
+            item["is_stocked"] = isStocked;
+            item["is_affordable"] = isAffordable;
+            bool potionSlotAllowsPurchase = !kind.Equals("potion", StringComparison.OrdinalIgnoreCase)
+                || hasOpenPotionSlots != false;
+            item["is_purchase_legal_now"] = isStocked && isAffordable && potionSlotAllowsPurchase && kind != "unknown";
+            if (kind.Equals("potion", StringComparison.OrdinalIgnoreCase) && hasOpenPotionSlots == false)
+            {
+                item["purchase_blocked_reason"] = "potion_slots_full";
+            }
+            item["slot_group"] = slotGroup;
+            item["slot_index"] = slotIndex;
+            item["locator_id"] = $"{slotGroup}:{slotIndex}";
+            item["shop_item_index"] = index;
+            item["shop_item_id"] = SanitizeActionId($"{slotGroup}_{slotIndex}_{modelId}");
+        }
+    }
+
+    private static string BuildShopSlotGroup(string kind)
+    {
+        if (kind.Equals("card", StringComparison.OrdinalIgnoreCase))
+        {
+            return "card";
+        }
+
+        if (kind.Equals("relic", StringComparison.OrdinalIgnoreCase))
+        {
+            return "relic";
+        }
+
+        if (kind.Equals("potion", StringComparison.OrdinalIgnoreCase))
+        {
+            return "potion";
+        }
+
+        if (kind.Equals("service", StringComparison.OrdinalIgnoreCase))
+        {
+            return "service";
+        }
+
+        return "unknown";
+    }
+
+    private static string BuildShopItemModelId(Dictionary<string, object?> item, string kind)
+    {
+        if (kind.Equals("card", StringComparison.OrdinalIgnoreCase)
+            && item.TryGetValue("card", out object? cardValue)
+            && cardValue is Dictionary<string, object?> card)
+        {
+            return ReadDictionaryString(card, "card_id")
+                ?? ReadDictionaryString(card, "instance_id")
+                ?? ReadDictionaryString(item, "name")
+                ?? "unknown_card";
+        }
+
+        if (item.TryGetValue(kind, out object? nestedValue)
+            && nestedValue is Dictionary<string, object?> nested)
+        {
+            return ReadDictionaryString(nested, "id")
+                ?? ReadDictionaryString(nested, "name")
+                ?? ReadDictionaryString(item, "name")
+                ?? $"unknown_{kind}";
+        }
+
+        return ReadDictionaryString(item, "name") ?? $"unknown_{kind}";
+    }
+
+    private static bool IsAvailableShopRemovalService(Dictionary<string, object?> item)
+    {
+        string kind = ReadDictionaryString(item, "kind") ?? ReadDictionaryString(item, "item_type") ?? string.Empty;
+        if (!kind.Equals("service", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        string name = ReadDictionaryString(item, "name") ?? string.Empty;
+        string nodeType = ReadDictionaryString(item, "node_type") ?? string.Empty;
+        return ReadDictionaryBool(item, "sold_out") != true
+            && (ContainsAny(name, "Remove", "Removal", "Purge", "제거")
+                || ContainsAny(nodeType, "Remove", "Removal", "Purge"));
+    }
+
     private static List<Dictionary<string, object?>> BuildShopLegalActions(List<Dictionary<string, object?>> items, bool canProceed)
     {
         List<Dictionary<string, object?>> actions = new();
+        foreach (Dictionary<string, object?> item in items)
+        {
+            if (ReadDictionaryBool(item, "is_purchase_legal_now") != true)
+            {
+                continue;
+            }
+
+            string kind = ReadDictionaryString(item, "kind") ?? string.Empty;
+            string shopItemId = ReadDictionaryString(item, "shop_item_id") ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(shopItemId))
+            {
+                continue;
+            }
+
+            string modelId = ReadDictionaryString(item, "model_id") ?? shopItemId;
+            string name = ReadDictionaryString(item, "name") ?? modelId;
+            int? cost = ReadDictionaryInt(item, "cost");
+            string actionType = kind.Equals("service", StringComparison.OrdinalIgnoreCase)
+                ? "remove_card_at_shop"
+                : "buy_shop_item";
+
+            actions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = SanitizeActionId($"{actionType}_{shopItemId}"),
+                ["type"] = actionType,
+                ["shop_item_id"] = shopItemId,
+                ["kind"] = kind,
+                ["model_id"] = modelId,
+                ["cost"] = cost,
+                ["slot_group"] = ReadDictionaryString(item, "slot_group"),
+                ["slot_index"] = ReadDictionaryInt(item, "slot_index"),
+                ["locator_id"] = ReadDictionaryString(item, "locator_id"),
+                ["summary"] = actionType == "remove_card_at_shop"
+                    ? $"Use shop card removal service for {cost?.ToString() ?? "unknown"} gold."
+                    : $"Buy {name} for {cost?.ToString() ?? "unknown"} gold.",
+                ["validation_note"] = "Executor must re-read the current merchant inventory and verify slot, model_id, cost, stock, and gold before applying."
+            });
+        }
+
         if (canProceed)
         {
             actions.Add(new Dictionary<string, object?>
@@ -2221,12 +2619,55 @@ internal static class CombatStateExporter
         string fallbackName = GetReadableName(source);
         return new Dictionary<string, object?>
         {
-            ["id"] = ReadString(source, "id", "_id", "key", "_key") ?? fallbackName,
-            ["name"] = ReadString(source, "name", "_name", "displayName", "_displayName", "title", "_title") ?? fallbackName,
-            ["description"] = TryReadFormattedDescription(source) ?? ReadString(source, "description", "_description", "desc", "_desc", "tooltip", "toolTip"),
+            ["id"] = ReadModelIdentifier(source) ?? fallbackName,
+            ["name"] = ReadDisplayText(source, "Name", "name", "_name", "DisplayName", "displayName", "_displayName", "Title", "title", "_title") ?? fallbackName,
+            ["description"] = ReadItemDescription(source),
             ["rarity"] = ReadString(source, "rarity", "_rarity", "relicRarity", "potionRarity"),
             ["type_name"] = source.GetType().FullName ?? source.GetType().Name
         };
+    }
+
+    private static string? ReadModelIdentifier(object? source)
+    {
+        object? id = FindMemberValue(source, "Id", "id", "_id", "Key", "key", "_key");
+        object? entry = FindMemberValue(id, "Entry", "entry", "_entry");
+        string? entryText = entry is null ? null : ReadObjectString(entry);
+        if (!string.IsNullOrWhiteSpace(entryText))
+        {
+            return entryText;
+        }
+
+        string? idText = id is null ? null : ReadObjectString(id);
+        return string.IsNullOrWhiteSpace(idText) ? null : idText;
+    }
+
+    private static string? ReadDisplayText(object? source, params string[] names)
+    {
+        object? value = FindMemberValue(source, names);
+        return ReadFormattedText(value) ?? (value is null ? null : ReadObjectString(value));
+    }
+
+    private static string? ReadItemDescription(object? source)
+    {
+        string? direct = TryReadFormattedDescription(source)
+            ?? ReadDisplayText(source, "Tooltip", "tooltip", "_tooltip", "ToolTip", "toolTip")
+            ?? ReadString(source, "description", "_description", "desc", "_desc", "tooltip", "toolTip");
+        if (!string.IsNullOrWhiteSpace(direct))
+        {
+            return direct;
+        }
+
+        foreach (string methodName in new[] { "GetDescription", "GetFormattedDescription", "GetTooltip", "GetToolTip" })
+        {
+            object? value = TryInvokeMethod(source, methodName);
+            string? text = ReadFormattedText(value);
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                return text;
+            }
+        }
+
+        return null;
     }
 
     private static List<Dictionary<string, object?>> BuildRewardLegalActions(List<Dictionary<string, object?>> rewards)
@@ -3059,6 +3500,7 @@ internal static class CombatStateExporter
         object? runtimeCreature = FindMemberValue(player, "Creature", "creature", "_creature")
             ?? FindMemberValue(recentPlayer, "Creature", "creature", "_creature");
         PowerGroups powerGroups = BuildPowerGroups(player, playerCombatState, recentPlayer, runtimeCreature);
+        Dictionary<string, object?> potionSlotState = BuildPotionSlotState(player, recentPlayer);
 
         return new Dictionary<string, object?>
         {
@@ -3069,9 +3511,54 @@ internal static class CombatStateExporter
             ["energy"] = ReadFirstInt(new[] { playerCombatState, player, recentPlayer }, "energy", "_energy", "currentEnergy", "_currentEnergy"),
             ["max_energy"] = ReadFirstInt(new[] { playerCombatState, player, recentPlayer }, "maxEnergy", "_maxEnergy", "energyMax", "_energyMax"),
             ["gold"] = ReadFirstInt(new[] { player, recentPlayer }, "gold", "_gold", "currentGold", "_currentGold"),
+            ["potion_slots"] = potionSlotState["potion_slots"],
+            ["filled_potion_slots"] = potionSlotState["filled_potion_slots"],
+            ["max_potion_slots"] = potionSlotState["max_potion_slots"],
+            ["has_open_potion_slots"] = potionSlotState["has_open_potion_slots"],
             ["buffs"] = powerGroups.Buffs,
             ["debuffs"] = powerGroups.Debuffs,
             ["powers_unknown"] = powerGroups.Unknown
+        };
+    }
+
+    private static Dictionary<string, object?> BuildPotionSlotState(params object?[] sources)
+    {
+        object? slotsSource = sources
+            .Select(source => FindMemberValue(
+                source,
+                "PotionSlots",
+                "potionSlots",
+                "_potionSlots",
+                "Potions",
+                "potions",
+                "_potions"))
+            .FirstOrDefault(value => value is not null);
+
+        List<Dictionary<string, object?>> slots = new();
+        if (slotsSource is IEnumerable enumerable && slotsSource is not string)
+        {
+            int index = 0;
+            foreach (object? slot in enumerable)
+            {
+                Dictionary<string, object?>? potion = BuildItemSummary(slot);
+                slots.Add(new Dictionary<string, object?>
+                {
+                    ["slot_index"] = index,
+                    ["empty"] = potion is null,
+                    ["potion"] = potion
+                });
+                index++;
+            }
+        }
+
+        int maxSlots = slots.Count;
+        int filledSlots = slots.Count(slot => ReadDictionaryBool(slot, "empty") == false);
+        return new Dictionary<string, object?>
+        {
+            ["potion_slots"] = slots,
+            ["filled_potion_slots"] = maxSlots == 0 ? null : filledSlots,
+            ["max_potion_slots"] = maxSlots == 0 ? null : maxSlots,
+            ["has_open_potion_slots"] = maxSlots == 0 ? null : filledSlots < maxSlots
         };
     }
 
@@ -4800,13 +5287,14 @@ internal static class CombatStateExporter
         List<Dictionary<string, object?>> result = new();
         foreach (object relic in relics)
         {
-            string fallbackName = GetReadableName(relic);
+            Dictionary<string, object?> summary = BuildItemSummary(relic)
+                ?? new Dictionary<string, object?>();
             result.Add(new Dictionary<string, object?>
             {
-                ["id"] = ReadString(relic, "id", "relicId", "key") ?? fallbackName,
-                ["name"] = ReadString(relic, "name", "displayName", "title") ?? fallbackName,
-                ["description"] = ReadString(relic, "description", "desc", "tooltip", "toolTip"),
-                ["rarity"] = ReadString(relic, "rarity", "relicRarity"),
+                ["id"] = ReadDictionaryString(summary, "id") ?? GetReadableName(relic),
+                ["name"] = ReadDictionaryString(summary, "name") ?? GetReadableName(relic),
+                ["description"] = ReadDictionaryString(summary, "description"),
+                ["rarity"] = ReadDictionaryString(summary, "rarity"),
                 ["counter"] = ReadInt(relic, "counter", "count", "charges", "uses", "value")
             });
         }
