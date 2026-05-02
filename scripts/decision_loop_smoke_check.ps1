@@ -70,7 +70,13 @@ function Send-ActionClaim {
             "claim_potion_reward",
             "choose_card_reward",
             "skip_card_reward",
-            "proceed_reward_screen"
+            "proceed_reward_screen",
+            "choose_map_node",
+            "choose_event_option",
+            "choose_rest_site_option",
+            "proceed_rest_site",
+            "choose_card_selection",
+            "confirm_card_selection"
         )
     } | ConvertTo-Json -Depth 8
 
@@ -529,7 +535,13 @@ try {
             "claim_potion_reward",
             "choose_card_reward",
             "skip_card_reward",
-            "proceed_reward_screen"
+            "proceed_reward_screen",
+            "choose_map_node",
+            "choose_event_option",
+            "choose_rest_site_option",
+            "proceed_rest_site",
+            "choose_card_selection",
+            "confirm_card_selection"
         )
     } | ConvertTo-Json -Depth 8
     $staleClaim = Invoke-RestMethod `

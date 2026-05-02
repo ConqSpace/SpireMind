@@ -242,6 +242,34 @@ internal static class CombatActionExecutor
             {
                 applied = TryExecutePlayCard(legalAction, context.CombatRoot, out detail);
             }
+            else if (legalAction.ActionType.Equals("choose_event_option", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecuteEventOption(legalAction, context.CombatRoot, out detail);
+            }
+            else if (legalAction.ActionType.Equals("choose_rest_site_option", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecuteRestSiteOption(legalAction, context.CombatRoot, out detail);
+            }
+            else if (legalAction.ActionType.Equals("proceed_rest_site", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecuteRestSiteProceed(context.CombatRoot, out detail);
+            }
+            else if (legalAction.ActionType.Equals("proceed_shop", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecuteShopProceed(context.CombatRoot, out detail);
+            }
+            else if (legalAction.ActionType.Equals("choose_card_selection", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecuteCardSelectionChoice(legalAction, context.CombatRoot, out detail);
+            }
+            else if (legalAction.ActionType.Equals("confirm_card_selection", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecuteCardSelectionConfirm(context.CombatRoot, out detail);
+            }
+            else if (legalAction.ActionType.Equals("choose_map_node", StringComparison.OrdinalIgnoreCase))
+            {
+                applied = TryExecuteMapNodeSelection(legalAction, context.CombatRoot, out detail);
+            }
             else
             {
                 applied = TryExecuteRewardAction(legalAction, context.CombatRoot, claim, out detail, out bool resultDeferred);
@@ -278,7 +306,316 @@ internal static class CombatActionExecutor
             || actionType.Equals("claim_potion_reward", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("choose_card_reward", StringComparison.OrdinalIgnoreCase)
             || actionType.Equals("skip_card_reward", StringComparison.OrdinalIgnoreCase)
-            || actionType.Equals("proceed_reward_screen", StringComparison.OrdinalIgnoreCase);
+            || actionType.Equals("proceed_reward_screen", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("choose_map_node", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("choose_event_option", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("choose_rest_site_option", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("proceed_rest_site", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("proceed_shop", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("choose_card_selection", StringComparison.OrdinalIgnoreCase)
+            || actionType.Equals("confirm_card_selection", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryExecuteEventOption(
+        LegalActionSnapshot legalAction,
+        object eventRoot,
+        out string detail)
+    {
+        object? eventRoom = ResolveEventRoom(eventRoot);
+        if (eventRoom is null)
+        {
+            string rootTypeName = eventRoot.GetType().FullName ?? eventRoot.GetType().Name;
+            detail = $"Event option cannot run on this screen. root={rootTypeName}";
+            return false;
+        }
+
+        if (legalAction.EventOptionIndex is null)
+        {
+            detail = "choose_event_option requires event_option_index.";
+            return false;
+        }
+
+        object? optionButton = FindEventOptionButton(eventRoom, legalAction.EventOptionIndex.Value);
+        if (optionButton is null)
+        {
+            detail = $"Event option button was not found. event_option_id={legalAction.EventOptionId ?? "<none>"}, index={legalAction.EventOptionIndex.Value}";
+            return false;
+        }
+
+        object? option = ReadNamedMember(optionButton, "Option");
+        if (ReadNamedMember(option, "IsLocked") is bool isLocked && isLocked)
+        {
+            detail = $"Event option is locked. event_option_id={legalAction.EventOptionId ?? "<none>"}, index={legalAction.EventOptionIndex.Value}";
+            return false;
+        }
+
+        if (!TryInvokeMethod(optionButton, "OnRelease", out _))
+        {
+            detail = $"Event option button release failed. event_option_id={legalAction.EventOptionId ?? "<none>"}, index={legalAction.EventOptionIndex.Value}";
+            return false;
+        }
+
+        detail = $"Event option selected. event_option_id={legalAction.EventOptionId ?? "<none>"}, index={legalAction.EventOptionIndex.Value}";
+        Logger.Info(detail);
+        return true;
+    }
+
+    private static bool TryExecuteRestSiteOption(
+        LegalActionSnapshot legalAction,
+        object restSiteRoot,
+        out string detail)
+    {
+        object? restSiteRoom = ResolveRestSiteRoom(restSiteRoot);
+        if (restSiteRoom is null)
+        {
+            string rootTypeName = restSiteRoot.GetType().FullName ?? restSiteRoot.GetType().Name;
+            detail = $"모닥불 선택지는 현재 화면에서 실행할 수 없습니다. root={rootTypeName}";
+            return false;
+        }
+
+        if (legalAction.RestOptionIndex is null)
+        {
+            detail = "choose_rest_site_option에는 rest_option_index가 필요합니다.";
+            return false;
+        }
+
+        object? optionButton = FindRestSiteOptionButton(restSiteRoom, legalAction.RestOptionIndex.Value);
+        if (optionButton is null)
+        {
+            detail = $"모닥불 선택 버튼을 찾지 못했습니다. rest_option_id={legalAction.RestOptionId ?? "<none>"}, index={legalAction.RestOptionIndex.Value}";
+            return false;
+        }
+
+        object? option = ReadNamedMember(optionButton, "Option");
+        if (ReadNamedMember(option, "IsEnabled") is bool isEnabled && !isEnabled)
+        {
+            detail = $"모닥불 선택지가 비활성 상태입니다. rest_option_id={legalAction.RestOptionId ?? "<none>"}, index={legalAction.RestOptionIndex.Value}";
+            return false;
+        }
+
+        if (!TryInvokeMethod(optionButton, "OnRelease", out _))
+        {
+            detail = $"모닥불 선택 버튼 호출에 실패했습니다. rest_option_id={legalAction.RestOptionId ?? "<none>"}, index={legalAction.RestOptionIndex.Value}";
+            return false;
+        }
+
+        detail = $"모닥불 선택지를 골랐습니다. rest_option_id={legalAction.RestOptionId ?? "<none>"}, index={legalAction.RestOptionIndex.Value}";
+        Logger.Info(detail);
+        return true;
+    }
+
+    private static bool TryExecuteRestSiteProceed(object restSiteRoot, out string detail)
+    {
+        object? restSiteRoom = ResolveRestSiteRoom(restSiteRoot);
+        if (restSiteRoom is null)
+        {
+            string rootTypeName = restSiteRoot.GetType().FullName ?? restSiteRoot.GetType().Name;
+            detail = $"모닥불 진행 버튼은 현재 화면에서 실행할 수 없습니다. root={rootTypeName}";
+            return false;
+        }
+
+        object? proceedButton = ReadNamedMember(restSiteRoom, "ProceedButton")
+            ?? ReadNamedMember(restSiteRoom, "_proceedButton");
+        if (proceedButton is null)
+        {
+            detail = "모닥불 진행 버튼을 찾지 못했습니다.";
+            return false;
+        }
+
+        if (ReadNamedMember(proceedButton, "IsEnabled") is bool isEnabled && !isEnabled)
+        {
+            detail = "모닥불 진행 버튼이 아직 비활성 상태입니다.";
+            return false;
+        }
+
+        if (!TryInvokeMethod(restSiteRoom, "OnProceedButtonReleased", out _, proceedButton))
+        {
+            detail = "모닥불 진행 버튼 호출에 실패했습니다.";
+            return false;
+        }
+
+        detail = "모닥불 진행 버튼을 눌렀습니다.";
+        Logger.Info(detail);
+        return true;
+    }
+
+    private static bool TryExecuteShopProceed(object shopRoot, out string detail)
+    {
+        object? shopRoom = ResolveShopRoom(shopRoot);
+        if (shopRoom is null)
+        {
+            string rootTypeName = shopRoot.GetType().FullName ?? shopRoot.GetType().Name;
+            detail = $"상점 진행 버튼은 현재 화면에서 실행할 수 없습니다. root={rootTypeName}";
+            return false;
+        }
+
+        object? proceedButton = ReadNamedMember(shopRoom, "ProceedButton")
+            ?? ReadNamedMember(shopRoom, "_proceedButton")
+            ?? ReadNamedMember(shopRoom, "ContinueButton")
+            ?? ReadNamedMember(shopRoom, "_continueButton");
+        if (proceedButton is null)
+        {
+            detail = "상점 진행 버튼을 찾지 못했습니다.";
+            return false;
+        }
+
+        if (ReadNamedMember(proceedButton, "IsEnabled") is bool isEnabled && !isEnabled)
+        {
+            detail = "상점 진행 버튼이 아직 비활성 상태입니다.";
+            return false;
+        }
+
+        if (!TryInvokeMethod(shopRoom, "OnProceedButtonReleased", out _, proceedButton)
+            && !TryInvokeMethod(shopRoom, "OnProceedPressed", out _, proceedButton)
+            && !TryInvokeMethod(shopRoom, "Proceed", out _))
+        {
+            detail = "상점 진행 버튼 호출에 실패했습니다.";
+            return false;
+        }
+
+        detail = "상점 진행 버튼을 눌렀습니다.";
+        Logger.Info(detail);
+        return true;
+    }
+
+    private static bool TryExecuteCardSelectionChoice(
+        LegalActionSnapshot legalAction,
+        object currentRoot,
+        out string detail)
+    {
+        object? selectionScreen = ResolveCardSelectionScreen(currentRoot);
+        if (selectionScreen is null)
+        {
+            string rootTypeName = currentRoot.GetType().FullName ?? currentRoot.GetType().Name;
+            detail = $"카드 선택 화면을 찾지 못했습니다. root={rootTypeName}";
+            return false;
+        }
+
+        if (legalAction.CardSelectionIndex is null)
+        {
+            detail = "choose_card_selection에는 card_selection_index가 필요합니다.";
+            return false;
+        }
+
+        List<object> cardHolders = FindGridCardHolders(selectionScreen);
+        int selectionIndex = legalAction.CardSelectionIndex.Value;
+        if (selectionIndex < 0 || selectionIndex >= cardHolders.Count)
+        {
+            detail = $"카드 선택 인덱스가 화면의 카드 수를 벗어났습니다. index={selectionIndex}, count={cardHolders.Count}";
+            return false;
+        }
+
+        object cardHolder = cardHolders[selectionIndex];
+        object? card = ReadCardFromHolder(cardHolder);
+        if (card is null)
+        {
+            detail = $"선택할 카드 모델을 찾지 못했습니다. index={selectionIndex}";
+            return false;
+        }
+
+        if (!TryInvokeMethod(selectionScreen, "OnCardClicked", out _, card)
+            && !TryInvokeMethod(cardHolder, "EmitSignalPressed", out _, cardHolder))
+        {
+            detail = $"카드 선택 신호를 보내지 못했습니다. card_selection_id={legalAction.CardSelectionId ?? "<none>"}, index={selectionIndex}";
+            return false;
+        }
+
+        detail = $"카드 선택을 요청했습니다. card_selection_id={legalAction.CardSelectionId ?? "<none>"}, index={selectionIndex}";
+        Logger.Info(detail);
+        return true;
+    }
+
+    private static bool TryExecuteCardSelectionConfirm(object currentRoot, out string detail)
+    {
+        object? selectionScreen = ResolveCardSelectionScreen(currentRoot);
+        if (selectionScreen is null)
+        {
+            string rootTypeName = currentRoot.GetType().FullName ?? currentRoot.GetType().Name;
+            detail = $"카드 선택 확인을 실행할 화면을 찾지 못했습니다. root={rootTypeName}";
+            return false;
+        }
+
+        if (TryInvokeMethod(selectionScreen, "CheckIfSelectionComplete", out _))
+        {
+            detail = "카드 선택 확인을 요청했습니다. method=CheckIfSelectionComplete";
+            Logger.Info(detail);
+            return true;
+        }
+
+        object? confirmButton = FindCardSelectionConfirmButton(selectionScreen);
+        if (TryInvokeMethod(selectionScreen, "CompleteSelection", out _, confirmButton))
+        {
+            detail = "카드 선택 확인을 요청했습니다. method=CompleteSelection";
+            Logger.Info(detail);
+            return true;
+        }
+
+        if (TryInvokeMethod(selectionScreen, "ConfirmSelection", out _, confirmButton))
+        {
+            detail = "카드 선택 확인을 요청했습니다. method=ConfirmSelection";
+            Logger.Info(detail);
+            return true;
+        }
+
+        if (confirmButton is not null && TryInvokeMethod(confirmButton, "OnRelease", out _))
+        {
+            detail = "카드 선택 확인 버튼을 눌렀습니다.";
+            Logger.Info(detail);
+            return true;
+        }
+
+        detail = "카드 선택 확인 메서드와 확인 버튼을 찾지 못했습니다.";
+        return false;
+    }
+
+    private static bool TryExecuteMapNodeSelection(
+        LegalActionSnapshot legalAction,
+        object mapRoot,
+        out string detail)
+    {
+        string rootTypeName = mapRoot.GetType().FullName ?? mapRoot.GetType().Name;
+        if (!rootTypeName.Contains("NMapScreen", StringComparison.OrdinalIgnoreCase))
+        {
+            detail = $"지도 행동을 실행할 수 있는 화면이 아닙니다. root={rootTypeName}";
+            return false;
+        }
+
+        if (ReadNamedMember(mapRoot, "IsTraveling") is bool isTraveling && isTraveling)
+        {
+            detail = "이미 지도 이동 중이라 새 지도 선택을 실행하지 않았습니다.";
+            return false;
+        }
+
+        bool isTravelEnabled = ReadNamedMember(mapRoot, "IsTravelEnabled") is bool travelEnabled && travelEnabled;
+        bool isDebugTravelEnabled = ReadNamedMember(mapRoot, "IsDebugTravelEnabled") is bool debugTravelEnabled && debugTravelEnabled;
+        if (!isTravelEnabled && !isDebugTravelEnabled)
+        {
+            detail = "현재 지도에서 이동 선택이 활성화되어 있지 않습니다.";
+            return false;
+        }
+
+        object? mapPoint = FindMapPointForAction(mapRoot, legalAction);
+        if (mapPoint is null)
+        {
+            detail = $"선택할 지도 노드를 찾지 못했습니다. node_id={legalAction.NodeId ?? "<none>"}, row={legalAction.MapRow?.ToString() ?? "?"}, column={legalAction.MapColumn?.ToString() ?? "?"}";
+            return false;
+        }
+
+        if (!IsMapPointSelectable(mapPoint))
+        {
+            detail = $"지도 노드가 현재 선택 가능 상태가 아닙니다. node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}";
+            return false;
+        }
+
+        if (!TryInvokeMethod(mapRoot, "OnMapPointSelectedLocally", out _, mapPoint))
+        {
+            detail = $"지도 노드 선택 호출에 실패했습니다. node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}";
+            return false;
+        }
+
+        detail = $"지도 노드 선택을 요청했습니다. node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}, row={legalAction.MapRow?.ToString() ?? "?"}, column={legalAction.MapColumn?.ToString() ?? "?"}";
+        Logger.Info(detail);
+        return true;
     }
 
     private static bool TryExecuteRewardAction(
@@ -467,6 +804,188 @@ internal static class CombatActionExecutor
             .FirstOrDefault();
     }
 
+    private static object? ResolveEventRoom(object currentRoot)
+    {
+        string rootTypeName = currentRoot.GetType().FullName ?? currentRoot.GetType().Name;
+        if (rootTypeName.Contains("NEventRoom", StringComparison.OrdinalIgnoreCase))
+        {
+            return currentRoot;
+        }
+
+        Type? eventRoomType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Nodes.Rooms.NEventRoom");
+        object? eventRoom = ReadStaticNamedMember(eventRoomType, "Instance");
+        string eventRoomTypeName = eventRoom?.GetType().FullName ?? eventRoom?.GetType().Name ?? string.Empty;
+        return eventRoomTypeName.Contains("NEventRoom", StringComparison.OrdinalIgnoreCase) ? eventRoom : null;
+    }
+
+    private static object? ResolveRestSiteRoom(object currentRoot)
+    {
+        string rootTypeName = currentRoot.GetType().FullName ?? currentRoot.GetType().Name;
+        if (rootTypeName.Contains("NRestSiteRoom", StringComparison.OrdinalIgnoreCase))
+        {
+            return currentRoot;
+        }
+
+        Type? restSiteRoomType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Nodes.Rooms.NRestSiteRoom");
+        object? restSiteRoom = ReadStaticNamedMember(restSiteRoomType, "Instance");
+        string restSiteRoomTypeName = restSiteRoom?.GetType().FullName ?? restSiteRoom?.GetType().Name ?? string.Empty;
+        return restSiteRoomTypeName.Contains("NRestSiteRoom", StringComparison.OrdinalIgnoreCase) ? restSiteRoom : null;
+    }
+
+    private static object? ResolveShopRoom(object currentRoot)
+    {
+        string rootTypeName = currentRoot.GetType().FullName ?? currentRoot.GetType().Name;
+        if (rootTypeName.Contains("Merchant", StringComparison.OrdinalIgnoreCase)
+            || rootTypeName.Contains("Shop", StringComparison.OrdinalIgnoreCase)
+            || rootTypeName.Contains("Store", StringComparison.OrdinalIgnoreCase))
+        {
+            return currentRoot;
+        }
+
+        return EnumerateNodeDescendants(currentRoot)
+            .FirstOrDefault(node =>
+            {
+                string typeName = node.GetType().FullName ?? node.GetType().Name;
+                return typeName.Contains("Merchant", StringComparison.OrdinalIgnoreCase)
+                    || typeName.Contains("Shop", StringComparison.OrdinalIgnoreCase)
+                    || typeName.Contains("Store", StringComparison.OrdinalIgnoreCase);
+            });
+    }
+
+    private static object? ResolveCardSelectionScreen(object currentRoot)
+    {
+        if (IsCardSelectionScreen(currentRoot))
+        {
+            return currentRoot;
+        }
+
+        Type? overlayStackType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Nodes.Screens.Overlays.NOverlayStack");
+        object? overlayStack = ReadStaticNamedMember(overlayStackType, "Instance");
+        object? topOverlay = null;
+        _ = TryInvokeMethod(overlayStack, "Peek", out topOverlay);
+        if (IsCardSelectionScreen(topOverlay))
+        {
+            return topOverlay;
+        }
+
+        Type? screenContextType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext");
+        object? screenContext = ReadStaticNamedMember(screenContextType, "Instance");
+        object? currentScreen = null;
+        _ = TryInvokeMethod(screenContext, "GetCurrentScreen", out currentScreen);
+        return IsCardSelectionScreen(currentScreen) ? currentScreen : null;
+    }
+
+    private static bool IsCardSelectionScreen(object? source)
+    {
+        if (source is null)
+        {
+            return false;
+        }
+
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        return ContainsAny(
+            typeName,
+            "NDeckEnchantSelectScreen",
+            "NDeckUpgradeSelectScreen",
+            "NDeckTransformSelectScreen",
+            "NDeckCardSelectScreen");
+    }
+
+    private static object? FindEventOptionButton(object eventRoom, int optionIndex)
+    {
+        object? layout = ReadNamedMember(eventRoom, "Layout");
+        List<object> optionButtons = ExpandValue(ReadNamedMember(layout, "OptionButtons"))
+            .Where(IsEventOptionButton)
+            .ToList();
+
+        if (optionButtons.Count == 0)
+        {
+            optionButtons = EnumerateNodeDescendants(eventRoom)
+                .Where(IsEventOptionButton)
+                .ToList();
+        }
+
+        return optionButtons.FirstOrDefault(button => ReadInt(button, "Index") == optionIndex)
+            ?? optionButtons.Skip(optionIndex).FirstOrDefault();
+    }
+
+    private static object? FindRestSiteOptionButton(object restSiteRoom, int optionIndex)
+    {
+        return EnumerateNodeDescendants(restSiteRoom)
+            .Where(IsRestSiteButton)
+            .Skip(optionIndex)
+            .FirstOrDefault();
+    }
+
+    private static bool IsEventOptionButton(object value)
+    {
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return typeName.Contains("NEventOptionButton", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsRestSiteButton(object value)
+    {
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return typeName.Contains("NRestSiteButton", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static object? FindMapPointForAction(object mapScreen, LegalActionSnapshot legalAction)
+    {
+        object? mapPointDictionary = ReadNamedMember(mapScreen, "_mapPointDictionary");
+        IEnumerable<object> mapPointCandidates = ExpandValue(ReadNamedMember(mapPointDictionary, "Values"))
+            .Where(value => !IsScalar(value.GetType()));
+
+        if (!mapPointCandidates.Any())
+        {
+            mapPointCandidates = EnumerateNodeDescendants(mapScreen)
+                .Where(value => (value.GetType().FullName ?? value.GetType().Name).Contains("NMapPoint", StringComparison.OrdinalIgnoreCase));
+        }
+
+        return mapPointCandidates.FirstOrDefault(candidate => IsSameMapPoint(candidate, legalAction));
+    }
+
+    private static bool IsSameMapPoint(object mapPoint, LegalActionSnapshot legalAction)
+    {
+        string nodeId = BuildMapNodeId(mapPoint);
+        if (!string.IsNullOrWhiteSpace(legalAction.NodeId)
+            && string.Equals(nodeId, legalAction.NodeId, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        (int? row, int? column) = ReadMapPointCoord(mapPoint);
+        return row is not null
+            && column is not null
+            && legalAction.MapRow == row
+            && legalAction.MapColumn == column;
+    }
+
+    private static bool IsMapPointSelectable(object mapPoint)
+    {
+        if (ReadNamedMember(mapPoint, "IsEnabled") is bool isEnabled)
+        {
+            return isEnabled;
+        }
+
+        string? state = ReadNamedMember(mapPoint, "State")?.ToString();
+        return string.Equals(state, "Travelable", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string BuildMapNodeId(object mapPoint)
+    {
+        (int? row, int? column) = ReadMapPointCoord(mapPoint);
+        return row is null || column is null ? "map_unknown" : $"map_r{row.Value}_c{column.Value}";
+    }
+
+    private static (int? row, int? column) ReadMapPointCoord(object mapPoint)
+    {
+        object? point = ReadNamedMember(mapPoint, "Point");
+        object? coord = ReadNamedMember(point, "coord") ?? ReadNamedMember(point, "Coord");
+        int? column = ReadInt(coord, "col") ?? ReadInt(coord, "Col") ?? ReadInt(coord, "column") ?? ReadInt(coord, "Column");
+        int? row = ReadInt(coord, "row") ?? ReadInt(coord, "Row");
+        return (row, column);
+    }
+
     private static bool TryParseRewardIndex(string? rewardId, out int rewardIndex)
     {
         rewardIndex = -1;
@@ -516,6 +1035,22 @@ internal static class CombatActionExecutor
             .ToList();
     }
 
+    private static List<object> FindGridCardHolders(object selectionScreen)
+    {
+        object? grid = ReadNamedMember(selectionScreen, "_grid");
+        List<object> cardHolders = EnumerateNodeDescendants(grid)
+            .Where(IsGridCardHolder)
+            .ToList();
+        if (cardHolders.Count > 0)
+        {
+            return cardHolders;
+        }
+
+        return EnumerateNodeDescendants(selectionScreen)
+            .Where(IsGridCardHolder)
+            .ToList();
+    }
+
     private static IEnumerable<object> EnumerateNodeDescendants(object? node)
     {
         if (node is null)
@@ -544,6 +1079,45 @@ internal static class CombatActionExecutor
         string typeName = value.GetType().FullName ?? value.GetType().Name;
         return typeName.Contains("NCardHolder", StringComparison.OrdinalIgnoreCase)
             || typeName.Contains("NGridCardHolder", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsGridCardHolder(object value)
+    {
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return typeName.Contains("NGridCardHolder", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static object? ReadCardFromHolder(object cardHolder)
+    {
+        object? cardModel = ReadNamedMember(cardHolder, "CardModel")
+            ?? ReadNamedMember(cardHolder, "_baseCard");
+        if (cardModel is not null)
+        {
+            return cardModel;
+        }
+
+        object? cardNode = ReadNamedMember(cardHolder, "CardNode");
+        return ReadNamedMember(cardNode, "Model") ?? cardNode;
+    }
+
+    private static object? FindCardSelectionConfirmButton(object selectionScreen)
+    {
+        string[] memberNames =
+        {
+            "_singlePreviewConfirmButton",
+            "_multiPreviewConfirmButton",
+            "_previewConfirmButton",
+            "_confirmButton"
+        };
+
+        List<object> buttons = memberNames
+            .Select(name => ReadNamedMember(selectionScreen, name))
+            .Where(button => button is not null)
+            .Cast<object>()
+            .ToList();
+
+        return buttons.FirstOrDefault(button => ReadNamedMember(button, "IsEnabled") is bool isEnabled && isEnabled)
+            ?? buttons.FirstOrDefault();
     }
 
     private static bool IsCompletionSourceCompleted(object completionSource)

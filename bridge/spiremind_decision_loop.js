@@ -367,11 +367,20 @@ function summarizeState(snapshot) {
   const hand = Array.isArray(piles.hand) ? piles.hand.filter(isPlainObject) : [];
   const enemies = Array.isArray(state.enemies) ? state.enemies.filter(isPlainObject) : [];
   const legalActions = Array.isArray(state.legal_actions) ? state.legal_actions.filter(isPlainObject) : [];
+  const gameOver = isPlainObject(state.game_over) ? state.game_over : null;
 
   return {
     state_version: readNumber(snapshot.state_version),
     state_id: typeof snapshot.state_id === "string" ? snapshot.state_id : state.state_id || null,
     phase: typeof state.phase === "string" ? state.phase : null,
+    terminal: gameOver
+      ? {
+          result: typeof gameOver.result === "string" ? gameOver.result : null,
+          is_victory: gameOver.is_victory === true ? true : (gameOver.is_victory === false ? false : null),
+          score: readNumber(gameOver.score),
+          floor: readNumber(gameOver.floor)
+        }
+      : null,
     player: {
       hp: readNumber(player.hp),
       max_hp: readNumber(player.max_hp),
@@ -561,6 +570,18 @@ function classifyCombatReadiness(snapshot) {
       readyForDecision: false,
       shouldStop: false,
       reason: "state_missing"
+    };
+  }
+
+  if (phase === "game_over" || phase === "run_finished") {
+    const terminalResult = stateSummary.terminal && typeof stateSummary.terminal.result === "string"
+      ? stateSummary.terminal.result
+      : phase;
+    return {
+      stateSummary,
+      readyForDecision: false,
+      shouldStop: true,
+      reason: `terminal:${terminalResult}`
     };
   }
 
@@ -1067,7 +1088,11 @@ function createCombatOutcome(options, progress, endStateSummary, reason, decisio
   return {
     play_session_id: options.playSessionId,
     reason,
-    result: reason === "player_defeated"
+    result: String(reason).startsWith("terminal:victory")
+      ? "victory"
+      : String(reason).startsWith("terminal:defeat")
+      ? "defeat"
+      : reason === "player_defeated"
       ? "defeat"
       : (reason === "no_live_enemies" || String(reason).startsWith("non_combat_phase:") ? "cleared_or_transitioned" : "stopped"),
     started_at: progress ? progress.started_at : null,
@@ -1281,6 +1306,220 @@ function readNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function scoreFutureOfPotionsOption(legalAction) {
+  const text = [
+    legalAction.description,
+    legalAction.summary,
+    legalAction.title
+  ].filter((value) => typeof value === "string").join(" ");
+
+  if (text.includes("약화 포션")) {
+    return 10;
+  }
+
+  if (text.includes("폭발성 앰플")) {
+    return 30;
+  }
+
+  return 20;
+}
+
+function chooseCardSelectionDecision(state, legalActions) {
+  const cardSelection = isPlainObject(state.card_selection) ? state.card_selection : {};
+  const selectionKind = typeof cardSelection.selection_kind === "string"
+    ? cardSelection.selection_kind
+    : "unknown";
+  const selectedCount = readNumber(cardSelection.selected_count) ?? 0;
+  const minSelect = readNumber(cardSelection.min_select);
+  const maxSelect = readNumber(cardSelection.max_select);
+  const targetSelect = getCardSelectionTargetCount(minSelect, maxSelect);
+  const confirmAction = legalActions.find((legalAction) =>
+    legalAction.type === "confirm_card_selection" && typeof legalAction.action_id === "string"
+  );
+
+  if (selectedCount >= targetSelect && confirmAction) {
+    return {
+      selected_action_id: confirmAction.action_id,
+      reason: `휴리스틱 카드 선택 확인: ${selectionKind}, selected=${selectedCount}, target=${targetSelect}`
+    };
+  }
+
+  const chooseActions = legalActions.filter((legalAction) =>
+    legalAction.type === "choose_card_selection" && typeof legalAction.action_id === "string"
+  );
+  if (selectedCount < targetSelect && chooseActions.length > 0) {
+    const cardByActionId = buildCardSelectionCardLookup(cardSelection);
+    const selectedAction = chooseActions
+      .map((legalAction) => ({
+        legalAction,
+        score: scoreCardSelectionAction(selectionKind, legalAction, cardByActionId.get(legalAction.action_id))
+      }))
+      .sort((left, right) => right.score - left.score)[0].legalAction;
+
+    return {
+      selected_action_id: selectedAction.action_id,
+      reason: `휴리스틱 카드 선택: ${selectionKind}, ${selectedAction.name || selectedAction.card_selection_id || selectedAction.action_id}`
+    };
+  }
+
+  if (confirmAction) {
+    return {
+      selected_action_id: confirmAction.action_id,
+      reason: `휴리스틱 카드 선택 확인: ${selectionKind}, 더 선택할 후보가 없습니다.`
+    };
+  }
+
+  return null;
+}
+
+function getCardSelectionTargetCount(minSelect, maxSelect) {
+  const minimum = minSelect === null ? 1 : Math.max(0, minSelect);
+  if (maxSelect === null) {
+    return minimum;
+  }
+
+  return Math.min(minimum, Math.max(0, maxSelect));
+}
+
+function buildCardSelectionCardLookup(cardSelection) {
+  const cards = Array.isArray(cardSelection.cards)
+    ? cardSelection.cards.filter(isPlainObject)
+    : [];
+  const lookup = new Map();
+  for (const card of cards) {
+    const cardSelectionId = typeof card.card_selection_id === "string" ? card.card_selection_id : "";
+    const cardSelectionIndex = readNumber(card.card_selection_index);
+    if (cardSelectionId !== "") {
+      lookup.set(`choose_${cardSelectionId}`, card);
+    }
+    if (cardSelectionIndex !== null) {
+      lookup.set(`index:${cardSelectionIndex}`, card);
+    }
+  }
+
+  return lookup;
+}
+
+function scoreCardSelectionAction(selectionKind, legalAction, card) {
+  const normalizedKind = String(selectionKind || "").toLowerCase();
+  const cardName = readCardSelectionText(legalAction, card, "name").toLowerCase();
+  const cardId = readCardSelectionText(legalAction, card, "card_id").toUpperCase();
+  const cardType = readCardSelectionText(legalAction, card, "type").toLowerCase();
+  const rarity = readCardSelectionText(legalAction, card, "rarity").toLowerCase();
+  const cost = readNumber(card?.cost) ?? readNumber(card?.base_cost) ?? 1;
+
+  if (normalizedKind.includes("remove")) {
+    return scoreCardRemovalCandidate(cardName, cardId, cardType);
+  }
+
+  if (normalizedKind.includes("transform")) {
+    return scoreCardTransformCandidate(cardName, cardId, cardType);
+  }
+
+  if (normalizedKind.includes("upgrade") || normalizedKind.includes("enchant")) {
+    return scoreCardUpgradeCandidate(cardName, cardId, cardType, rarity, cost);
+  }
+
+  return scoreGenericCardSelectionCandidate(cardName, cardId, cardType, rarity, cost);
+}
+
+function readCardSelectionText(legalAction, card, fieldName) {
+  const actionFieldName = fieldName === "type" ? "card_type" : fieldName;
+  const actionValue = legalAction && typeof legalAction[fieldName] === "string"
+    ? legalAction[fieldName]
+    : (legalAction && typeof legalAction[actionFieldName] === "string"
+      ? legalAction[actionFieldName]
+      : "");
+  const cardFieldName = fieldName === "type" ? "card_type" : fieldName;
+  const cardValue = card && typeof card[fieldName] === "string"
+    ? card[fieldName]
+    : (card && typeof card[cardFieldName] === "string"
+      ? card[cardFieldName]
+      : "");
+  return actionValue || cardValue || "";
+}
+
+function scoreCardUpgradeCandidate(cardName, cardId, cardType, rarity, cost) {
+  let score = 0;
+  if (cardId.includes("BASH") || cardName.includes("강타")) {
+    score += 120;
+  }
+  if (cardId.includes("WHIRLWIND") || cardName.includes("소용돌이")) {
+    score += 95;
+  }
+  if (cardId.includes("PERFECTED_STRIKE") || cardName.includes("완벽한 타격")) {
+    score += 80;
+  }
+  if (cardType.includes("attack")) {
+    score += 30;
+  }
+  if (cardType.includes("skill")) {
+    score += 20;
+  }
+  if (rarity.includes("rare")) {
+    score += 25;
+  }
+  if (rarity.includes("uncommon")) {
+    score += 15;
+  }
+  score += Math.max(0, cost) * 5;
+  if (cardId.includes("STRIKE") || cardName === "타격") {
+    score -= 20;
+  }
+  if (cardId.includes("DEFEND") || cardName === "수비") {
+    score -= 15;
+  }
+
+  return score;
+}
+
+function scoreCardRemovalCandidate(cardName, cardId, cardType) {
+  let score = 0;
+  if (cardType.includes("curse") || cardId.includes("CURSE")) {
+    score += 200;
+  }
+  if (cardType.includes("status") || cardId.includes("STATUS")) {
+    score += 150;
+  }
+  if (cardId.includes("STRIKE") || cardName === "타격") {
+    score += 90;
+  }
+  if (cardId.includes("DEFEND") || cardName === "수비") {
+    score += 70;
+  }
+
+  return score;
+}
+
+function scoreCardTransformCandidate(cardName, cardId, cardType) {
+  return scoreCardRemovalCandidate(cardName, cardId, cardType);
+}
+
+function scoreGenericCardSelectionCandidate(cardName, cardId, cardType, rarity, cost) {
+  let score = 0;
+  if (cardType.includes("attack")) {
+    score += 20;
+  }
+  if (cardType.includes("skill")) {
+    score += 15;
+  }
+  if (rarity.includes("rare")) {
+    score += 30;
+  }
+  if (rarity.includes("uncommon")) {
+    score += 15;
+  }
+  score += Math.max(0, cost) * 3;
+  if (cardId.includes("STRIKE") || cardName === "타격") {
+    score -= 10;
+  }
+  if (cardId.includes("DEFEND") || cardName === "수비") {
+    score -= 8;
+  }
+
+  return score;
+}
+
 function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
   const state = snapshot.state;
   if (!isPlainObject(state)) {
@@ -1293,6 +1532,10 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
     ? state.legal_actions.filter(isPlainObject)
     : [];
   const phase = typeof state.phase === "string" ? state.phase : "";
+  if (phase === "game_over" || phase === "run_finished") {
+    return null;
+  }
+
   if (phase === "reward") {
     const preferredRewardActionTypes = [
       "claim_gold_reward",
@@ -1313,6 +1556,93 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
     }
   }
 
+  if (phase === "card_selection") {
+    return chooseCardSelectionDecision(state, legalActions);
+  }
+
+  if (phase === "event") {
+    const eventActions = legalActions.filter((legalAction) =>
+      legalAction.type === "choose_event_option" && typeof legalAction.action_id === "string"
+    );
+    const event = isPlainObject(state.event) ? state.event : {};
+    const eventId = typeof event.event_id === "string" ? event.event_id : "";
+    if (eventId === "EVENT.THE_FUTURE_OF_POTIONS") {
+      const rankedPotionActions = eventActions
+        .filter((legalAction) => legalAction.will_kill_player !== true)
+        .map((legalAction) => ({
+          legalAction,
+          score: scoreFutureOfPotionsOption(legalAction)
+        }))
+        .sort((left, right) => left.score - right.score);
+      if (rankedPotionActions.length > 0) {
+        const selected = rankedPotionActions[0].legalAction;
+        return {
+          selected_action_id: selected.action_id,
+          reason: `휴리스틱 이벤트 처리: 포션의 미래? - ${selected.description || selected.action_id}`
+        };
+      }
+    }
+
+    const eventAction = eventActions.find((legalAction) => legalAction.will_kill_player !== true)
+      || eventActions[0];
+    if (eventAction) {
+      return {
+        selected_action_id: eventAction.action_id,
+        reason: `Heuristic event option: ${eventAction.title || eventAction.event_option_id || eventAction.action_id}`
+      };
+    }
+  }
+
+  if (phase === "rest_site") {
+    const proceedAction = legalActions.find((legalAction) =>
+      legalAction.type === "proceed_rest_site" && typeof legalAction.action_id === "string"
+    );
+    const restActions = legalActions.filter((legalAction) =>
+      legalAction.type === "choose_rest_site_option" && typeof legalAction.action_id === "string"
+    );
+    const playerHp = readNumber(player.hp);
+    const playerMaxHp = readNumber(player.max_hp);
+    const shouldHeal = playerHp !== null && playerMaxHp !== null && playerHp < playerMaxHp;
+    const healAction = restActions.find((legalAction) => {
+      const text = [
+        legalAction.rest_option_id,
+        legalAction.title,
+        legalAction.description,
+        legalAction.summary
+      ].filter((value) => typeof value === "string").join(" ").toLowerCase();
+      return text.includes("heal") || text.includes("rest") || text.includes("회복") || text.includes("휴식");
+    });
+    const selectedAction = (shouldHeal ? healAction : null) || restActions[0] || proceedAction;
+    if (selectedAction) {
+      return {
+        selected_action_id: selectedAction.action_id,
+        reason: `휴리스틱 모닥불 처리: ${selectedAction.rest_option_id || selectedAction.action_id}`
+      };
+    }
+  }
+
+  if (phase === "shop") {
+    const proceedAction = legalActions.find((legalAction) =>
+      legalAction.type === "proceed_shop" && typeof legalAction.action_id === "string"
+    );
+    if (proceedAction) {
+      return {
+        selected_action_id: proceedAction.action_id,
+        reason: "휴리스틱 상점 처리: 구매 판단은 아직 보수적으로 건너뛰고 진행"
+      };
+    }
+  }
+
+  if (phase === "map") {
+    const mapAction = legalActions.find((legalAction) => legalAction.type === "choose_map_node");
+    if (mapAction && typeof mapAction.action_id === "string") {
+      return {
+        selected_action_id: mapAction.action_id,
+        reason: `휴리스틱 지도 노드 선택: ${mapAction.node_id || mapAction.action_id}`
+      };
+    }
+  }
+
   const enemies = Array.isArray(state.enemies)
     ? state.enemies.filter((enemy) => isPlainObject(enemy) && (readNumber(enemy.hp) ?? 1) > 0)
     : [];
@@ -1320,6 +1650,7 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
   const targetCombatId = primaryEnemy ? readNumber(primaryEnemy.combat_id) : null;
 
   const actions = [];
+  const usedCombatCardIds = new Set();
   for (const legalAction of legalActions) {
     if (actions.length >= maxActionsPerTurn) {
       break;
@@ -1340,11 +1671,16 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
       continue;
     }
 
+    if (usedCombatCardIds.has(combatCardId)) {
+      continue;
+    }
+
     actions.push({
       type: "play_card",
       combat_card_id: combatCardId,
       target_combat_id: actionTargetCombatId
     });
+    usedCombatCardIds.add(combatCardId);
 
     if (energy !== null && cost !== null && cost > 0) {
       energy -= cost;
@@ -1383,6 +1719,13 @@ function buildCommandPrompt(options, snapshot) {
             type: "play_card",
             combat_card_id: "number",
             target_combat_id: "number|null"
+          },
+          {
+            type: "choose_card_selection",
+            card_selection_index: "number"
+          },
+          {
+            type: "confirm_card_selection"
           }
         ],
         selected_action_id: "string 선택 사항",
@@ -1391,6 +1734,7 @@ function buildCommandPrompt(options, snapshot) {
       rules: [
         "legal_actions에 있는 행동만 선택하세요.",
         "여러 카드를 쓰려면 actions 배열을 사용하세요.",
+        "카드 선택 화면에서는 selected_count, min_select, max_select를 보고 필요한 수만큼 고른 뒤 confirm_card_selection을 선택하세요.",
         "손패 순서 대신 combat_card_id를 우선 사용하세요.",
         "대상은 target_combat_id를 우선 사용하세요.",
         "설명 없이 JSON 객체만 출력하세요."

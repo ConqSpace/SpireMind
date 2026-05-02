@@ -30,11 +30,26 @@ internal static class AutotestMainThreadTicker
         try
         {
             Interlocked.Increment(ref tickCount);
-            if (!CombatStateExporter.TryExportRewardStateIfVisible())
+            if (!CombatStateExporter.TryExportGameOverStateIfVisible())
             {
-                if (!CombatStateExporter.TryExportMapStateIfVisible())
+                if (!CombatStateExporter.TryExportCardSelectionStateIfVisible())
                 {
-                    CombatStateExporter.FlushPendingExportIfReady();
+                    if (!CombatStateExporter.TryExportEventStateIfVisible())
+                    {
+                        if (!CombatStateExporter.TryExportRewardStateIfVisible())
+                        {
+                            if (!CombatStateExporter.TryExportShopStateIfVisible())
+                            {
+                                if (!CombatStateExporter.TryExportRestSiteStateIfVisible())
+                                {
+                                    if (!CombatStateExporter.TryExportMapStateIfVisible())
+                                    {
+                                        CombatStateExporter.FlushPendingExportIfReady();
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

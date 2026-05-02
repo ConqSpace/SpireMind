@@ -76,7 +76,17 @@ internal static class CombatActionRuntimeContext
                 ReadString(action, "target_id"),
                 ReadInt(action, "target_combat_id"),
                 ReadString(action, "reward_id"),
-                ReadInt(action, "card_reward_index")));
+                ReadInt(action, "card_reward_index"),
+                ReadString(action, "node_id"),
+                ReadInt(action, "row"),
+                ReadInt(action, "column"),
+                ReadString(action, "event_option_id"),
+                ReadInt(action, "event_option_index"),
+                ReadString(action, "rest_option_id"),
+                ReadInt(action, "rest_option_index"),
+                ReadString(action, "card_selection_id"),
+                ReadInt(action, "card_selection_index"),
+                ReadString(action, "selection_kind")));
         }
 
         return actions;
@@ -139,4 +149,14 @@ internal sealed record LegalActionSnapshot(
     string? TargetId,
     int? TargetCombatId,
     string? RewardId,
-    int? CardRewardIndex);
+    int? CardRewardIndex,
+    string? NodeId,
+    int? MapRow,
+    int? MapColumn,
+    string? EventOptionId,
+    int? EventOptionIndex,
+    string? RestOptionId,
+    int? RestOptionIndex,
+    string? CardSelectionId,
+    int? CardSelectionIndex,
+    string? SelectionKind);

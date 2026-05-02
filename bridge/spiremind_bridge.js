@@ -442,6 +442,64 @@ function resolveLegalActionForPlannedStep(stateObject, actionObject) {
     };
   }
 
+  if (actionType === "confirm_card_selection") {
+    const legalAction = getLegalActions(stateObject).find((candidate) =>
+      readTrimmedString(candidate.type) === "confirm_card_selection"
+    );
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: "현재 legal_actions에서 confirm_card_selection을 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType === "choose_card_selection") {
+    const requestedSelectionId = readTrimmedString(actionObject.card_selection_id);
+    const requestedCardId = readTrimmedString(actionObject.card_id);
+    const requestedName = readTrimmedString(actionObject.name);
+    const requestedIndex = readOptionalInteger(actionObject.card_selection_index);
+    const legalAction = getLegalActions(stateObject).find((candidate) => {
+      if (readTrimmedString(candidate.type) !== "choose_card_selection") {
+        return false;
+      }
+
+      if (requestedSelectionId !== "") {
+        return readTrimmedString(candidate.card_selection_id) === requestedSelectionId;
+      }
+
+      if (requestedIndex !== null) {
+        return readOptionalInteger(candidate.card_selection_index) === requestedIndex;
+      }
+
+      if (requestedCardId !== "") {
+        return readTrimmedString(candidate.card_id) === requestedCardId;
+      }
+
+      if (requestedName !== "") {
+        return readTrimmedString(candidate.name) === requestedName;
+      }
+
+      return false;
+    });
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: "현재 legal_actions에서 요청한 choose_card_selection을 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
   if (actionType !== "play_card") {
     return {
       ok: false,

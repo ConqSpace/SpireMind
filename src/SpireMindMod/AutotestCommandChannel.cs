@@ -26,7 +26,9 @@ internal static class AutotestCommandChannel
     private static int mainThreadId;
     private static int commandInFlight;
     private static int continueRunInFlight;
+    private static int startNewRunInFlight;
     private static ContinueRunOperation? continueRunOperation;
+    private static StartNewRunOperation? startNewRunOperation;
 
     public static void Tick()
     {
@@ -51,6 +53,7 @@ internal static class AutotestCommandChannel
         }
 
         TryAdvanceContinueRunOperation();
+        TryAdvanceStartNewRunOperation();
     }
 
     private static void TryProcessCommandFile()
@@ -132,6 +135,12 @@ internal static class AutotestCommandChannel
                 return;
             }
 
+            if (command.Action.Equals("start_new_run", StringComparison.OrdinalIgnoreCase))
+            {
+                TryStartNewRun(command);
+                return;
+            }
+
             WriteCommandResult(command, "rejected", $"吏?먰븯吏 ?딅뒗 action?낅땲?? {command.Action}");
             Interlocked.Exchange(ref commandInFlight, 0);
             return;
@@ -205,6 +214,51 @@ internal static class AutotestCommandChannel
         }
 
         return true;
+    }
+
+    private static void TryStartNewRun(AutotestCommand command)
+    {
+        Dictionary<string, object?> diagnostics = CreateContinueRunDiagnostics();
+
+        if (Interlocked.CompareExchange(ref startNewRunInFlight, 1, 0) != 0)
+        {
+            WriteCommandResult(command, "rejected", "start_new_run이 이미 실행 중입니다.", diagnostics);
+            Interlocked.Exchange(ref commandInFlight, 0);
+            return;
+        }
+
+        diagnostics["start_stage"] = "press_singleplayer";
+        diagnostics["timeout_ms"] = ReadInt(command.Params, "timeout_ms") ?? StartNewRunOperation.DefaultTimeoutMs;
+        diagnostics["ready_timeout_ms"] = ReadInt(command.Params, "ready_timeout_ms") ?? StartNewRunOperation.DefaultReadyTimeoutMs;
+        diagnostics["requested_character_id"] = ReadString(command.Params, "character_id");
+
+        startNewRunOperation = new StartNewRunOperation(command, diagnostics);
+        WriteCommandResult(command, "started", "새 런 시작 UI 흐름을 준비합니다.", diagnostics);
+        Logger.Info($"start_new_run UI 경로 시작: id={command.Id}");
+        Interlocked.Exchange(ref commandInFlight, 0);
+    }
+
+    private static bool TryAdvanceStartNewRunOperation()
+    {
+        StartNewRunOperation? operation = startNewRunOperation;
+        if (operation is null)
+        {
+            return false;
+        }
+
+        bool completed = operation.Tick();
+        if (completed)
+        {
+            startNewRunOperation = null;
+        }
+
+        return true;
+    }
+
+    private static void ReleaseStartNewRunCommand()
+    {
+        Interlocked.Exchange(ref startNewRunInFlight, 0);
+        Interlocked.Exchange(ref commandInFlight, 0);
     }
 
     private static void ReleaseContinueRunCommand()
@@ -930,6 +984,36 @@ internal static class AutotestCommandChannel
         return ReadMember(source, member);
     }
 
+    private static bool TrySetInstanceMember(object? source, string memberName, object? value)
+    {
+        if (source is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            MemberInfo? member = source.GetType().GetMember(memberName, flags)
+                .FirstOrDefault(candidate => candidate is FieldInfo or PropertyInfo);
+            switch (member)
+            {
+                case FieldInfo field:
+                    field.SetValue(source, value);
+                    return true;
+                case PropertyInfo property when property.SetMethod is not null:
+                    property.SetValue(source, value);
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static object? ReadMember(object? source, MemberInfo? member)
     {
         try
@@ -1064,6 +1148,554 @@ internal static class AutotestCommandChannel
     {
         string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
         return Path.Combine(appData, "SlayTheSpire2", "SpireMind", "autotest_result.json");
+    }
+
+    private sealed class StartNewRunOperation
+    {
+        internal const int DefaultTimeoutMs = 180000;
+        internal const int DefaultReadyTimeoutMs = 120000;
+        private const int WaitStageResultIntervalMs = 1500;
+
+        private readonly AutotestCommand command;
+        private readonly Dictionary<string, object?> diagnostics;
+        private readonly long startedAtMs = Environment.TickCount64;
+        private readonly int timeoutMs;
+        private readonly int readyTimeoutMs;
+        private readonly string? requestedCharacterId;
+        private readonly string? requestedSeed;
+        private readonly bool useCustomRun;
+
+        private string stage = "press_singleplayer";
+        private long readyWaitStartedAtMs;
+        private long lastWaitStageResultAtMs;
+
+        internal StartNewRunOperation(AutotestCommand command, Dictionary<string, object?> diagnostics)
+        {
+            this.command = command;
+            this.diagnostics = diagnostics;
+            timeoutMs = ReadInt(command.Params, "timeout_ms") ?? DefaultTimeoutMs;
+            readyTimeoutMs = ReadInt(command.Params, "ready_timeout_ms") ?? DefaultReadyTimeoutMs;
+            requestedCharacterId = ReadString(command.Params, "character_id");
+            requestedSeed = NormalizeSeed(ReadString(command.Params, "seed"));
+            useCustomRun = !string.IsNullOrWhiteSpace(requestedSeed)
+                || string.Equals(ReadString(command.Params, "run_mode"), "custom", StringComparison.OrdinalIgnoreCase)
+                || ReadBool(command.Params, "custom") == true;
+            diagnostics["requested_seed"] = requestedSeed;
+            diagnostics["use_custom_run"] = useCustomRun;
+        }
+
+        internal bool Tick()
+        {
+            try
+            {
+                diagnostics["start_stage"] = stage;
+                diagnostics["elapsed_ms"] = Environment.TickCount64 - startedAtMs;
+                diagnostics["started_on_main_thread"] = IsGameMainThread();
+
+                if (timeoutMs > 0 && Environment.TickCount64 - startedAtMs > timeoutMs)
+                {
+                    Fail($"start_new_run이 {timeoutMs}ms 안에 완료되지 않았습니다.");
+                    return true;
+                }
+
+                switch (stage)
+                {
+                    case "press_singleplayer":
+                        return PressSingleplayer();
+                    case "open_run_mode_if_needed":
+                        return OpenRunModeIfNeeded();
+                    case "set_custom_seed":
+                        return SetCustomSeed();
+                    case "select_character":
+                        return SelectCharacter();
+                    case "press_confirm":
+                        return PressConfirm();
+                    case "wait_state_ready":
+                        return WaitStateReady();
+                    case "done":
+                        RefreshContinueRunDiagnostics(diagnostics);
+                        WriteCommandResult(command, "applied", "start_new_run이 정상 UI 흐름으로 런 상태까지 도달했습니다.", diagnostics);
+                        Logger.Info($"start_new_run UI 경로 완료: id={command.Id}");
+                        ReleaseStartNewRunCommand();
+                        return true;
+                    default:
+                        Fail($"알 수 없는 start_new_run 단계입니다: {stage}");
+                        return true;
+                }
+            }
+            catch (TargetInvocationException exception) when (exception.InnerException is not null)
+            {
+                RecordException(exception.InnerException);
+                Fail($"{exception.InnerException.GetType().Name}: {exception.InnerException.Message}");
+                return true;
+            }
+            catch (Exception exception)
+            {
+                RecordException(exception);
+                Fail($"{exception.GetType().Name}: {exception.Message}");
+                return true;
+            }
+        }
+
+        private bool PressSingleplayer()
+        {
+            object? nGame = ReadStaticMember(AccessTools.TypeByName("MegaCrit.Sts2.Core.Nodes.NGame"), "Instance");
+            object? runManager = ReadStaticMember(AccessTools.TypeByName("MegaCrit.Sts2.Core.Runs.RunManager"), "Instance");
+            object? mainMenu = ReadInstanceMember(nGame, "MainMenu");
+            RefreshContinueRunDiagnostics(diagnostics, nGame, mainMenu, runManager);
+
+            if (ReadInstanceMember(runManager, "IsInProgress") is bool isInProgress && isInProgress)
+            {
+                readyWaitStartedAtMs = Environment.TickCount64;
+                stage = "wait_state_ready";
+                WriteCommandResult(command, "running", "이미 런이 진행 중이므로 상태 파일 준비만 확인합니다.", diagnostics);
+                return false;
+            }
+
+            if (mainMenu is null)
+            {
+                Reject("현재 화면에서 메인 메뉴 객체를 찾을 수 없어 새 런을 시작하지 않았습니다.");
+                return true;
+            }
+
+            object? currentSubmenu = PeekMainMenuSubmenu(mainMenu);
+            string? currentSubmenuTypeName = currentSubmenu?.GetType().FullName;
+            diagnostics["initial_submenu_found"] = currentSubmenu is not null;
+            diagnostics["initial_submenu_type"] = currentSubmenuTypeName;
+            if (currentSubmenuTypeName?.Contains("NCustomRunScreen", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                stage = "set_custom_seed";
+                WriteCommandResult(command, "running", "이미 커스텀 런 화면이 열려 있어 시드 입력 단계로 이동합니다.", diagnostics);
+                return false;
+            }
+
+            if (currentSubmenuTypeName?.Contains("NCharacterSelectScreen", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                stage = useCustomRun ? "open_run_mode_if_needed" : "select_character";
+                WriteCommandResult(command, "running", "이미 캐릭터 선택 화면이 열려 있어 현재 화면에서 이어갑니다.", diagnostics);
+                return false;
+            }
+
+            if (currentSubmenuTypeName?.Contains("NSingleplayerSubmenu", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                stage = "open_run_mode_if_needed";
+                WriteCommandResult(command, "running", "이미 싱글플레이 하위 메뉴가 열려 있어 런 종류 선택 단계로 이동합니다.", diagnostics);
+                return false;
+            }
+
+            TryInvokeVoidMethod(mainMenu, "RefreshButtons");
+            object? singleplayerButton = ReadInstanceMember(mainMenu, "_singleplayerButton");
+            if (!IsButtonReady(singleplayerButton, "singleplayer_button"))
+            {
+                Reject("싱글플레이 버튼이 아직 누를 수 있는 상태가 아닙니다.");
+                return true;
+            }
+
+            MethodInfo? singleplayerPressed = FindCompatibleMethod(
+                mainMenu.GetType(),
+                "SingleplayerButtonPressed",
+                new[] { singleplayerButton!.GetType() });
+            diagnostics["singleplayer_pressed_method_found"] = singleplayerPressed is not null;
+            if (singleplayerPressed is null)
+            {
+                Fail("SingleplayerButtonPressed 메서드를 찾을 수 없습니다.");
+                return true;
+            }
+
+            singleplayerPressed.Invoke(mainMenu, new[] { singleplayerButton });
+            stage = "open_run_mode_if_needed";
+            WriteCommandResult(command, "running", "싱글플레이 메뉴 진입을 요청했습니다.", diagnostics);
+            return false;
+        }
+
+        private bool OpenRunModeIfNeeded()
+        {
+            object? mainMenu = GetMainMenu();
+            object? submenu = PeekMainMenuSubmenu(mainMenu);
+            string? submenuTypeName = submenu?.GetType().FullName;
+            diagnostics["submenu_found"] = submenu is not null;
+            diagnostics["submenu_type"] = submenuTypeName;
+            diagnostics["target_run_mode"] = useCustomRun ? "custom" : "standard";
+
+            if (submenu is null)
+            {
+                WriteRunningResultIfDue("싱글플레이 하위 메뉴가 열리기를 기다리는 중입니다.");
+                return false;
+            }
+
+            if (submenuTypeName?.Contains("NCharacterSelectScreen", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                if (useCustomRun)
+                {
+                    WriteRunningResultIfDue("커스텀 런 화면을 기다리는 중입니다.");
+                    return false;
+                }
+
+                stage = "select_character";
+                WriteCommandResult(command, "running", "캐릭터 선택 화면을 확인했습니다.", diagnostics);
+                return false;
+            }
+
+            if (submenuTypeName?.Contains("NCustomRunScreen", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                stage = "set_custom_seed";
+                WriteCommandResult(command, "running", "커스텀 런 화면을 확인했습니다.", diagnostics);
+                return false;
+            }
+
+            if (submenuTypeName?.Contains("NSingleplayerSubmenu", StringComparison.OrdinalIgnoreCase) != true)
+            {
+                WriteRunningResultIfDue($"예상한 하위 메뉴가 아닙니다. current={submenuTypeName ?? "<none>"}");
+                return false;
+            }
+
+            string buttonMemberName = useCustomRun ? "_customButton" : "_standardButton";
+            string buttonPrefix = useCustomRun ? "custom_button" : "standard_button";
+            string openMethodName = useCustomRun ? "OpenCustomScreen" : "OpenCharacterSelect";
+            object? runModeButton = ReadInstanceMember(submenu, buttonMemberName);
+            if (!IsButtonReady(runModeButton, buttonPrefix))
+            {
+                WriteRunningResultIfDue($"{(useCustomRun ? "커스텀 런" : "표준 런")} 버튼이 누를 수 있는 상태가 되기를 기다리는 중입니다.");
+                return false;
+            }
+
+            MethodInfo? openRunMode = FindCompatibleMethod(
+                submenu.GetType(),
+                openMethodName,
+                new[] { runModeButton!.GetType() });
+            diagnostics["open_run_mode_method"] = openMethodName;
+            diagnostics["open_run_mode_method_found"] = openRunMode is not null;
+            if (openRunMode is null)
+            {
+                Fail($"{openMethodName} 메서드를 찾을 수 없습니다.");
+                return true;
+            }
+
+            openRunMode.Invoke(submenu, new[] { runModeButton });
+            stage = useCustomRun ? "set_custom_seed" : "select_character";
+            WriteCommandResult(command, "running", $"{(useCustomRun ? "커스텀 런" : "표준 런")} 화면 진입을 요청했습니다.", diagnostics);
+            return false;
+        }
+
+        private bool SetCustomSeed()
+        {
+            object? customRunScreen = GetCustomRunScreen();
+            if (customRunScreen is null)
+            {
+                WriteRunningResultIfDue("커스텀 런 화면이 열리기를 기다리는 중입니다.");
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(requestedSeed))
+            {
+                diagnostics["custom_seed_skipped"] = true;
+                stage = "select_character";
+                WriteCommandResult(command, "running", "요청된 시드가 없어 커스텀 런 시드 입력을 건너뜁니다.", diagnostics);
+                return false;
+            }
+
+            object? seedInput = ReadInstanceMember(customRunScreen, "_seedInput");
+            diagnostics["seed_input_found"] = seedInput is not null;
+            diagnostics["seed_input_type"] = seedInput?.GetType().FullName;
+            if (seedInput is null)
+            {
+                WriteRunningResultIfDue("커스텀 런 시드 입력란을 찾는 중입니다.");
+                return false;
+            }
+
+            bool textSet = TrySetInstanceMember(seedInput, "Text", requestedSeed);
+            MethodInfo? submitSeed = FindCompatibleMethod(customRunScreen.GetType(), "OnSeedInputSubmitted", new[] { typeof(string) });
+            diagnostics["seed_input_text_set"] = textSet;
+            diagnostics["seed_submit_method_found"] = submitSeed is not null;
+            if (submitSeed is null)
+            {
+                Fail("OnSeedInputSubmitted(string) 메서드를 찾을 수 없습니다.");
+                return true;
+            }
+
+            submitSeed.Invoke(customRunScreen, new object?[] { requestedSeed });
+            object? lobby = ReadInstanceMember(customRunScreen, "Lobby");
+            diagnostics["custom_lobby_found"] = lobby is not null;
+            diagnostics["custom_lobby_seed"] = ReadInstanceMember(lobby, "Seed")?.ToString();
+            stage = "select_character";
+            WriteCommandResult(command, "running", $"커스텀 런 시드 입력란에 {requestedSeed}를 적용했습니다.", diagnostics);
+            return false;
+        }
+
+        private bool SelectCharacter()
+        {
+            object? characterSelect = GetRunSetupScreen();
+            if (characterSelect is null)
+            {
+                WriteRunningResultIfDue($"{(useCustomRun ? "커스텀 런" : "캐릭터 선택")} 화면이 열리기를 기다리는 중입니다.");
+                return false;
+            }
+
+            object? selectedButton = ReadInstanceMember(characterSelect, "_selectedButton");
+            if (selectedButton is null)
+            {
+                object? characterButton = FindCharacterButton(characterSelect, requestedCharacterId);
+                if (characterButton is null)
+                {
+                    WriteRunningResultIfDue("선택 가능한 캐릭터 버튼을 찾는 중입니다.");
+                    return false;
+                }
+
+                TryInvokeVoidMethod(characterButton, "UnlockIfPossible");
+                if (ReadInstanceMember(characterButton, "IsLocked") is bool isLocked && isLocked)
+                {
+                    Fail("요청한 캐릭터 버튼이 잠겨 있어 새 런을 시작할 수 없습니다.");
+                    return true;
+                }
+
+                TryInvokeVoidMethod(characterButton, "Select");
+                selectedButton = ReadInstanceMember(characterSelect, "_selectedButton") ?? characterButton;
+            }
+
+            diagnostics["selected_character_button_found"] = selectedButton is not null;
+            diagnostics["selected_character_id"] = ReadCharacterId(selectedButton);
+            stage = "press_confirm";
+            WriteCommandResult(command, "running", "캐릭터 선택을 확인했습니다.", diagnostics);
+            return false;
+        }
+
+        private bool PressConfirm()
+        {
+            object? characterSelect = GetRunSetupScreen();
+            if (characterSelect is null)
+            {
+                WriteRunningResultIfDue("확인 버튼을 누르기 전에 런 설정 화면을 기다리는 중입니다.");
+                return false;
+            }
+
+            object? confirmButton = useCustomRun
+                ? ReadInstanceMember(characterSelect, "_confirmButton")
+                : ReadInstanceMember(characterSelect, "_embarkButton");
+            if (!IsButtonReady(confirmButton, "confirm_button"))
+            {
+                WriteRunningResultIfDue("확인 버튼이 누를 수 있는 상태가 되기를 기다리는 중입니다.");
+                return false;
+            }
+
+            MethodInfo? embark = FindCompatibleMethod(characterSelect.GetType(), "OnEmbarkPressed", new[] { confirmButton!.GetType() });
+            diagnostics["embark_method_found"] = embark is not null;
+            if (embark is null)
+            {
+                Fail("OnEmbarkPressed 메서드를 찾을 수 없습니다.");
+                return true;
+            }
+
+            embark.Invoke(characterSelect, new[] { confirmButton });
+            readyWaitStartedAtMs = Environment.TickCount64;
+            stage = "wait_state_ready";
+            WriteCommandResult(command, "running", "새 런 시작 확인을 요청했습니다.", diagnostics);
+            return false;
+        }
+
+        private bool WaitStateReady()
+        {
+            long elapsedMs = Environment.TickCount64 - readyWaitStartedAtMs;
+            string? latestFilePhase = CombatStateExporter.ReadLatestStateFilePhase("start_new_run");
+            bool exportPending = CombatStateExporter.HasPendingExport;
+            bool combatInProgress = IsCombatInProgress();
+            bool combatPlayPhase = IsCombatPlayPhase();
+            CombatStateExporter.CombatExportProbe fileProbe = CombatStateExporter.ReadLatestStateFileProbe("start_new_run");
+
+            diagnostics["state_ready_elapsed_ms"] = elapsedMs;
+            diagnostics["state_ready_timeout_ms"] = readyTimeoutMs;
+            diagnostics["state_ready_file_phase"] = latestFilePhase;
+            diagnostics["state_ready_pending_export"] = exportPending;
+            diagnostics["state_ready_combat_in_progress"] = combatInProgress;
+            diagnostics["state_ready_combat_play_phase"] = combatPlayPhase;
+            diagnostics["state_ready_file_is_stable"] = fileProbe.IsStable;
+            diagnostics["state_ready_file_hand_count"] = fileProbe.HandCount;
+            diagnostics["state_ready_file_enemy_count"] = fileProbe.EnemyCount;
+
+            if (!exportPending && IsAcceptedRunPhase(latestFilePhase, fileProbe, combatPlayPhase))
+            {
+                diagnostics["state_ready_success_phase"] = latestFilePhase;
+                stage = "done";
+                WriteCommandResult(command, "running", "새 런 상태 파일이 준비된 것을 확인했습니다.", diagnostics);
+                return false;
+            }
+
+            if (elapsedMs > readyTimeoutMs)
+            {
+                Fail("새 런 상태 파일 준비 시간이 초과되었습니다.");
+                return true;
+            }
+
+            WriteRunningResultIfDue("새 런 상태 파일이 준비되기를 기다리는 중입니다.");
+            return false;
+        }
+
+        private bool IsButtonReady(object? button, string prefix)
+        {
+            bool found = button is not null;
+            bool enabled = ReadInstanceMember(button, "IsEnabled") is bool isEnabled && isEnabled;
+            bool visible = InvokeBoolMethod(button, "IsVisible") ?? false;
+            bool visibleInTree = InvokeBoolMethod(button, "IsVisibleInTree") ?? false;
+            diagnostics[$"{prefix}_found"] = found;
+            diagnostics[$"{prefix}_enabled"] = enabled;
+            diagnostics[$"{prefix}_visible"] = visible;
+            diagnostics[$"{prefix}_visible_in_tree"] = visibleInTree;
+            diagnostics[$"{prefix}_type"] = button?.GetType().FullName;
+            return found && enabled && visible && visibleInTree;
+        }
+
+        private object? GetMainMenu()
+        {
+            object? nGame = ReadStaticMember(AccessTools.TypeByName("MegaCrit.Sts2.Core.Nodes.NGame"), "Instance");
+            return ReadInstanceMember(nGame, "MainMenu");
+        }
+
+        private object? PeekMainMenuSubmenu(object? mainMenu)
+        {
+            object? submenuStack = ReadInstanceMember(mainMenu, "SubmenuStack");
+            return TryInvokeNoArgMethod(submenuStack, "Peek");
+        }
+
+        private object? GetCharacterSelectScreen()
+        {
+            object? submenu = PeekMainMenuSubmenu(GetMainMenu());
+            string? submenuTypeName = submenu?.GetType().FullName;
+            return submenuTypeName?.Contains("NCharacterSelectScreen", StringComparison.OrdinalIgnoreCase) == true
+                ? submenu
+                : null;
+        }
+
+        private object? GetCustomRunScreen()
+        {
+            object? submenu = PeekMainMenuSubmenu(GetMainMenu());
+            string? submenuTypeName = submenu?.GetType().FullName;
+            return submenuTypeName?.Contains("NCustomRunScreen", StringComparison.OrdinalIgnoreCase) == true
+                ? submenu
+                : null;
+        }
+
+        private object? GetRunSetupScreen()
+        {
+            return useCustomRun ? GetCustomRunScreen() : GetCharacterSelectScreen();
+        }
+
+        private object? FindCharacterButton(object characterSelect, string? characterId)
+        {
+            object? container = ReadInstanceMember(characterSelect, "_charButtonContainer");
+            foreach (object button in EnumerateChildren(container))
+            {
+                string? candidateId = ReadCharacterId(button);
+                bool locked = ReadInstanceMember(button, "IsLocked") is bool isLocked && isLocked;
+                bool visible = InvokeBoolMethod(button, "IsVisible") ?? true;
+                if (!visible || locked)
+                {
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(characterId) || string.Equals(candidateId, characterId, StringComparison.OrdinalIgnoreCase))
+                {
+                    diagnostics["candidate_character_id"] = candidateId;
+                    return button;
+                }
+            }
+
+            return null;
+        }
+
+        private static string? NormalizeSeed(string? seed)
+        {
+            if (string.IsNullOrWhiteSpace(seed))
+            {
+                return null;
+            }
+
+            string normalized = seed.Trim().ToUpperInvariant()
+                .Replace('O', '0')
+                .Replace('I', '1');
+            return normalized.Length == 0 ? null : normalized;
+        }
+
+        private static IEnumerable<object> EnumerateChildren(object? node)
+        {
+            object? children = TryInvokeNoArgMethod(node, "GetChildren");
+            if (children is System.Collections.IEnumerable enumerable)
+            {
+                foreach (object? child in enumerable)
+                {
+                    if (child is not null)
+                    {
+                        yield return child;
+                    }
+                }
+            }
+        }
+
+        private static string? ReadCharacterId(object? characterButton)
+        {
+            object? character = ReadInstanceMember(characterButton, "Character");
+            object? id = ReadInstanceMember(character, "Id");
+            object? entry = ReadInstanceMember(id, "Entry");
+            return entry?.ToString() ?? id?.ToString();
+        }
+
+        private static bool IsAcceptedRunPhase(
+            string? phase,
+            CombatStateExporter.CombatExportProbe fileProbe,
+            bool combatPlayPhase)
+        {
+            if (string.Equals(phase, "map", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(phase, "event", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(phase, "reward", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return string.Equals(phase, "combat_turn", StringComparison.OrdinalIgnoreCase)
+                && combatPlayPhase
+                && fileProbe.IsStable;
+        }
+
+        private void WriteRunningResultIfDue(string message)
+        {
+            long nowMs = Environment.TickCount64;
+            if (nowMs - lastWaitStageResultAtMs < WaitStageResultIntervalMs)
+            {
+                diagnostics["result_write_throttled"] = true;
+                diagnostics["result_write_interval_ms"] = WaitStageResultIntervalMs;
+                return;
+            }
+
+            lastWaitStageResultAtMs = nowMs;
+            diagnostics["result_write_throttled"] = false;
+            diagnostics["result_write_interval_ms"] = WaitStageResultIntervalMs;
+            diagnostics["start_stage"] = stage;
+            WriteCommandResult(command, "running", message, diagnostics);
+        }
+
+        private void Fail(string message)
+        {
+            diagnostics["start_stage"] = stage;
+            RefreshContinueRunDiagnostics(diagnostics);
+            WriteCommandResult(command, "failed", message, diagnostics);
+            Logger.Warning($"start_new_run 실패: id={command.Id}, stage={stage}, {message}");
+            ReleaseStartNewRunCommand();
+        }
+
+        private void Reject(string message)
+        {
+            diagnostics["start_stage"] = stage;
+            RefreshContinueRunDiagnostics(diagnostics);
+            WriteCommandResult(command, "rejected", message, diagnostics);
+            Logger.Warning($"start_new_run 실행 거부: id={command.Id}, stage={stage}, {message}");
+            ReleaseStartNewRunCommand();
+        }
+
+        private void RecordException(Exception exception)
+        {
+            diagnostics["exception_stage"] = stage;
+            diagnostics["exception_type"] = exception.GetType().Name;
+            diagnostics["exception_message"] = exception.Message;
+            diagnostics["exception_stack"] = SummarizeStackTrace(exception);
+        }
     }
 
     private sealed class ContinueRunOperation

@@ -248,12 +248,38 @@ internal static class CombatStateExporter
         }
     }
 
+    internal static bool TryExportGameOverStateIfVisible()
+    {
+        try
+        {
+            object? gameOverScreen = FindGameOverScreen();
+            if (gameOverScreen is null)
+            {
+                return false;
+            }
+
+            Dictionary<string, object?> state = BuildGameOverState(gameOverScreen);
+            WriteState(gameOverScreen, state, "game_over", force: false, tickAfterExport: false);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"Game over state export failed. The game will keep running. {exception.GetType().Name}: {exception.Message}");
+            return false;
+        }
+    }
+
     internal static bool TryExportRewardStateIfVisible()
     {
         try
         {
             object? rewardScreen = FindRewardScreen();
             if (rewardScreen is null)
+            {
+                return false;
+            }
+
+            if (IsRewardScreenCoveredByOpenMap(rewardScreen))
             {
                 return false;
             }
@@ -265,6 +291,100 @@ internal static class CombatStateExporter
         catch (Exception exception)
         {
             Logger.Warning($"보상 화면 상태 추출에 실패했습니다. 게임 진행은 멈추지 않습니다. {exception.GetType().Name}: {exception.Message}");
+            return false;
+        }
+    }
+
+    internal static bool TryExportCardSelectionStateIfVisible()
+    {
+        try
+        {
+            object? cardSelectionScreen = FindCardSelectionScreen();
+            if (cardSelectionScreen is null)
+            {
+                return false;
+            }
+
+            Dictionary<string, object?> state = BuildCardSelectionState(cardSelectionScreen);
+            WriteState(cardSelectionScreen, state, "card_selection", force: false, tickAfterExport: false);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"Card selection state export failed. The game will keep running. {exception.GetType().Name}: {exception.Message}");
+            return false;
+        }
+    }
+
+    internal static bool TryExportEventStateIfVisible()
+    {
+        try
+        {
+            object? eventRoom = FindEventRoom();
+            if (eventRoom is null)
+            {
+                return false;
+            }
+
+            if (IsFinishedEventCoveredByOpenMap(eventRoom))
+            {
+                return false;
+            }
+
+            Dictionary<string, object?> state = BuildEventState(eventRoom);
+            WriteState(eventRoom, state, "event", force: false, tickAfterExport: false);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"Event room state export failed. The game will keep running. {exception.GetType().Name}: {exception.Message}");
+            return false;
+        }
+    }
+
+    internal static bool TryExportRestSiteStateIfVisible()
+    {
+        try
+        {
+            object? restSiteRoom = FindRestSiteRoom();
+            if (restSiteRoom is null)
+            {
+                return false;
+            }
+
+            if (FindMapScreen() is not null)
+            {
+                return false;
+            }
+
+            Dictionary<string, object?> state = BuildRestSiteState(restSiteRoom);
+            WriteState(restSiteRoom, state, "rest_site", force: false, tickAfterExport: false);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"모닥불 화면 상태 추출에 실패했습니다. 게임 진행은 멈추지 않습니다. {exception.GetType().Name}: {exception.Message}");
+            return false;
+        }
+    }
+
+    internal static bool TryExportShopStateIfVisible()
+    {
+        try
+        {
+            object? shopScreen = FindShopScreen();
+            if (shopScreen is null)
+            {
+                return false;
+            }
+
+            Dictionary<string, object?> state = BuildShopState(shopScreen);
+            WriteState(shopScreen, state, "shop", force: false, tickAfterExport: false);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"상점 화면 상태 추출에 실패했습니다. 게임 진행은 멈추지 않습니다. {exception.GetType().Name}: {exception.Message}");
             return false;
         }
     }
@@ -518,6 +638,1271 @@ internal static class CombatStateExporter
         };
     }
 
+    private static Dictionary<string, object?> BuildGameOverState(object gameOverScreen)
+    {
+        object? runManager = GetStaticPropertyValue("MegaCrit.Sts2.Core.Runs.RunManager", "Instance");
+        object? runState = FindMemberValue(gameOverScreen, "_runState", "runState", "RunState")
+            ?? FindMemberValue(runManager, "RunState", "runState", "_runState", "State", "state");
+        object? serializableRun = FindMemberValue(gameOverScreen, "_serializableRun", "serializableRun", "SerializableRun");
+        object? history = FindMemberValue(gameOverScreen, "_history", "history", "History")
+            ?? FindMemberValue(runManager, "History", "history", "_history");
+        object? player = FindMemberValue(gameOverScreen, "_localPlayer", "localPlayer", "LocalPlayer")
+            ?? recentPlayer
+            ?? recentPlayerCombatState
+            ?? EnumerateObjects(FindMemberValue(runState, "Players", "players", "_players")).FirstOrDefault();
+        object? relicsSource = FindMemberValue(player, "relics")
+            ?? FindMemberValue(runState, "relics");
+
+        List<object> roots = new();
+        AddRoot(roots, gameOverScreen);
+        AddRoot(roots, runState);
+        AddRoot(roots, serializableRun);
+        AddRoot(roots, history);
+        AddRoot(roots, player);
+        ObjectGraph graph = ObjectGraph.Collect(roots, 3, 260);
+
+        return new Dictionary<string, object?>
+        {
+            ["schema_version"] = "combat_state.v1",
+            ["phase"] = "game_over",
+            ["state_id"] = "game_over_pending",
+            ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["run"] = BuildRun(runState ?? gameOverScreen, graph),
+            ["player"] = player is null ? new Dictionary<string, object?>() : BuildPlayer(player),
+            ["piles"] = BuildEmptyPiles(),
+            ["enemies"] = new List<Dictionary<string, object?>>(),
+            ["game_over"] = BuildGameOverScreenState(gameOverScreen, runState, history),
+            ["legal_actions"] = new List<Dictionary<string, object?>>(),
+            ["relics"] = BuildRelics(relicsSource, graph),
+            ["debug"] = BuildGameOverDebug(gameOverScreen, runState, history, graph)
+        };
+    }
+
+    private static object? FindGameOverScreen()
+    {
+        object? screenContext = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext",
+            "Instance");
+        object? currentScreen = TryInvokeMethod(screenContext, "GetCurrentScreen");
+        if (IsGameOverScreen(currentScreen))
+        {
+            return currentScreen;
+        }
+
+        object? overlayStack = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Screens.Overlays.NOverlayStack",
+            "Instance");
+        object? topOverlay = TryInvokeMethod(overlayStack, "Peek");
+        if (IsGameOverScreen(topOverlay))
+        {
+            return topOverlay;
+        }
+
+        return EnumerateNodeDescendants(overlayStack)
+            .FirstOrDefault(IsGameOverScreen);
+    }
+
+    private static bool IsGameOverScreen(object? source)
+    {
+        if (source is null)
+        {
+            return false;
+        }
+
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        if (typeName.Contains("NGameOverScreen", StringComparison.OrdinalIgnoreCase))
+        {
+            return IsLiveVisibleControl(source);
+        }
+
+        string? screenType = ReadString(source, "ScreenType", "screenType", "_screenType");
+        return !string.IsNullOrWhiteSpace(screenType)
+            && screenType.Contains("GameOver", StringComparison.OrdinalIgnoreCase)
+            && IsLiveVisibleControl(source);
+    }
+
+    private static Dictionary<string, object?> BuildGameOverScreenState(object gameOverScreen, object? runState, object? history)
+    {
+        bool? isVictory = ReadBool(history, "Win", "win", "_win")
+            ?? ReadBool(FindMemberValue(runState, "CurrentRoom", "currentRoom", "_currentRoom"), "IsVictoryRoom", "isVictoryRoom", "_isVictoryRoom");
+        object? continueButton = FindMemberValue(gameOverScreen, "_continueButton", "continueButton", "ContinueButton");
+        object? mainMenuButton = FindMemberValue(gameOverScreen, "_mainMenuButton", "mainMenuButton", "MainMenuButton");
+        object? viewRunButton = FindMemberValue(gameOverScreen, "_viewRunButton", "viewRunButton", "ViewRunButton");
+
+        return new Dictionary<string, object?>
+        {
+            ["screen_type"] = gameOverScreen.GetType().FullName ?? gameOverScreen.GetType().Name,
+            ["result"] = isVictory == true ? "victory" : "defeat",
+            ["is_victory"] = isVictory,
+            ["score"] = ReadInt(gameOverScreen, "_score", "score", "Score"),
+            ["score_threshold"] = ReadInt(gameOverScreen, "_scoreThreshold", "scoreThreshold", "ScoreThreshold"),
+            ["floor"] = ReadInt(runState, "TotalFloor", "totalFloor", "_totalFloor"),
+            ["ascension"] = ReadInt(runState, "AscensionLevel", "ascensionLevel", "_ascensionLevel"),
+            ["game_mode"] = ReadString(runState, "GameMode", "gameMode", "_gameMode"),
+            ["continue_button"] = BuildButtonState(continueButton),
+            ["main_menu_button"] = BuildButtonState(mainMenuButton),
+            ["view_run_button"] = BuildButtonState(viewRunButton),
+            ["summary_animating"] = ReadBool(gameOverScreen, "_isAnimatingSummary", "isAnimatingSummary", "IsAnimatingSummary")
+        };
+    }
+
+    private static Dictionary<string, object?> BuildButtonState(object? button)
+    {
+        if (button is null)
+        {
+            return new Dictionary<string, object?>
+            {
+                ["found"] = false
+            };
+        }
+
+        return new Dictionary<string, object?>
+        {
+            ["found"] = true,
+            ["type_name"] = button.GetType().FullName ?? button.GetType().Name,
+            ["visible"] = ReadBool(button, "Visible", "visible"),
+            ["visible_in_tree"] = TryInvokeBoolMethod(button, "IsVisibleInTree"),
+            ["enabled"] = ReadBool(button, "IsEnabled", "isEnabled", "_isEnabled")
+        };
+    }
+
+    private static Dictionary<string, object?> BuildGameOverDebug(object gameOverScreen, object? runState, object? history, ObjectGraph graph)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["current_root_type"] = gameOverScreen.GetType().FullName ?? gameOverScreen.GetType().Name,
+            ["run_state_type"] = runState?.GetType().FullName ?? runState?.GetType().Name,
+            ["history_type"] = history?.GetType().FullName ?? history?.GetType().Name,
+            ["observed_types"] = LastObservedTypes.ToArray(),
+            ["graph_node_count"] = graph.Nodes.Count
+        };
+    }
+
+    private static Dictionary<string, object?> BuildCardSelectionState(object cardSelectionScreen)
+    {
+        object? managerCombatState = ReadCombatManagerDebugState(GetCombatManagerInstance());
+        if (managerCombatState is not null)
+        {
+            RememberObservedRoot(managerCombatState);
+        }
+
+        object? runManager = GetStaticPropertyValue("MegaCrit.Sts2.Core.Runs.RunManager", "Instance");
+        object? runState = FindMemberValue(runManager, "RunState", "runState", "_runState", "State", "state");
+        object? player = recentPlayer
+            ?? recentPlayerCombatState
+            ?? EnumerateObjects(FindMemberValue(runState, "Players", "players", "_players")).FirstOrDefault();
+        object? relicsSource = FindMemberValue(player, "relics")
+            ?? FindMemberValue(runState, "relics");
+
+        List<object> roots = new();
+        AddRoot(roots, cardSelectionScreen);
+        AddRoot(roots, runState);
+        AddRoot(roots, player);
+        AddRoot(roots, managerCombatState);
+        ObjectGraph graph = ObjectGraph.Collect(roots, 3, 260);
+
+        Dictionary<string, object?> cardSelection = BuildCardSelectionScreenState(cardSelectionScreen);
+        List<Dictionary<string, object?>> cards = ReadDictionaryList(cardSelection, "cards");
+
+        return new Dictionary<string, object?>
+        {
+            ["schema_version"] = "combat_state.v1",
+            ["phase"] = "card_selection",
+            ["state_id"] = "card_selection_pending",
+            ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["run"] = BuildRun(runState ?? managerCombatState ?? cardSelectionScreen, graph),
+            ["player"] = player is null ? new Dictionary<string, object?>() : BuildPlayer(player),
+            ["piles"] = BuildEmptyPiles(),
+            ["enemies"] = new List<Dictionary<string, object?>>(),
+            ["card_selection"] = cardSelection,
+            ["legal_actions"] = BuildCardSelectionLegalActions(cardSelection, cards),
+            ["relics"] = BuildRelics(relicsSource, graph),
+            ["debug"] = BuildCardSelectionDebug(cardSelectionScreen, graph)
+        };
+    }
+
+    private static object? FindCardSelectionScreen()
+    {
+        object? overlayStack = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Screens.Overlays.NOverlayStack",
+            "Instance");
+        object? topOverlay = TryInvokeMethod(overlayStack, "Peek");
+        if (IsCardSelectionScreen(topOverlay))
+        {
+            return topOverlay;
+        }
+
+        object? screenContext = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext",
+            "Instance");
+        object? currentScreen = TryInvokeMethod(screenContext, "GetCurrentScreen");
+        if (IsCardSelectionScreen(currentScreen))
+        {
+            return currentScreen;
+        }
+
+        return EnumerateNodeDescendants(overlayStack)
+            .FirstOrDefault(IsCardSelectionScreen);
+    }
+
+    private static bool IsCardSelectionScreen(object? source)
+    {
+        if (source is null)
+        {
+            return false;
+        }
+
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        return IsLiveVisibleControl(source)
+            && ContainsAny(
+                typeName,
+                "NDeckEnchantSelectScreen",
+                "NDeckUpgradeSelectScreen",
+                "NDeckTransformSelectScreen",
+                "NDeckCardSelectScreen");
+    }
+
+    private static Dictionary<string, object?> BuildCardSelectionScreenState(object cardSelectionScreen)
+    {
+        object? prefs = FindMemberValue(cardSelectionScreen, "_prefs", "Prefs", "prefs");
+        object? selectedCardsSource = FindMemberValue(cardSelectionScreen, "_selectedCards", "SelectedCards", "selectedCards");
+        List<object> selectedCards = EnumerateObjects(selectedCardsSource).ToList();
+        int? minSelect = ReadInt(prefs, "MinSelect", "minSelect", "_minSelect");
+        int? maxSelect = ReadInt(prefs, "MaxSelect", "maxSelect", "_maxSelect");
+        object? prompt = FindMemberValue(prefs, "Prompt", "prompt", "_prompt");
+        object? confirmButton = FindCardSelectionConfirmButton(cardSelectionScreen);
+
+        return new Dictionary<string, object?>
+        {
+            ["screen_type"] = cardSelectionScreen.GetType().FullName ?? cardSelectionScreen.GetType().Name,
+            ["selection_kind"] = InferCardSelectionKind(cardSelectionScreen),
+            ["prompt"] = ReadFormattedText(prompt),
+            ["min_select"] = minSelect,
+            ["max_select"] = maxSelect,
+            ["selected_count"] = selectedCards.Count,
+            ["preview_visible"] = IsAnyCardSelectionPreviewVisible(cardSelectionScreen),
+            ["confirm_button"] = BuildButtonState(confirmButton),
+            ["cards"] = BuildCardSelectionCards(cardSelectionScreen, selectedCards)
+        };
+    }
+
+    private static string InferCardSelectionKind(object cardSelectionScreen)
+    {
+        string typeName = cardSelectionScreen.GetType().FullName ?? cardSelectionScreen.GetType().Name;
+        if (typeName.Contains("Enchant", StringComparison.OrdinalIgnoreCase))
+        {
+            return "enchant";
+        }
+
+        if (typeName.Contains("Upgrade", StringComparison.OrdinalIgnoreCase))
+        {
+            return "upgrade";
+        }
+
+        if (typeName.Contains("Transform", StringComparison.OrdinalIgnoreCase))
+        {
+            return "transform";
+        }
+
+        if (typeName.Contains("DeckCardSelect", StringComparison.OrdinalIgnoreCase))
+        {
+            return "deck_card_select";
+        }
+
+        return "unknown";
+    }
+
+    private static List<Dictionary<string, object?>> BuildCardSelectionCards(object cardSelectionScreen, List<object> selectedCards)
+    {
+        List<object> holders = FindGridCardHolders(cardSelectionScreen);
+        List<Dictionary<string, object?>> cards = new();
+        for (int index = 0; index < holders.Count; index++)
+        {
+            object holder = holders[index];
+            object? card = ExtractCardFromHolder(holder);
+            if (card is null)
+            {
+                continue;
+            }
+
+            Dictionary<string, object?> cardState = BuildCards("card_selection", new[] { card }).FirstOrDefault()
+                ?? new Dictionary<string, object?>();
+            string name = ReadDictionaryString(cardState, "name")
+                ?? ReadCardName(card)
+                ?? GetReadableName(card);
+            string cardSelectionId = SanitizeActionId($"card_selection_{index}_{name}");
+            cardState["card_selection_id"] = cardSelectionId;
+            cardState["card_selection_index"] = index;
+            cardState["selected"] = IsCardSelected(card, selectedCards);
+            cardState["visible"] = ReadBool(holder, "Visible", "visible");
+            cardState["visible_in_tree"] = TryInvokeBoolMethod(holder, "IsVisibleInTree");
+            cardState["clickable"] = ReadBool(holder, "_isClickable", "isClickable", "IsClickable");
+            cardState["holder_type"] = holder.GetType().FullName ?? holder.GetType().Name;
+            cards.Add(cardState);
+        }
+
+        return cards;
+    }
+
+    private static List<object> FindGridCardHolders(object cardSelectionScreen)
+    {
+        object? grid = FindMemberValue(cardSelectionScreen, "_grid", "Grid", "grid");
+        List<object> holders = EnumerateNodeDescendants(grid)
+            .Where(IsGridCardHolder)
+            .ToList();
+        if (holders.Count > 0)
+        {
+            return holders;
+        }
+
+        return EnumerateNodeDescendants(cardSelectionScreen)
+            .Where(IsGridCardHolder)
+            .ToList();
+    }
+
+    private static bool IsGridCardHolder(object value)
+    {
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return typeName.Contains("NGridCardHolder", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static object? ExtractCardFromHolder(object holder)
+    {
+        object? cardModel = FindMemberValue(holder, "CardModel", "cardModel", "_cardModel", "_baseCard");
+        if (cardModel is not null)
+        {
+            return cardModel;
+        }
+
+        object? cardNode = FindMemberValue(holder, "CardNode", "cardNode", "_cardNode");
+        return FindMemberValue(cardNode, "Model", "model", "_model") ?? cardNode;
+    }
+
+    private static bool IsCardSelected(object card, List<object> selectedCards)
+    {
+        return selectedCards.Any(selectedCard => ReferenceEquals(selectedCard, card) || selectedCard.Equals(card));
+    }
+
+    private static bool IsAnyCardSelectionPreviewVisible(object cardSelectionScreen)
+    {
+        string[] previewMemberNames =
+        {
+            "_enchantSinglePreviewContainer",
+            "_enchantMultiPreviewContainer",
+            "_upgradeSinglePreviewContainer",
+            "_upgradeMultiPreviewContainer",
+            "_previewContainer"
+        };
+
+        return previewMemberNames
+            .Select(name => FindMemberValue(cardSelectionScreen, name))
+            .Any(preview => preview is not null && ReadBool(preview, "Visible", "visible") == true);
+    }
+
+    private static object? FindCardSelectionConfirmButton(object cardSelectionScreen)
+    {
+        string[] preferredMemberNames =
+        {
+            "_singlePreviewConfirmButton",
+            "_multiPreviewConfirmButton",
+            "_previewConfirmButton",
+            "_confirmButton"
+        };
+
+        List<object> buttons = preferredMemberNames
+            .Select(name => FindMemberValue(cardSelectionScreen, name))
+            .Where(button => button is not null)
+            .Cast<object>()
+            .ToList();
+
+        return buttons.FirstOrDefault(button => ReadBool(button, "IsEnabled", "isEnabled", "_isEnabled") == true)
+            ?? buttons.FirstOrDefault();
+    }
+
+    private static List<Dictionary<string, object?>> BuildCardSelectionLegalActions(
+        Dictionary<string, object?> cardSelection,
+        List<Dictionary<string, object?>> cards)
+    {
+        List<Dictionary<string, object?>> actions = new();
+        string selectionKind = ReadDictionaryString(cardSelection, "selection_kind") ?? "unknown";
+        int? selectedCount = ReadDictionaryInt(cardSelection, "selected_count");
+        int? minSelect = ReadDictionaryInt(cardSelection, "min_select");
+        int? maxSelect = ReadDictionaryInt(cardSelection, "max_select");
+        int requiredSelect = Math.Max(1, minSelect ?? 1);
+        bool canChooseMore = maxSelect is null || (selectedCount ?? 0) < maxSelect.Value;
+
+        if (canChooseMore)
+        {
+            foreach (Dictionary<string, object?> card in cards)
+            {
+                if (ReadDictionaryBool(card, "selected") == true)
+                {
+                    continue;
+                }
+
+                int? cardSelectionIndex = ReadDictionaryInt(card, "card_selection_index");
+                string cardSelectionId = ReadDictionaryString(card, "card_selection_id") ?? $"card_selection_{cardSelectionIndex?.ToString() ?? "unknown"}";
+                string name = ReadDictionaryString(card, "name") ?? cardSelectionId;
+                actions.Add(new Dictionary<string, object?>
+                {
+                    ["action_id"] = SanitizeActionId($"choose_{cardSelectionId}"),
+                    ["type"] = "choose_card_selection",
+                    ["card_selection_id"] = cardSelectionId,
+                    ["card_selection_index"] = cardSelectionIndex,
+                    ["selection_kind"] = selectionKind,
+                    ["card_id"] = ReadDictionaryString(card, "card_id"),
+                    ["name"] = name,
+                    ["card_type"] = ReadDictionaryString(card, "type"),
+                    ["rarity"] = ReadDictionaryString(card, "rarity"),
+                    ["cost"] = ReadDictionaryInt(card, "cost"),
+                    ["upgraded"] = ReadDictionaryBool(card, "upgraded"),
+                    ["summary"] = $"Choose card selection: {name}",
+                    ["validation_note"] = "Visible card selection holder."
+                });
+            }
+        }
+
+        if ((selectedCount ?? 0) >= requiredSelect)
+        {
+            actions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = "confirm_card_selection",
+                ["type"] = "confirm_card_selection",
+                ["selection_kind"] = selectionKind,
+                ["selected_count"] = selectedCount,
+                ["summary"] = "Confirm current card selection.",
+                ["validation_note"] = "A card selection is already active."
+            });
+        }
+
+        return actions;
+    }
+
+    private static Dictionary<string, object?> BuildCardSelectionDebug(object cardSelectionScreen, ObjectGraph graph)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["current_root_type"] = cardSelectionScreen.GetType().FullName ?? cardSelectionScreen.GetType().Name,
+            ["observed_types"] = LastObservedTypes.ToArray(),
+            ["graph_node_count"] = graph.Nodes.Count,
+            ["grid_holder_count"] = FindGridCardHolders(cardSelectionScreen).Count
+        };
+    }
+
+    private static Dictionary<string, object?> BuildEventState(object eventRoom)
+    {
+        object? managerCombatState = ReadCombatManagerDebugState(GetCombatManagerInstance());
+        if (managerCombatState is not null)
+        {
+            RememberObservedRoot(managerCombatState);
+        }
+
+        object? eventModel = FindMemberValue(eventRoom, "_event", "Event", "event");
+        object? layout = FindMemberValue(eventRoom, "Layout", "layout");
+        object? owner = FindMemberValue(eventModel, "Owner", "owner", "_owner");
+        object? runState = FindMemberValue(owner, "RunState", "runState", "_runState")
+            ?? FindMemberValue(eventRoom, "_runState", "runState", "RunState")
+            ?? FindMemberValue(GetStaticPropertyValue("MegaCrit.Sts2.Core.Runs.RunManager", "Instance"), "RunState", "runState", "_runState", "State", "state");
+        object? player = recentPlayer
+            ?? recentPlayerCombatState
+            ?? owner
+            ?? EnumerateObjects(FindMemberValue(runState, "Players", "players", "_players")).FirstOrDefault();
+        object? relicsSource = FindMemberValue(player, "relics")
+            ?? FindMemberValue(runState, "relics");
+
+        List<object> roots = new();
+        AddRoot(roots, eventRoom);
+        AddRoot(roots, eventModel);
+        AddRoot(roots, layout);
+        AddRoot(roots, owner);
+        AddRoot(roots, runState);
+        AddRoot(roots, player);
+        AddRoot(roots, managerCombatState);
+        ObjectGraph graph = ObjectGraph.Collect(roots, 3, 260);
+
+        Dictionary<string, object?> eventState = BuildEventScreenState(eventRoom, eventModel, layout);
+        List<Dictionary<string, object?>> options = ReadDictionaryList(eventState, "options");
+
+        return new Dictionary<string, object?>
+        {
+            ["schema_version"] = "combat_state.v1",
+            ["phase"] = "event",
+            ["state_id"] = "event_pending",
+            ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["run"] = BuildRun(runState ?? managerCombatState ?? eventRoom, graph),
+            ["player"] = player is null ? new Dictionary<string, object?>() : BuildPlayer(player),
+            ["piles"] = BuildEmptyPiles(),
+            ["enemies"] = new List<Dictionary<string, object?>>(),
+            ["event"] = eventState,
+            ["legal_actions"] = BuildEventLegalActions(options),
+            ["relics"] = BuildRelics(relicsSource, graph),
+            ["debug"] = BuildEventDebug(eventRoom, eventModel, layout, graph)
+        };
+    }
+
+    private static object? FindEventRoom()
+    {
+        object? room = GetStaticPropertyValue("MegaCrit.Sts2.Core.Nodes.Rooms.NEventRoom", "Instance");
+        if (IsEventRoomVisible(room))
+        {
+            return room;
+        }
+
+        object? screenContext = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext",
+            "Instance");
+        object? currentScreen = TryInvokeMethod(screenContext, "GetCurrentScreen");
+        if (IsEventRoomVisible(currentScreen))
+        {
+            return currentScreen;
+        }
+
+        object? run = GetStaticPropertyValue("MegaCrit.Sts2.Core.Nodes.Rooms.NRun", "Instance");
+        object? runEventRoom = FindMemberValue(run, "EventRoom", "eventRoom", "_eventRoom");
+        return IsEventRoomVisible(runEventRoom) ? runEventRoom : null;
+    }
+
+    private static bool IsFinishedEventCoveredByOpenMap(object eventRoom)
+    {
+        if (FindMapScreen() is null)
+        {
+            return false;
+        }
+
+        object? eventModel = FindMemberValue(eventRoom, "_event", "Event", "event");
+        if (ReadBool(eventModel, "IsFinished", "isFinished", "_isFinished") == true)
+        {
+            return true;
+        }
+
+        object? layout = FindMemberValue(eventRoom, "Layout", "layout");
+        return BuildEventOptions(layout, eventRoom)
+            .Any(option =>
+                ReadDictionaryBool(option, "is_proceed") == true
+                && ReadDictionaryBool(option, "was_chosen") == true);
+    }
+
+    private static bool IsEventRoomVisible(object? source)
+    {
+        if (source is null)
+        {
+            return false;
+        }
+
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        return typeName.Contains("NEventRoom", StringComparison.OrdinalIgnoreCase)
+            && IsLiveVisibleControl(source);
+    }
+
+    private static Dictionary<string, object?> BuildEventScreenState(object eventRoom, object? eventModel, object? layout)
+    {
+        List<Dictionary<string, object?>> options = BuildEventOptions(layout, eventRoom);
+        return new Dictionary<string, object?>
+        {
+            ["screen_type"] = eventRoom.GetType().FullName ?? eventRoom.GetType().Name,
+            ["event_id"] = ReadString(eventModel, "Id", "id", "_id", "Key", "key", "TextKey", "textKey") ?? GetReadableName(eventModel ?? eventRoom),
+            ["title"] = ReadFormattedText(FindMemberValue(eventModel, "Title", "title", "_title")),
+            ["description"] = ReadFormattedText(FindMemberValue(eventModel, "Description", "description", "_description")),
+            ["is_finished"] = ReadBool(eventModel, "IsFinished", "isFinished", "_isFinished"),
+            ["is_shared"] = ReadBool(eventModel, "IsShared", "isShared", "_isShared"),
+            ["option_count"] = options.Count,
+            ["options"] = options
+        };
+    }
+
+    private static List<Dictionary<string, object?>> BuildEventOptions(object? layout, object eventRoom)
+    {
+        List<object> optionButtons = EnumerateObjects(FindMemberValue(layout, "OptionButtons", "optionButtons")).ToList();
+        if (optionButtons.Count == 0)
+        {
+            optionButtons = EnumerateNodeDescendants(eventRoom)
+                .Where(IsEventOptionButton)
+                .ToList();
+        }
+
+        List<Dictionary<string, object?>> options = new();
+        for (int index = 0; index < optionButtons.Count; index++)
+        {
+            options.Add(BuildEventOption(optionButtons[index], index));
+        }
+
+        return options;
+    }
+
+    private static Dictionary<string, object?> BuildEventOption(object button, int fallbackIndex)
+    {
+        object? option = FindMemberValue(button, "Option", "option", "_option");
+        int optionIndex = ReadInt(button, "Index", "index", "_index") ?? fallbackIndex;
+        string optionId = $"event_option_{optionIndex}";
+        string? title = ReadFormattedText(FindMemberValue(option, "Title", "title", "_title"));
+        string? description = ReadFormattedText(FindMemberValue(option, "Description", "description", "_description"));
+        bool? willKillPlayer = TryInvokeBoolMethod(button, "WillKillPlayer");
+        return new Dictionary<string, object?>
+        {
+            ["event_option_id"] = optionId,
+            ["event_option_index"] = optionIndex,
+            ["text_key"] = ReadString(option, "TextKey", "textKey", "_textKey"),
+            ["title"] = title,
+            ["description"] = description,
+            ["is_locked"] = ReadBool(option, "IsLocked", "isLocked", "_isLocked"),
+            ["is_proceed"] = ReadBool(option, "IsProceed", "isProceed", "_isProceed"),
+            ["was_chosen"] = ReadBool(option, "WasChosen", "wasChosen", "_wasChosen"),
+            ["will_kill_player"] = willKillPlayer,
+            ["is_enabled"] = ReadBool(button, "IsEnabled", "isEnabled", "_isEnabled"),
+            ["type_name"] = option?.GetType().FullName ?? option?.GetType().Name,
+            ["button_type_name"] = button.GetType().FullName ?? button.GetType().Name,
+            ["summary"] = BuildEventOptionSummary(title, description, optionId)
+        };
+    }
+
+    private static string BuildEventOptionSummary(string? title, string? description, string fallback)
+    {
+        if (!string.IsNullOrWhiteSpace(title) && !string.IsNullOrWhiteSpace(description))
+        {
+            return $"{title}: {description}";
+        }
+
+        return title ?? description ?? fallback;
+    }
+
+    private static bool IsEventOptionButton(object value)
+    {
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return typeName.Contains("NEventOptionButton", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static List<Dictionary<string, object?>> BuildEventLegalActions(List<Dictionary<string, object?>> options)
+    {
+        List<Dictionary<string, object?>> actions = new();
+        foreach (Dictionary<string, object?> option in options)
+        {
+            if (ReadDictionaryBool(option, "is_locked") == true)
+            {
+                continue;
+            }
+
+            int? optionIndex = ReadDictionaryInt(option, "event_option_index");
+            string optionId = ReadDictionaryString(option, "event_option_id") ?? $"event_option_{optionIndex?.ToString() ?? "unknown"}";
+            string summary = ReadDictionaryString(option, "summary") ?? optionId;
+            actions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = SanitizeActionId($"choose_{optionId}"),
+                ["type"] = "choose_event_option",
+                ["event_option_id"] = optionId,
+                ["event_option_index"] = optionIndex,
+                ["text_key"] = ReadDictionaryString(option, "text_key"),
+                ["title"] = ReadDictionaryString(option, "title"),
+                ["description"] = ReadDictionaryString(option, "description"),
+                ["is_proceed"] = ReadDictionaryBool(option, "is_proceed"),
+                ["will_kill_player"] = ReadDictionaryBool(option, "will_kill_player"),
+                ["summary"] = $"Choose event option: {summary}",
+                ["validation_note"] = "Visible event option button."
+            });
+        }
+
+        return actions;
+    }
+
+    private static Dictionary<string, object?> BuildEventDebug(object eventRoom, object? eventModel, object? layout, ObjectGraph graph)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["current_root_type"] = eventRoom.GetType().FullName ?? eventRoom.GetType().Name,
+            ["event_model_type"] = eventModel?.GetType().FullName ?? eventModel?.GetType().Name,
+            ["layout_type"] = layout?.GetType().FullName ?? layout?.GetType().Name,
+            ["observed_types"] = LastObservedTypes.ToArray(),
+            ["graph_node_count"] = graph.Nodes.Count
+        };
+    }
+
+    private static Dictionary<string, object?> BuildRestSiteState(object restSiteRoom)
+    {
+        object? runManager = GetStaticPropertyValue("MegaCrit.Sts2.Core.Runs.RunManager", "Instance");
+        object? runState = FindMemberValue(restSiteRoom, "_runState", "runState", "RunState")
+            ?? FindMemberValue(runManager, "RunState", "runState", "_runState", "State", "state");
+        object? player = recentPlayer
+            ?? recentPlayerCombatState
+            ?? EnumerateObjects(FindMemberValue(runState, "Players", "players", "_players")).FirstOrDefault();
+        object? relicsSource = FindMemberValue(player, "relics")
+            ?? FindMemberValue(runState, "relics");
+
+        List<object> roots = new();
+        AddRoot(roots, restSiteRoom);
+        AddRoot(roots, runState);
+        AddRoot(roots, player);
+        ObjectGraph graph = ObjectGraph.Collect(roots, 3, 260);
+
+        Dictionary<string, object?> restSite = BuildRestSiteScreenState(restSiteRoom);
+        List<Dictionary<string, object?>> options = ReadDictionaryList(restSite, "options");
+
+        return new Dictionary<string, object?>
+        {
+            ["schema_version"] = "combat_state.v1",
+            ["phase"] = "rest_site",
+            ["state_id"] = "rest_site_pending",
+            ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["run"] = BuildRun(runState ?? restSiteRoom, graph),
+            ["player"] = player is null ? new Dictionary<string, object?>() : BuildPlayer(player),
+            ["piles"] = BuildEmptyPiles(),
+            ["enemies"] = new List<Dictionary<string, object?>>(),
+            ["rest_site"] = restSite,
+            ["legal_actions"] = BuildRestSiteLegalActions(options, ReadDictionaryBool(restSite, "proceed_enabled") == true),
+            ["relics"] = BuildRelics(relicsSource, graph),
+            ["debug"] = BuildRestSiteDebug(restSiteRoom, runState, graph)
+        };
+    }
+
+    private static object? FindRestSiteRoom()
+    {
+        object? room = GetStaticPropertyValue("MegaCrit.Sts2.Core.Nodes.Rooms.NRestSiteRoom", "Instance");
+        if (IsRestSiteRoomVisible(room))
+        {
+            return room;
+        }
+
+        object? screenContext = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext",
+            "Instance");
+        object? currentScreen = TryInvokeMethod(screenContext, "GetCurrentScreen");
+        if (IsRestSiteRoomVisible(currentScreen))
+        {
+            return currentScreen;
+        }
+
+        object? run = GetStaticPropertyValue("MegaCrit.Sts2.Core.Nodes.Rooms.NRun", "Instance");
+        object? runRestSiteRoom = FindMemberValue(run, "RestSiteRoom", "restSiteRoom", "_restSiteRoom");
+        return IsRestSiteRoomVisible(runRestSiteRoom) ? runRestSiteRoom : null;
+    }
+
+    private static bool IsRestSiteRoomVisible(object? source)
+    {
+        if (source is null)
+        {
+            return false;
+        }
+
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        return typeName.Contains("NRestSiteRoom", StringComparison.OrdinalIgnoreCase)
+            && IsLiveVisibleControl(source);
+    }
+
+    private static Dictionary<string, object?> BuildRestSiteScreenState(object restSiteRoom)
+    {
+        List<Dictionary<string, object?>> options = BuildRestSiteOptions(restSiteRoom);
+        object? proceedButton = FindMemberValue(restSiteRoom, "ProceedButton", "_proceedButton", "proceedButton");
+        return new Dictionary<string, object?>
+        {
+            ["screen_type"] = restSiteRoom.GetType().FullName ?? restSiteRoom.GetType().Name,
+            ["option_count"] = options.Count,
+            ["options"] = options,
+            ["proceed_enabled"] = ReadBool(proceedButton, "IsEnabled", "isEnabled", "_isEnabled"),
+            ["proceed_visible"] = ReadBool(proceedButton, "Visible", "visible")
+        };
+    }
+
+    private static List<Dictionary<string, object?>> BuildRestSiteOptions(object restSiteRoom)
+    {
+        List<object> optionButtons = EnumerateNodeDescendants(restSiteRoom)
+            .Where(IsRestSiteButton)
+            .ToList();
+
+        List<Dictionary<string, object?>> options = new();
+        for (int index = 0; index < optionButtons.Count; index++)
+        {
+            options.Add(BuildRestSiteOption(optionButtons[index], index));
+        }
+
+        return options;
+    }
+
+    private static Dictionary<string, object?> BuildRestSiteOption(object button, int fallbackIndex)
+    {
+        object? option = FindMemberValue(button, "Option", "option", "_option");
+        string optionId = ReadString(option, "OptionId", "optionId", "_optionId") ?? $"rest_option_{fallbackIndex}";
+        string? title = ReadFormattedText(FindMemberValue(option, "Title", "title", "_title"));
+        string? description = ReadFormattedText(FindMemberValue(option, "Description", "description", "_description"));
+        bool? isEnabled = ReadBool(option, "IsEnabled", "isEnabled", "_isEnabled");
+        return new Dictionary<string, object?>
+        {
+            ["rest_option_id"] = optionId,
+            ["rest_option_index"] = fallbackIndex,
+            ["title"] = title,
+            ["description"] = description,
+            ["is_enabled"] = isEnabled,
+            ["type_name"] = option?.GetType().FullName ?? option?.GetType().Name,
+            ["button_type_name"] = button.GetType().FullName ?? button.GetType().Name,
+            ["summary"] = BuildRestSiteOptionSummary(optionId, title, description)
+        };
+    }
+
+    private static string BuildRestSiteOptionSummary(string optionId, string? title, string? description)
+    {
+        if (!string.IsNullOrWhiteSpace(title) && !string.IsNullOrWhiteSpace(description))
+        {
+            return $"{title}: {description}";
+        }
+
+        return title ?? description ?? optionId;
+    }
+
+    private static bool IsRestSiteButton(object value)
+    {
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return typeName.Contains("NRestSiteButton", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static List<Dictionary<string, object?>> BuildRestSiteLegalActions(List<Dictionary<string, object?>> options, bool canProceed)
+    {
+        List<Dictionary<string, object?>> actions = new();
+        foreach (Dictionary<string, object?> option in options)
+        {
+            if (ReadDictionaryBool(option, "is_enabled") == false)
+            {
+                continue;
+            }
+
+            int? optionIndex = ReadDictionaryInt(option, "rest_option_index");
+            string optionId = ReadDictionaryString(option, "rest_option_id") ?? $"rest_option_{optionIndex?.ToString() ?? "unknown"}";
+            actions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = SanitizeActionId($"choose_rest_site_{optionId}_{optionIndex?.ToString() ?? "unknown"}"),
+                ["type"] = "choose_rest_site_option",
+                ["rest_option_id"] = optionId,
+                ["rest_option_index"] = optionIndex,
+                ["title"] = ReadDictionaryString(option, "title"),
+                ["description"] = ReadDictionaryString(option, "description"),
+                ["summary"] = $"모닥불 선택지를 고릅니다: {ReadDictionaryString(option, "summary") ?? optionId}",
+                ["validation_note"] = "현재 모닥불 화면의 실제 선택 버튼입니다."
+            });
+        }
+
+        if (canProceed)
+        {
+            actions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = "proceed_rest_site",
+                ["type"] = "proceed_rest_site",
+                ["summary"] = "모닥불 화면을 닫고 지도로 진행합니다.",
+                ["validation_note"] = "현재 모닥불 화면의 진행 버튼입니다."
+            });
+        }
+
+        return actions;
+    }
+
+    private static Dictionary<string, object?> BuildRestSiteDebug(object restSiteRoom, object? runState, ObjectGraph graph)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["current_root_type"] = restSiteRoom.GetType().FullName ?? restSiteRoom.GetType().Name,
+            ["run_state_type"] = runState?.GetType().FullName ?? runState?.GetType().Name,
+            ["observed_types"] = LastObservedTypes.ToArray(),
+            ["graph_node_count"] = graph.Nodes.Count
+        };
+    }
+
+    private static Dictionary<string, object?> BuildEmptyPiles()
+    {
+        return new Dictionary<string, object?>
+        {
+            ["hand"] = new List<Dictionary<string, object?>>(),
+            ["draw_pile"] = new List<Dictionary<string, object?>>(),
+            ["discard_pile"] = new List<Dictionary<string, object?>>(),
+            ["exhaust_pile"] = new List<Dictionary<string, object?>>()
+        };
+    }
+
+    private static Dictionary<string, object?> BuildShopState(object shopScreen)
+    {
+        object? managerCombatState = ReadCombatManagerDebugState(GetCombatManagerInstance());
+        if (managerCombatState is not null)
+        {
+            RememberObservedRoot(managerCombatState);
+        }
+
+        object? runManager = GetStaticPropertyValue("MegaCrit.Sts2.Core.Runs.RunManager", "Instance");
+        object? runState = FindMemberValue(shopScreen, "_runState", "runState", "RunState")
+            ?? FindMemberValue(runManager, "RunState", "runState", "_runState", "State", "state");
+        object? player = recentPlayer
+            ?? recentPlayerCombatState
+            ?? EnumerateObjects(FindMemberValue(runState, "Players", "players", "_players")).FirstOrDefault();
+        object? relicsSource = FindMemberValue(player, "relics")
+            ?? FindMemberValue(runState, "relics");
+
+        List<object> roots = new();
+        AddRoot(roots, shopScreen);
+        AddRoot(roots, runState);
+        AddRoot(roots, player);
+        AddRoot(roots, managerCombatState);
+        ObjectGraph graph = ObjectGraph.Collect(roots, 3, 320);
+
+        Dictionary<string, object?> shop = BuildShopScreenState(shopScreen, graph);
+        List<Dictionary<string, object?>> items = ReadDictionaryList(shop, "items");
+
+        return new Dictionary<string, object?>
+        {
+            ["schema_version"] = "combat_state.v1",
+            ["phase"] = "shop",
+            ["state_id"] = "shop_pending",
+            ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["run"] = BuildRun(runState ?? managerCombatState ?? shopScreen, graph),
+            ["player"] = player is null ? new Dictionary<string, object?>() : BuildPlayer(player),
+            ["piles"] = BuildEmptyPiles(),
+            ["enemies"] = new List<Dictionary<string, object?>>(),
+            ["shop"] = shop,
+            ["legal_actions"] = BuildShopLegalActions(items, ReadDictionaryBool(shop, "proceed_enabled") == true),
+            ["relics"] = BuildRelics(relicsSource, graph),
+            ["debug"] = BuildShopDebug(shopScreen, graph)
+        };
+    }
+
+    private static object? FindShopScreen()
+    {
+        object? screenContext = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext",
+            "Instance");
+        object? currentScreen = TryInvokeMethod(screenContext, "GetCurrentScreen");
+        if (IsShopScreen(currentScreen))
+        {
+            return currentScreen;
+        }
+
+        object? overlayStack = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Screens.Overlays.NOverlayStack",
+            "Instance");
+        object? topOverlay = TryInvokeMethod(overlayStack, "Peek");
+        if (IsShopScreen(topOverlay))
+        {
+            return topOverlay;
+        }
+
+        object? runManager = GetStaticPropertyValue("MegaCrit.Sts2.Core.Runs.RunManager", "Instance");
+        object? currentRoom = FindMemberValue(runManager, "CurrentRoom", "currentRoom", "_currentRoom");
+        object? nGame = GetStaticPropertyValue("MegaCrit.Sts2.Core.Nodes.NGame", "Instance");
+
+        return EnumerateNodeDescendants(currentScreen)
+            .Concat(EnumerateNodeDescendants(overlayStack))
+            .Concat(EnumerateNodeDescendants(currentRoom))
+            .Concat(EnumerateNodeDescendants(nGame))
+            .FirstOrDefault(IsShopScreen);
+    }
+
+    private static bool IsShopScreen(object? source)
+    {
+        if (source is null)
+        {
+            return false;
+        }
+
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        return ContainsAny(typeName, "Shop", "Merchant", "Store")
+            && IsLiveVisibleControl(source);
+    }
+
+    private static Dictionary<string, object?> BuildShopScreenState(object shopScreen, ObjectGraph graph)
+    {
+        object? proceedButton = FindMemberValue(shopScreen, "_proceedButton", "proceedButton", "ProceedButton", "_continueButton", "continueButton");
+        List<Dictionary<string, object?>> items = BuildShopItems(shopScreen, graph);
+
+        return new Dictionary<string, object?>
+        {
+            ["screen_type"] = shopScreen.GetType().FullName ?? shopScreen.GetType().Name,
+            ["item_count"] = items.Count,
+            ["items"] = items,
+            ["proceed_button"] = BuildButtonState(proceedButton),
+            ["proceed_enabled"] = IsButtonEnabledOrVisible(proceedButton),
+            ["proceed_visible"] = IsLiveVisibleControlOrNull(proceedButton)
+        };
+    }
+
+    private static List<Dictionary<string, object?>> BuildShopItems(object shopScreen, ObjectGraph graph)
+    {
+        List<Dictionary<string, object?>> items = new();
+        HashSet<string> seenKeys = new(StringComparer.OrdinalIgnoreCase);
+
+        AddShopCardItems(shopScreen, items, seenKeys);
+        AddShopMerchantCardItems(shopScreen, items, seenKeys);
+        AddShopItemCandidates(shopScreen, graph, items, seenKeys, "relic", "Relic");
+        AddShopItemCandidates(shopScreen, graph, items, seenKeys, "potion", "Potion");
+        AddShopServiceCandidates(shopScreen, graph, items, seenKeys);
+
+        return items;
+    }
+
+    private static void AddShopCardItems(object shopScreen, List<Dictionary<string, object?>> items, HashSet<string> seenKeys)
+    {
+        List<object> holders = FindGridCardHolders(shopScreen);
+        for (int index = 0; index < holders.Count; index++)
+        {
+            object holder = holders[index];
+            if (IsLiveVisibleControlOrNull(holder) == false)
+            {
+                continue;
+            }
+
+            object? card = ExtractCardFromHolder(holder);
+            if (card is null)
+            {
+                continue;
+            }
+
+            Dictionary<string, object?> cardState = BuildCards("shop", new[] { card }).FirstOrDefault()
+                ?? new Dictionary<string, object?>();
+            string name = ReadDictionaryString(cardState, "name")
+                ?? ReadCardName(card)
+                ?? GetReadableName(card);
+            string dedupeKey = $"card:{ReadDictionaryString(cardState, "card_id") ?? name}:{index}";
+            if (!seenKeys.Add(dedupeKey))
+            {
+                continue;
+            }
+
+            items.Add(new Dictionary<string, object?>
+            {
+                ["shop_item_id"] = SanitizeActionId($"shop_card_{index}_{name}"),
+                ["shop_item_index"] = items.Count,
+                ["item_type"] = "card",
+                ["name"] = name,
+                ["price"] = ReadPrice(holder, card),
+                ["sold_out"] = ReadBool(holder, "IsSoldOut", "isSoldOut", "_isSoldOut"),
+                ["card"] = cardState,
+                ["holder_type"] = holder.GetType().FullName ?? holder.GetType().Name,
+                ["visible"] = ReadBool(holder, "Visible", "visible"),
+                ["visible_in_tree"] = TryInvokeBoolMethod(holder, "IsVisibleInTree")
+            });
+        }
+    }
+
+    private static void AddShopMerchantCardItems(object shopScreen, List<Dictionary<string, object?>> items, HashSet<string> seenKeys)
+    {
+        List<object> cardNodes = EnumerateNodeDescendants(shopScreen)
+            .Where(candidate => ContainsAny(candidate.GetType().FullName ?? candidate.GetType().Name, "NMerchantCard"))
+            .Where(candidate => IsLiveVisibleControlOrNull(candidate) != false)
+            .Distinct(ReferenceEqualityComparer.Instance)
+            .ToList();
+
+        for (int index = 0; index < cardNodes.Count; index++)
+        {
+            object cardNode = cardNodes[index];
+            object? card = FindMemberValue(cardNode, "Card", "card", "_card", "Model", "model", "_model", "CardModel", "cardModel", "_cardModel");
+            if (card is null)
+            {
+                continue;
+            }
+
+            Dictionary<string, object?> cardState = BuildCards("shop", new[] { card }).FirstOrDefault()
+                ?? new Dictionary<string, object?>();
+            string name = ReadDictionaryString(cardState, "name")
+                ?? ReadCardName(card)
+                ?? GetReadableName(card);
+            string dedupeKey = $"merchant_card:{ReadDictionaryString(cardState, "card_id") ?? name}:{index}";
+            if (!seenKeys.Add(dedupeKey))
+            {
+                continue;
+            }
+
+            items.Add(new Dictionary<string, object?>
+            {
+                ["shop_item_id"] = SanitizeActionId($"shop_card_{items.Count}_{name}"),
+                ["shop_item_index"] = items.Count,
+                ["item_type"] = "card",
+                ["name"] = name,
+                ["price"] = ReadPrice(cardNode, card),
+                ["sold_out"] = ReadBool(cardNode, "IsSoldOut", "isSoldOut", "_isSoldOut", "SoldOut", "soldOut"),
+                ["card"] = cardState,
+                ["node_type"] = cardNode.GetType().FullName ?? cardNode.GetType().Name,
+                ["model_type"] = card.GetType().FullName ?? card.GetType().Name,
+                ["visible"] = ReadBool(cardNode, "Visible", "visible"),
+                ["visible_in_tree"] = TryInvokeBoolMethod(cardNode, "IsVisibleInTree")
+            });
+        }
+    }
+
+    private static void AddShopItemCandidates(
+        object shopScreen,
+        ObjectGraph graph,
+        List<Dictionary<string, object?>> items,
+        HashSet<string> seenKeys,
+        string itemType,
+        string typeHint)
+    {
+        IEnumerable<object> candidates = EnumerateNodeDescendants(shopScreen)
+            .Where(candidate => IsShopItemCandidate(candidate, typeHint))
+            .Distinct(ReferenceEqualityComparer.Instance);
+
+        foreach (object candidate in candidates)
+        {
+            object itemModel = ResolveShopItemModel(candidate, typeHint) ?? candidate;
+            Dictionary<string, object?>? itemSummary = BuildItemSummary(itemModel);
+            if (itemSummary is null)
+            {
+                continue;
+            }
+
+            string name = ReadDictionaryString(itemSummary, "name") ?? GetReadableName(itemModel);
+            string id = ReadDictionaryString(itemSummary, "id") ?? name;
+            string dedupeKey = $"{itemType}:{id}:{name}";
+            if (!seenKeys.Add(dedupeKey))
+            {
+                continue;
+            }
+
+            items.Add(new Dictionary<string, object?>
+            {
+                ["shop_item_id"] = SanitizeActionId($"shop_{itemType}_{items.Count}_{name}"),
+                ["shop_item_index"] = items.Count,
+                ["item_type"] = itemType,
+                ["name"] = name,
+                ["price"] = ReadPrice(candidate, itemModel),
+                ["sold_out"] = ReadBool(candidate, "IsSoldOut", "isSoldOut", "_isSoldOut", "SoldOut", "soldOut"),
+                [itemType] = itemSummary,
+                ["node_type"] = candidate.GetType().FullName ?? candidate.GetType().Name,
+                ["model_type"] = itemModel.GetType().FullName ?? itemModel.GetType().Name,
+                ["visible"] = ReadBool(candidate, "Visible", "visible"),
+                ["visible_in_tree"] = TryInvokeBoolMethod(candidate, "IsVisibleInTree")
+            });
+        }
+    }
+
+    private static void AddShopServiceCandidates(object shopScreen, ObjectGraph graph, List<Dictionary<string, object?>> items, HashSet<string> seenKeys)
+    {
+        IEnumerable<object> candidates = EnumerateNodeDescendants(shopScreen)
+            .Concat(graph.Nodes.Select(node => node.Value).Where(value => value is not null).Cast<object>())
+            .Where(candidate => ContainsAny(candidate.GetType().FullName ?? candidate.GetType().Name, "Remove", "Purge", "Service"))
+            .Distinct(ReferenceEqualityComparer.Instance);
+
+        foreach (object candidate in candidates)
+        {
+            string typeName = candidate.GetType().FullName ?? candidate.GetType().Name;
+            string name = ReadString(candidate, "name", "_name", "displayName", "_displayName", "title", "_title") ?? GetReadableName(candidate);
+            string dedupeKey = $"service:{typeName}:{name}";
+            if (!seenKeys.Add(dedupeKey))
+            {
+                continue;
+            }
+
+            items.Add(new Dictionary<string, object?>
+            {
+                ["shop_item_id"] = SanitizeActionId($"shop_service_{items.Count}_{name}"),
+                ["shop_item_index"] = items.Count,
+                ["item_type"] = "service",
+                ["name"] = name,
+                ["price"] = ReadPrice(candidate),
+                ["node_type"] = typeName,
+                ["visible"] = ReadBool(candidate, "Visible", "visible"),
+                ["visible_in_tree"] = TryInvokeBoolMethod(candidate, "IsVisibleInTree")
+            });
+        }
+    }
+
+    private static bool IsShopItemCandidate(object candidate, string typeHint)
+    {
+        string typeName = candidate.GetType().FullName ?? candidate.GetType().Name;
+        if (ContainsAny(typeName, "List", "Dictionary", "Collection", "Manager", "Reward", "Action", "Iterator", "GrabBag"))
+        {
+            return false;
+        }
+
+        if (ContainsAny(typeName, $"NMerchant{typeHint}", $"Merchant{typeHint}", $"Shop{typeHint}"))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static object? ResolveShopItemModel(object candidate, string typeHint)
+    {
+        string lowerHint = typeHint.ToLowerInvariant();
+        object? model = FindMemberValue(
+            candidate,
+            typeHint,
+            lowerHint,
+            "_" + lowerHint,
+            "Model",
+            "model",
+            "_model",
+            "Item",
+            "item",
+            "_item");
+        if (model is null)
+        {
+            return null;
+        }
+
+        string modelTypeName = model.GetType().FullName ?? model.GetType().Name;
+        return ContainsAny(modelTypeName, typeHint) ? model : null;
+    }
+
+    private static int? ReadPrice(params object?[] sources)
+    {
+        return ReadFirstInt(
+            sources,
+            "price",
+            "_price",
+            "Price",
+            "cost",
+            "_cost",
+            "Cost",
+            "goldCost",
+            "_goldCost",
+            "GoldCost",
+            "shopPrice",
+            "_shopPrice",
+            "ShopPrice");
+    }
+
+    private static bool? IsButtonEnabledOrVisible(object? button)
+    {
+        if (button is null)
+        {
+            return false;
+        }
+
+        return ReadBool(button, "IsEnabled", "isEnabled", "_isEnabled")
+            ?? IsLiveVisibleControlOrNull(button);
+    }
+
+    private static bool? IsLiveVisibleControlOrNull(object? source)
+    {
+        return source is null ? null : IsLiveVisibleControl(source);
+    }
+
+    private static List<Dictionary<string, object?>> BuildShopLegalActions(List<Dictionary<string, object?>> items, bool canProceed)
+    {
+        List<Dictionary<string, object?>> actions = new();
+        if (canProceed)
+        {
+            actions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = "proceed_shop",
+                ["type"] = "proceed_shop",
+                ["summary"] = "상점을 나가고 다음 화면으로 진행합니다.",
+                ["validation_note"] = "현재 상점 화면의 진행 버튼입니다."
+            });
+        }
+
+        return actions;
+    }
+
+    private static Dictionary<string, object?> BuildShopDebug(object shopScreen, ObjectGraph graph)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["current_root_type"] = shopScreen.GetType().FullName ?? shopScreen.GetType().Name,
+            ["observed_types"] = LastObservedTypes.ToArray(),
+            ["graph_node_count"] = graph.Nodes.Count,
+            ["shop_related_node_types"] = graph.Nodes
+                .Select(node => node.Value)
+                .Where(value => value is not null)
+                .Select(value => value!.GetType().FullName ?? value.GetType().Name)
+                .Where(typeName => ContainsAny(typeName, "Shop", "Merchant", "Store", "Relic", "Potion"))
+                .Distinct(StringComparer.Ordinal)
+                .Take(40)
+                .ToArray()
+        };
+    }
+
     private static Dictionary<string, object?> BuildRewardState(object rewardScreen)
     {
         object? managerCombatState = ReadCombatManagerDebugState(GetCombatManagerInstance());
@@ -587,6 +1972,25 @@ internal static class CombatStateExporter
         }
 
         return null;
+    }
+
+    private static bool IsRewardScreenCoveredByOpenMap(object rewardScreen)
+    {
+        object? mapScreen = FindMapScreen();
+        if (mapScreen is null)
+        {
+            return false;
+        }
+
+        bool? isComplete = ReadBool(rewardScreen, "IsComplete", "isComplete", "_isComplete");
+        if (isComplete == true)
+        {
+            return true;
+        }
+
+        Dictionary<string, object?> reward = BuildRewardScreenState(rewardScreen);
+        List<Dictionary<string, object?>> rewards = ReadDictionaryList(reward, "rewards");
+        return rewards.Count == 0;
     }
 
     private static bool IsRewardScreen(object? source)
@@ -1167,7 +2571,7 @@ internal static class CombatStateExporter
                 ["column"] = column,
                 ["room_type"] = roomType,
                 ["summary"] = $"지도에서 {roomType} 노드({row?.ToString() ?? "?"}, {column?.ToString() ?? "?"})를 선택한다.",
-                ["validation_note"] = "이번 단계에서는 관측용 후보만 생성한다. 실행기는 아직 지도 노드 선택을 수행하지 않는다."
+                ["validation_note"] = "현재 지도 화면에서 바로 선택 가능한 노드입니다."
             });
         }
 
@@ -2299,6 +3703,33 @@ internal static class CombatStateExporter
         return ReadObjectString(description);
     }
 
+    private static string? ReadFormattedText(object? source)
+    {
+        if (source is null)
+        {
+            return null;
+        }
+
+        if (source is string text)
+        {
+            return string.IsNullOrWhiteSpace(text) ? null : text;
+        }
+
+        string? formatted = TryInvokeMethod(source, "GetFormattedText") as string;
+        if (!string.IsNullOrWhiteSpace(formatted))
+        {
+            return formatted;
+        }
+
+        string? raw = TryInvokeMethod(source, "GetRawText") as string;
+        if (!string.IsNullOrWhiteSpace(raw))
+        {
+            return raw;
+        }
+
+        return ReadObjectString(source);
+    }
+
     private static List<Dictionary<string, object?>> BuildLegalActions(
         Dictionary<string, object?> piles,
         List<Dictionary<string, object?>> enemies,
@@ -2769,16 +4200,23 @@ internal static class CombatStateExporter
         foreach (object enemy in enemies)
         {
             object? enemyCreature = FindMemberValue(enemy, "Creature", "creature");
-            PowerGroups powerGroups = BuildPowerGroups(enemy, enemyCreature);
             int? combatId = ReadFirstInt(new[] { enemy, enemyCreature }, "CombatId", "combatId", "_combatId");
+            int? hp = ReadInt(enemy, "hp", "currentHp", "currentHealth", "health");
+            int? maxHp = ReadInt(enemy, "maxHp", "maxHealth");
+            if (!IsRuntimeEnemyCandidate(enemy, combatId, hp, maxHp))
+            {
+                continue;
+            }
+
+            PowerGroups powerGroups = BuildPowerGroups(enemy, enemyCreature);
 
             result.Add(new Dictionary<string, object?>
             {
                 ["id"] = ReadString(enemy, "id", "enemyId", "monsterId") ?? $"enemy_{index}",
                 ["combat_id"] = combatId,
                 ["name"] = ReadString(enemy, "name", "displayName") ?? GetReadableName(enemy),
-                ["hp"] = ReadInt(enemy, "hp", "currentHp", "currentHealth", "health"),
-                ["max_hp"] = ReadInt(enemy, "maxHp", "maxHealth"),
+                ["hp"] = hp,
+                ["max_hp"] = maxHp,
                 ["block"] = ReadInt(enemy, "block", "currentBlock", "shield"),
                 ["buffs"] = powerGroups.Buffs,
                 ["debuffs"] = powerGroups.Debuffs,
@@ -2789,6 +4227,27 @@ internal static class CombatStateExporter
         }
 
         return result;
+    }
+
+    private static bool IsRuntimeEnemyCandidate(object enemy, int? combatId, int? hp, int? maxHp)
+    {
+        if (combatId is not null)
+        {
+            return true;
+        }
+
+        if (hp is not null || maxHp is not null)
+        {
+            return true;
+        }
+
+        string typeName = enemy.GetType().FullName ?? enemy.GetType().Name;
+        if (ContainsAny(typeName, "List", "Tuple", "Dictionary", "Enumerable", "Collection"))
+        {
+            return false;
+        }
+
+        return false;
     }
 
     private static PowerGroups BuildPowerGroups(params object?[] owners)
@@ -3556,6 +5015,30 @@ internal static class CombatStateExporter
         else
         {
             yield return source;
+        }
+    }
+
+    private static IEnumerable<object> EnumerateNodeDescendants(object? node)
+    {
+        if (node is null)
+        {
+            yield break;
+        }
+
+        Queue<object> queue = new();
+        queue.Enqueue(node);
+        int visitedCount = 0;
+        while (queue.Count > 0 && visitedCount < 512)
+        {
+            object current = queue.Dequeue();
+            visitedCount++;
+            yield return current;
+
+            object? children = TryInvokeMethod(current, "GetChildren") ?? TryInvokeMethod(current, "GetChildren", false);
+            foreach (object child in EnumerateObjects(children).Where(value => !IsScalar(value.GetType())))
+            {
+                queue.Enqueue(child);
+            }
         }
     }
 

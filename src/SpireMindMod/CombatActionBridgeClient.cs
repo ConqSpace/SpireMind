@@ -43,7 +43,14 @@ internal static class CombatActionBridgeClient
                 "claim_potion_reward",
                 "choose_card_reward",
                 "skip_card_reward",
-                "proceed_reward_screen"
+                "proceed_reward_screen",
+                "choose_map_node",
+                "choose_event_option",
+                "choose_rest_site_option",
+                "proceed_rest_site",
+                "proceed_shop",
+                "choose_card_selection",
+                "confirm_card_selection"
             }
         };
 
