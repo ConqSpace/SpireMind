@@ -28,6 +28,8 @@ internal static class CombatActionExecutor
     private static long lastDiagnosticLogAtMs;
     private static PendingClaim? pendingClaim;
     private static PendingRewardCardSelection? pendingRewardCardSelection;
+    private static PendingMapNodeSelection? pendingMapNodeSelection;
+    private static PendingCombatActionConfirmation? pendingCombatActionConfirmation;
     private static long roomEnteredSignalCount;
 
     public static void StartBackgroundPolling()
@@ -68,6 +70,8 @@ internal static class CombatActionExecutor
     {
         AutotestCommandChannel.TickMainThread();
         TryExecutePendingRewardCardSelection();
+        TryExecutePendingMapNodeSelection();
+        TryExecutePendingCombatActionConfirmation();
         TryExecutePendingClaim();
         TryStartClaimRequest();
     }
@@ -86,6 +90,11 @@ internal static class CombatActionExecutor
 
     private static void TryStartClaimRequest()
     {
+        if (pendingRewardCardSelection is not null || pendingMapNodeSelection is not null || pendingCombatActionConfirmation is not null)
+        {
+            return;
+        }
+
         long nowMs = Environment.TickCount64;
         if (Volatile.Read(ref claimInFlight) == 1)
         {
@@ -239,14 +248,47 @@ internal static class CombatActionExecutor
             if (legalAction.ActionType.Equals("end_turn", StringComparison.OrdinalIgnoreCase))
             {
                 applied = TryExecuteEndTurn(context.CombatRoot, out detail);
+                if (applied)
+                {
+                    pendingCombatActionConfirmation = new PendingCombatActionConfirmation(
+                        legalAction,
+                        claim,
+                        context.StateId,
+                        detail,
+                        Environment.TickCount64);
+                    Logger.Info($"전투 행동 입력 후 상태 변화를 기다립니다. action={legalAction.ActionId}, detail={detail}");
+                    return;
+                }
             }
             else if (legalAction.ActionType.Equals("play_card", StringComparison.OrdinalIgnoreCase))
             {
                 applied = TryExecutePlayCard(legalAction, context.CombatRoot, out detail);
+                if (applied)
+                {
+                    pendingCombatActionConfirmation = new PendingCombatActionConfirmation(
+                        legalAction,
+                        claim,
+                        context.StateId,
+                        detail,
+                        Environment.TickCount64);
+                    Logger.Info($"전투 행동 입력 후 상태 변화를 기다립니다. action={legalAction.ActionId}, detail={detail}");
+                    return;
+                }
             }
             else if (legalAction.ActionType.Equals("use_potion", StringComparison.OrdinalIgnoreCase))
             {
                 applied = TryExecuteUsePotion(legalAction, context.CombatRoot, out detail);
+                if (applied)
+                {
+                    pendingCombatActionConfirmation = new PendingCombatActionConfirmation(
+                        legalAction,
+                        claim,
+                        context.StateId,
+                        detail,
+                        Environment.TickCount64);
+                    Logger.Info($"전투 행동 입력 후 상태 변화를 기다립니다. action={legalAction.ActionId}, detail={detail}");
+                    return;
+                }
             }
             else if (legalAction.ActionType.Equals("choose_event_option", StringComparison.OrdinalIgnoreCase))
             {
@@ -298,7 +340,12 @@ internal static class CombatActionExecutor
             }
             else if (legalAction.ActionType.Equals("choose_map_node", StringComparison.OrdinalIgnoreCase))
             {
-                applied = TryExecuteMapNodeSelection(legalAction, context.CombatRoot, out detail);
+                applied = TryExecuteMapNodeSelection(legalAction, context.CombatRoot, claim, out detail, out bool resultDeferred);
+                if (applied && resultDeferred)
+                {
+                    Logger.Info(detail);
+                    return;
+                }
             }
             else
             {
@@ -1439,8 +1486,11 @@ internal static class CombatActionExecutor
     private static bool TryExecuteMapNodeSelection(
         LegalActionSnapshot legalAction,
         object mapRoot,
-        out string detail)
+        PendingClaim claim,
+        out string detail,
+        out bool resultDeferred)
     {
+        resultDeferred = false;
         string rootTypeName = mapRoot.GetType().FullName ?? mapRoot.GetType().Name;
         if (!rootTypeName.Contains("NMapScreen", StringComparison.OrdinalIgnoreCase))
         {
@@ -1478,68 +1528,74 @@ internal static class CombatActionExecutor
         long roomEnteredBaseline = Interlocked.Read(ref roomEnteredSignalCount);
         bool roomEnteredSubscribed = TrySubscribeRoomEntered(out object? runManager, out Delegate? roomEnteredHandler, out string roomEnteredSubscribeDetail);
         List<string> invokedCandidates = new();
-        try
+        if (!roomEnteredSubscribed && !string.IsNullOrWhiteSpace(roomEnteredSubscribeDetail))
         {
-            if (!roomEnteredSubscribed && !string.IsNullOrWhiteSpace(roomEnteredSubscribeDetail))
-            {
-                invokedCandidates.Add($"room_entered_subscribe: {roomEnteredSubscribeDetail}");
-            }
-
-            if (TryCallDeferredNoArgs(mapPoint, "ForceClick", out string deferredFailureReason))
-            {
-                invokedCandidates.Add("point.CallDeferred(ForceClick)");
-                if (WaitForMapNodeSelection(mapRoot, legalAction, roomEnteredBaseline))
-                {
-                    detail = $"지도 노드 선택을 완료했습니다. method=point.CallDeferred(ForceClick), node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}, row={legalAction.MapRow?.ToString() ?? "?"}, column={legalAction.MapColumn?.ToString() ?? "?"}";
-                    Logger.Info(detail);
-                    return true;
-                }
-            }
-
-            List<(string Label, object? Source, string MethodName, object?[] Args)> candidates = new()
-            {
-                ("point.ForceClick", mapPoint, "ForceClick", Array.Empty<object?>()),
-                ("point.OnRelease", mapPoint, "OnRelease", Array.Empty<object?>()),
-                ("point.OnPressed", mapPoint, "OnPressed", Array.Empty<object?>()),
-                ("map.OnMapPointSelectedLocally(point)", mapRoot, "OnMapPointSelectedLocally", new object?[] { mapPoint })
-            };
-
-            foreach ((string label, object? source, string methodName, object?[] args) in candidates)
-            {
-                if (!TryInvokeMethod(source, methodName, out _, args))
-                {
-                    continue;
-                }
-
-                invokedCandidates.Add(label);
-                if (WaitForMapNodeSelection(mapRoot, legalAction, roomEnteredBaseline))
-                {
-                    detail = $"지도 노드 선택을 완료했습니다. method={label}, node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}, row={legalAction.MapRow?.ToString() ?? "?"}, column={legalAction.MapColumn?.ToString() ?? "?"}";
-                    Logger.Info(detail);
-                    return true;
-                }
-            }
-
-            if (deferredFailureReason.Length > 0)
-            {
-                invokedCandidates.Insert(0, $"point.CallDeferred(ForceClick): {deferredFailureReason}");
-            }
-        }
-        finally
-        {
-            if (roomEnteredSubscribed)
-            {
-                UnsubscribeRoomEntered(runManager, roomEnteredHandler);
-            }
+            invokedCandidates.Add($"room_entered_subscribe: {roomEnteredSubscribeDetail}");
         }
 
-        string currentScreenTypeName = GetCurrentScreenTypeName();
-        string tried = invokedCandidates.Count == 0 ? "<none>" : string.Join(", ", invokedCandidates);
-        bool? isStillTraveling = ReadNamedMember(mapRoot, "IsTraveling") is bool stillTraveling
-            ? stillTraveling
-            : null;
-        detail = $"지도 노드 선택 호출 뒤에도 목적지에 도달하지 못했습니다. tried={tried}, current_screen={currentScreenTypeName}, is_traveling={isStillTraveling?.ToString() ?? "<unknown>"}, node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}";
+        List<(string Label, object? Source, string MethodName, object?[] Args)> nonBlockingCandidates = new()
+        {
+            ("point.ForceClick", mapPoint, "ForceClick", Array.Empty<object?>()),
+            ("point.OnRelease", mapPoint, "OnRelease", Array.Empty<object?>()),
+            ("point.OnPressed", mapPoint, "OnPressed", Array.Empty<object?>()),
+            ("map.OnMapPointSelectedLocally(point)", mapRoot, "OnMapPointSelectedLocally", new object?[] { mapPoint })
+        };
+
+        foreach ((string label, object? source, string methodName, object?[] args) in nonBlockingCandidates)
+        {
+            if (!TryInvokeMethod(source, methodName, out _, args))
+            {
+                continue;
+            }
+
+            invokedCandidates.Add(label);
+            pendingMapNodeSelection = new PendingMapNodeSelection(
+                legalAction,
+                claim,
+                mapRoot,
+                legalAction.NodeId ?? BuildMapNodeId(mapPoint),
+                roomEnteredBaseline,
+                roomEnteredSubscribed ? runManager : null,
+                roomEnteredSubscribed ? roomEnteredHandler : null,
+                label,
+                Environment.TickCount64);
+            detail = $"지도 노드 선택 신호를 보냈고 방 진입 완료 판정을 예약했습니다. method={label}, node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}, row={legalAction.MapRow?.ToString() ?? "?"}, column={legalAction.MapColumn?.ToString() ?? "?"}";
+            resultDeferred = true;
+            return true;
+        }
+
+        if (TryCallDeferredNoArgs(mapPoint, "ForceClick", out string nonBlockingDeferredFailureReason))
+        {
+            invokedCandidates.Add("point.CallDeferred(ForceClick)");
+            pendingMapNodeSelection = new PendingMapNodeSelection(
+                legalAction,
+                claim,
+                mapRoot,
+                legalAction.NodeId ?? BuildMapNodeId(mapPoint),
+                roomEnteredBaseline,
+                roomEnteredSubscribed ? runManager : null,
+                roomEnteredSubscribed ? roomEnteredHandler : null,
+                "point.CallDeferred(ForceClick)",
+                Environment.TickCount64);
+            detail = $"지도 노드 선택 신호를 예약했고 방 진입 완료 판정을 기다립니다. method=point.CallDeferred(ForceClick), node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}, row={legalAction.MapRow?.ToString() ?? "?"}, column={legalAction.MapColumn?.ToString() ?? "?"}";
+            resultDeferred = true;
+            return true;
+        }
+
+        if (roomEnteredSubscribed)
+        {
+            UnsubscribeRoomEntered(runManager, roomEnteredHandler);
+        }
+
+        if (nonBlockingDeferredFailureReason.Length > 0)
+        {
+            invokedCandidates.Add($"point.CallDeferred(ForceClick): {nonBlockingDeferredFailureReason}");
+        }
+
+        string nonBlockingTried = invokedCandidates.Count == 0 ? "<none>" : string.Join(", ", invokedCandidates);
+        detail = $"지도 노드 선택 메서드를 호출하지 못했습니다. tried={nonBlockingTried}, node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}";
         return false;
+
     }
 
     private static bool TryExecuteRewardAction(
@@ -1933,35 +1989,91 @@ internal static class CombatActionExecutor
         return false;
     }
 
-    private static bool WaitForMapNodeSelection(object mapRoot, LegalActionSnapshot legalAction, long roomEnteredBaseline)
+    private static void TryExecutePendingMapNodeSelection()
     {
-        const int timeoutMs = 45000;
-        const int pollIntervalMs = 100;
-        Stopwatch stopwatch = Stopwatch.StartNew();
-        int stableCompletionPollCount = 0;
-        while (stopwatch.ElapsedMilliseconds < timeoutMs)
+        PendingMapNodeSelection? pending = pendingMapNodeSelection;
+        if (pending is null)
         {
-            Thread.Sleep(pollIntervalMs);
-            object? currentScreen = GetCurrentScreen();
-            bool roomEntered = Interlocked.Read(ref roomEnteredSignalCount) > roomEnteredBaseline;
-            bool screenLeftMap = currentScreen is not null && !IsMapScreen(currentScreen);
-            bool traveling = ReadNamedMember(mapRoot, "IsTraveling") is bool isTraveling && isTraveling;
-            bool arrivedAtTargetOnMap = !traveling && IsCurrentMapPointTarget(mapRoot, legalAction);
-            if (roomEntered || screenLeftMap || arrivedAtTargetOnMap)
-            {
-                stableCompletionPollCount++;
-                if (stableCompletionPollCount >= 5)
-                {
-                    return true;
-                }
-            }
-            else
-            {
-                stableCompletionPollCount = 0;
-            }
+            return;
         }
 
-        return false;
+        long nowMs = Environment.TickCount64;
+        if (nowMs - pending.StartedAtMs > 60000)
+        {
+            pendingMapNodeSelection = null;
+            UnsubscribeRoomEntered(pending.RunManager, pending.RoomEnteredHandler);
+            string currentScreenTypeName = GetCurrentScreenTypeName();
+            bool? isStillTraveling = ReadNamedMember(pending.MapRoot, "IsTraveling") is bool stillTraveling
+                ? stillTraveling
+                : null;
+            string detail = $"지도 노드 이동 완료를 제한 시간 안에 확인하지 못했습니다. method={pending.MethodLabel}, current_screen={currentScreenTypeName}, is_traveling={isStillTraveling?.ToString() ?? "<unknown>"}, node_id={pending.NodeId}";
+            Logger.Warning(detail);
+            RememberExecuted(pending.Claim.Action.SubmissionId);
+            ReportResult(pending.Claim, "failed", detail);
+            return;
+        }
+
+        object? currentScreen = GetCurrentScreen();
+        bool roomEntered = Interlocked.Read(ref roomEnteredSignalCount) > pending.RoomEnteredBaseline;
+        bool screenLeftMap = currentScreen is not null && !IsMapScreen(currentScreen);
+        bool traveling = ReadNamedMember(pending.MapRoot, "IsTraveling") is bool isTraveling && isTraveling;
+        bool arrivedAtTargetOnMap = !traveling && IsCurrentMapPointTarget(pending.MapRoot, pending.LegalAction);
+        if (roomEntered || screenLeftMap || arrivedAtTargetOnMap)
+        {
+            pending.StableCompletionPollCount++;
+            if (pending.StableCompletionPollCount < 5)
+            {
+                return;
+            }
+
+            pendingMapNodeSelection = null;
+            UnsubscribeRoomEntered(pending.RunManager, pending.RoomEnteredHandler);
+            string detail = $"지도 노드 이동 완료를 확인했습니다. method={pending.MethodLabel}, room_entered={roomEntered}, screen_left_map={screenLeftMap}, arrived_at_target={arrivedAtTargetOnMap}, node_id={pending.NodeId}";
+            Logger.Info(detail);
+            RememberExecuted(pending.Claim.Action.SubmissionId);
+            ReportResult(pending.Claim, "applied", detail);
+            return;
+        }
+
+        pending.StableCompletionPollCount = 0;
+    }
+
+    private static void TryExecutePendingCombatActionConfirmation()
+    {
+        PendingCombatActionConfirmation? pending = pendingCombatActionConfirmation;
+        if (pending is null)
+        {
+            return;
+        }
+
+        CombatActionContextSnapshot context = CombatActionRuntimeContext.GetSnapshot();
+        CombatStateBridgePoster.PostedStateSnapshot? postedState = CombatStateBridgePoster.GetLatestPostedState();
+        bool runtimeStateChanged = !string.IsNullOrWhiteSpace(context.StateId)
+            && !context.StateId.Equals(pending.InitialStateId, StringComparison.Ordinal);
+        bool postedStateChanged = postedState is not null
+            && !postedState.StateId.Equals(pending.Claim.PostedState.StateId, StringComparison.Ordinal);
+
+        if (runtimeStateChanged || postedStateChanged)
+        {
+            pendingCombatActionConfirmation = null;
+            string detail = $"전투 행동 적용 후 상태 변화를 확인했습니다. action={pending.LegalAction.ActionId}, input_detail={pending.InputDetail}, initial_state={pending.InitialStateId}, current_state={context.StateId ?? "<none>"}, posted_state={postedState?.StateId ?? "<none>"}";
+            Logger.Info(detail);
+            RememberExecuted(pending.Claim.Action.SubmissionId);
+            ReportResult(pending.Claim, "applied", detail, postedState);
+            return;
+        }
+
+        long nowMs = Environment.TickCount64;
+        if (nowMs - pending.StartedAtMs <= 10000)
+        {
+            return;
+        }
+
+        pendingCombatActionConfirmation = null;
+        string timeoutDetail = $"전투 행동 입력 후 제한 시간 안에 상태 변화가 관찰되지 않았습니다. action={pending.LegalAction.ActionId}, input_detail={pending.InputDetail}, state={context.StateId ?? "<none>"}";
+        Logger.Warning(timeoutDetail);
+        RememberExecuted(pending.Claim.Action.SubmissionId);
+        ReportResult(pending.Claim, "failed", timeoutDetail, postedState);
     }
 
     private static bool TrySubscribeRoomEntered(out object? runManager, out Delegate? handler, out string detail)
@@ -3665,17 +3777,22 @@ internal static class CombatActionExecutor
         }
     }
 
-    private static void ReportResult(PendingClaim claim, string result, string note)
+    private static void ReportResult(
+        PendingClaim claim,
+        string result,
+        string note,
+        CombatStateBridgePoster.PostedStateSnapshot? observedState = null)
     {
         _ = Task.Run(async () =>
         {
             try
             {
+                CombatStateBridgePoster.PostedStateSnapshot resultState = observedState ?? claim.PostedState;
                 using CancellationTokenSource cancellation = new(1500);
                 await CombatActionBridgeClient.ReportResultAsync(
                     claim.Action,
                     result,
-                    claim.PostedState,
+                    resultState,
                     note,
                     cancellation.Token).ConfigureAwait(false);
                 Logger.Info($"행동 실행 결과 보고: {result} ({claim.Action.SubmissionId})");
@@ -3695,4 +3812,34 @@ internal static class CombatActionExecutor
         int CardRewardIndex,
         PendingClaim Claim,
         long StartedAtMs);
+
+    private sealed record PendingCombatActionConfirmation(
+        LegalActionSnapshot LegalAction,
+        PendingClaim Claim,
+        string InitialStateId,
+        string InputDetail,
+        long StartedAtMs);
+
+    private sealed class PendingMapNodeSelection(
+        LegalActionSnapshot legalAction,
+        PendingClaim claim,
+        object mapRoot,
+        string nodeId,
+        long roomEnteredBaseline,
+        object? runManager,
+        Delegate? roomEnteredHandler,
+        string methodLabel,
+        long startedAtMs)
+    {
+        public LegalActionSnapshot LegalAction { get; } = legalAction;
+        public PendingClaim Claim { get; } = claim;
+        public object MapRoot { get; } = mapRoot;
+        public string NodeId { get; } = nodeId;
+        public long RoomEnteredBaseline { get; } = roomEnteredBaseline;
+        public object? RunManager { get; } = runManager;
+        public Delegate? RoomEnteredHandler { get; } = roomEnteredHandler;
+        public string MethodLabel { get; } = methodLabel;
+        public long StartedAtMs { get; } = startedAtMs;
+        public int StableCompletionPollCount { get; set; }
+    }
 }

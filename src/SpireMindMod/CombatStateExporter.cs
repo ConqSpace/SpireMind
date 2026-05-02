@@ -1304,6 +1304,8 @@ internal static class CombatStateExporter
 
         Dictionary<string, object?> eventState = BuildEventScreenState(eventRoom, eventModel, layout);
         List<Dictionary<string, object?>> options = ReadDictionaryList(eventState, "options");
+        string eventFingerprint = BuildEventFingerprint(eventState, options);
+        eventState["fingerprint"] = eventFingerprint;
 
         return new Dictionary<string, object?>
         {
@@ -1316,7 +1318,7 @@ internal static class CombatStateExporter
             ["piles"] = BuildEmptyPiles(),
             ["enemies"] = new List<Dictionary<string, object?>>(),
             ["event"] = eventState,
-            ["legal_actions"] = BuildEventLegalActions(options),
+            ["legal_actions"] = BuildEventLegalActions(options, eventFingerprint),
             ["relics"] = BuildRelics(relicsSource, graph),
             ["debug"] = BuildEventDebug(eventRoom, eventModel, layout, graph)
         };
@@ -1433,6 +1435,7 @@ internal static class CombatStateExporter
             ["is_enabled"] = ReadBool(button, "IsEnabled", "isEnabled", "_isEnabled"),
             ["type_name"] = option?.GetType().FullName ?? option?.GetType().Name,
             ["button_type_name"] = button.GetType().FullName ?? button.GetType().Name,
+            ["fingerprint"] = BuildEventOptionFingerprint(optionId, optionIndex, title, description, ReadString(option, "TextKey", "textKey", "_textKey")),
             ["summary"] = BuildEventOptionSummary(title, description, optionId)
         };
     }
@@ -1453,7 +1456,7 @@ internal static class CombatStateExporter
         return typeName.Contains("NEventOptionButton", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static List<Dictionary<string, object?>> BuildEventLegalActions(List<Dictionary<string, object?>> options)
+    private static List<Dictionary<string, object?>> BuildEventLegalActions(List<Dictionary<string, object?>> options, string eventFingerprint)
     {
         List<Dictionary<string, object?>> actions = new();
         foreach (Dictionary<string, object?> option in options)
@@ -1475,14 +1478,79 @@ internal static class CombatStateExporter
                 ["text_key"] = ReadDictionaryString(option, "text_key"),
                 ["title"] = ReadDictionaryString(option, "title"),
                 ["description"] = ReadDictionaryString(option, "description"),
+                ["event_fingerprint"] = eventFingerprint,
+                ["option_fingerprint"] = ReadDictionaryString(option, "fingerprint"),
                 ["is_proceed"] = ReadDictionaryBool(option, "is_proceed"),
                 ["will_kill_player"] = ReadDictionaryBool(option, "will_kill_player"),
+                ["execution"] = new Dictionary<string, object?>
+                {
+                    ["schema"] = "event_action_execution.v1",
+                    ["event_fingerprint"] = eventFingerprint,
+                    ["option_fingerprint"] = ReadDictionaryString(option, "fingerprint"),
+                    ["checks"] = new Dictionary<string, object?>
+                    {
+                        ["event_option_index"] = optionIndex,
+                        ["is_locked_at_export"] = ReadDictionaryBool(option, "is_locked") == true,
+                        ["is_enabled_at_export"] = ReadDictionaryBool(option, "is_enabled"),
+                        ["runtime_state_rechecked_before_execution"] = true
+                    }
+                },
                 ["summary"] = $"Choose event option: {summary}",
-                ["validation_note"] = "Visible event option button."
+                ["validation_note"] = "Visible event option button. Runtime execution rechecks option index and current visible event screen."
             });
         }
 
         return actions;
+    }
+
+    private static string BuildEventFingerprint(Dictionary<string, object?> eventState, List<Dictionary<string, object?>> options)
+    {
+        Dictionary<string, object?> comparable = new()
+        {
+            ["event_id"] = ReadDictionaryString(eventState, "event_id"),
+            ["title"] = ReadDictionaryString(eventState, "title"),
+            ["description"] = ReadDictionaryString(eventState, "description"),
+            ["options"] = options
+                .Select(option => new Dictionary<string, object?>
+                {
+                    ["event_option_index"] = ReadDictionaryInt(option, "event_option_index"),
+                    ["text_key"] = ReadDictionaryString(option, "text_key"),
+                    ["title"] = ReadDictionaryString(option, "title"),
+                    ["description"] = ReadDictionaryString(option, "description"),
+                    ["is_locked"] = ReadDictionaryBool(option, "is_locked"),
+                    ["is_proceed"] = ReadDictionaryBool(option, "is_proceed")
+                })
+                .ToList()
+        };
+
+        return ComputeStableFingerprint(comparable);
+    }
+
+    private static string BuildEventOptionFingerprint(
+        string optionId,
+        int optionIndex,
+        string? title,
+        string? description,
+        string? textKey)
+    {
+        Dictionary<string, object?> comparable = new()
+        {
+            ["event_option_id"] = optionId,
+            ["event_option_index"] = optionIndex,
+            ["text_key"] = textKey,
+            ["title"] = title,
+            ["description"] = description
+        };
+
+        return ComputeStableFingerprint(comparable);
+    }
+
+    private static string ComputeStableFingerprint(Dictionary<string, object?> value)
+    {
+        Dictionary<string, object?> normalized = NormalizeStateForJson(value, "stable_fingerprint");
+        string json = JsonSerializer.Serialize(normalized, JsonOptions);
+        byte[] hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(json));
+        return Convert.ToHexString(hashBytes).ToLowerInvariant();
     }
 
     private static Dictionary<string, object?> BuildEventDebug(object eventRoom, object? eventModel, object? layout, ObjectGraph graph)
@@ -4712,11 +4780,16 @@ internal static class CombatStateExporter
                     int? targetCombatId = ReadDictionaryInt(enemy, "combat_id");
                     actions.Add(CreatePlayCardAction(
                         $"play_{cardInstanceId}_{targetId}",
+                        card,
                         cardInstanceId,
                         combatCardId,
+                        true,
                         targetId,
                         targetCombatId,
+                        enemy,
                         energyCost,
+                        playerEnergy,
+                        playable,
                         $"Play {cardName} on {enemyName}.",
                         BuildValidationNote(card, enemy, playerEnergy, energyCost, playable, true)));
                 }
@@ -4725,11 +4798,16 @@ internal static class CombatStateExporter
             {
                 actions.Add(CreatePlayCardAction(
                     $"play_{cardInstanceId}_no_target",
+                    card,
                     cardInstanceId,
                     combatCardId,
+                    false,
+                    null,
                     null,
                     null,
                     energyCost,
+                    playerEnergy,
+                    playable,
                     $"Play {cardName} with no target.",
                     BuildValidationNote(card, null, playerEnergy, energyCost, playable, false)));
             }
@@ -4781,6 +4859,7 @@ internal static class CombatStateExporter
                         true,
                         targetId,
                         targetCombatId,
+                        enemy,
                         $"Use {potionName} on {enemyName}."));
                 }
             }
@@ -4794,6 +4873,7 @@ internal static class CombatStateExporter
                     false,
                     null,
                     null,
+                    null,
                     $"Use {potionName}."));
             }
         }
@@ -4805,6 +4885,15 @@ internal static class CombatStateExporter
             ["card_instance_id"] = null,
             ["target_id"] = null,
             ["energy_cost"] = null,
+            ["requires_target"] = false,
+            ["execution"] = new Dictionary<string, object?>
+            {
+                ["schema"] = "combat_action_execution.v1",
+                ["checks"] = new Dictionary<string, object?>
+                {
+                    ["runtime_state_rechecked_before_execution"] = true
+                }
+            },
             ["summary"] = "End the current turn.",
             ["validation_note"] = "Always generated by exporter; no game action is executed during export."
         });
@@ -4814,11 +4903,16 @@ internal static class CombatStateExporter
 
     private static Dictionary<string, object?> CreatePlayCardAction(
         string actionId,
+        Dictionary<string, object?> card,
         string cardInstanceId,
         int? combatCardId,
+        bool requiresTarget,
         string? targetId,
         int? targetCombatId,
+        Dictionary<string, object?>? enemy,
         int? energyCost,
+        int? playerEnergy,
+        bool? playable,
         string summary,
         string validationNote)
     {
@@ -4831,6 +4925,18 @@ internal static class CombatStateExporter
             ["target_id"] = targetId,
             ["target_combat_id"] = targetCombatId,
             ["energy_cost"] = energyCost,
+            ["requires_target"] = requiresTarget,
+            ["execution"] = BuildPlayCardExecutionMetadata(
+                card,
+                cardInstanceId,
+                combatCardId,
+                requiresTarget,
+                targetId,
+                targetCombatId,
+                enemy,
+                energyCost,
+                playerEnergy,
+                playable),
             ["summary"] = summary,
             ["validation_note"] = validationNote
         };
@@ -4844,6 +4950,7 @@ internal static class CombatStateExporter
         bool requiresTarget,
         string? targetId,
         int? targetCombatId,
+        Dictionary<string, object?>? enemy,
         string summary)
     {
         return new Dictionary<string, object?>
@@ -4856,8 +4963,100 @@ internal static class CombatStateExporter
             ["requires_target"] = requiresTarget,
             ["target_id"] = targetId,
             ["target_combat_id"] = targetCombatId,
+            ["execution"] = BuildUsePotionExecutionMetadata(
+                potionSlotIndex,
+                potionId,
+                targetType,
+                requiresTarget,
+                targetId,
+                targetCombatId,
+                enemy),
             ["summary"] = summary,
             ["validation_note"] = "Runtime validation checks the same potion slot, potion id, target requirement, and target liveness before enqueueing UsePotionAction."
+        };
+    }
+
+    private static Dictionary<string, object?> BuildPlayCardExecutionMetadata(
+        Dictionary<string, object?> card,
+        string cardInstanceId,
+        int? combatCardId,
+        bool requiresTarget,
+        string? targetId,
+        int? targetCombatId,
+        Dictionary<string, object?>? enemy,
+        int? energyCost,
+        int? playerEnergy,
+        bool? playable)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["schema"] = "combat_action_execution.v1",
+            ["card"] = new Dictionary<string, object?>
+            {
+                ["instance_id"] = cardInstanceId,
+                ["combat_card_id"] = combatCardId,
+                ["card_id"] = ReadDictionaryString(card, "card_id"),
+                ["name"] = ReadDictionaryString(card, "name"),
+                ["type"] = ReadDictionaryString(card, "type"),
+                ["cost"] = energyCost,
+                ["playable"] = playable
+            },
+            ["target"] = enemy is null
+                ? null
+                : new Dictionary<string, object?>
+                {
+                    ["id"] = targetId,
+                    ["combat_id"] = targetCombatId,
+                    ["name"] = ReadDictionaryString(enemy, "name"),
+                    ["hp"] = ReadDictionaryInt(enemy, "hp"),
+                    ["block"] = ReadDictionaryInt(enemy, "block")
+                },
+            ["checks"] = new Dictionary<string, object?>
+            {
+                ["requires_target"] = requiresTarget,
+                ["has_target"] = !string.IsNullOrWhiteSpace(targetId),
+                ["energy_cost"] = energyCost,
+                ["player_energy_at_export"] = playerEnergy,
+                ["affordable_at_export"] = playerEnergy is null || energyCost is null || energyCost.Value <= playerEnergy.Value,
+                ["runtime_state_rechecked_before_execution"] = true
+            }
+        };
+    }
+
+    private static Dictionary<string, object?> BuildUsePotionExecutionMetadata(
+        int potionSlotIndex,
+        string potionId,
+        string? targetType,
+        bool requiresTarget,
+        string? targetId,
+        int? targetCombatId,
+        Dictionary<string, object?>? enemy)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["schema"] = "combat_action_execution.v1",
+            ["potion"] = new Dictionary<string, object?>
+            {
+                ["slot_index"] = potionSlotIndex,
+                ["potion_id"] = potionId,
+                ["target_type"] = targetType
+            },
+            ["target"] = enemy is null
+                ? null
+                : new Dictionary<string, object?>
+                {
+                    ["id"] = targetId,
+                    ["combat_id"] = targetCombatId,
+                    ["name"] = ReadDictionaryString(enemy, "name"),
+                    ["hp"] = ReadDictionaryInt(enemy, "hp"),
+                    ["block"] = ReadDictionaryInt(enemy, "block")
+                },
+            ["checks"] = new Dictionary<string, object?>
+            {
+                ["requires_target"] = requiresTarget,
+                ["has_target"] = !string.IsNullOrWhiteSpace(targetId),
+                ["runtime_state_rechecked_before_execution"] = true
+            }
         };
     }
 

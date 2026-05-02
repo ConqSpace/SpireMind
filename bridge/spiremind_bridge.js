@@ -703,6 +703,7 @@ function updateCurrentState(state, nextState) {
     state_id: envelope.state_id,
     legal_action_count: envelope.legal_action_ids.length
   });
+  correlateActionResultWithState(state, envelope);
   advanceActionPlanAfterStateUpdate(state);
   return envelope;
 }
@@ -1000,10 +1001,181 @@ function createActionSubmission(state, actionArguments) {
     result_reported_at: null,
     source: source || null,
     note: note || null,
+    pre_action_state_id: stateEnvelope.state_id,
+    pre_action_state_version: stateEnvelope.state_version,
+    pre_action_state_summary: summarizeStateForAction(state.currentState, selectedActionId),
     reason: isValid
       ? "최신 state_version의 legal_actions 안에 있습니다."
       : "selected_action_id가 없거나, expected_state_version이 최신 state_version과 다릅니다."
   };
+}
+
+function correlateActionResultWithState(state, envelope) {
+  const latestAction = state.latestAction;
+  if (!latestAction || latestAction.result === null || !latestAction.result_reported_at) {
+    return;
+  }
+
+  if (latestAction.post_result_state_version !== undefined && latestAction.post_result_state_version !== null) {
+    return;
+  }
+
+  if (envelope.state_version <= latestAction.state_version) {
+    return;
+  }
+
+  const postSummary = summarizeStateForAction(envelope.state, latestAction.selected_action_id);
+  const delta = compareActionStateSummaries(
+    latestAction.pre_action_state_summary || null,
+    postSummary,
+    latestAction.action || null);
+
+  latestAction.post_result_state_id = envelope.state_id;
+  latestAction.post_result_state_version = envelope.state_version;
+  latestAction.post_result_received_at = envelope.received_at;
+  latestAction.post_result_state_summary = postSummary;
+  latestAction.state_delta = delta;
+
+  writeJsonFile(state.latestActionFilePath, latestAction);
+  appendEvent(state, "action_state_observed", {
+    submission_id: latestAction.submission_id,
+    selected_action_id: latestAction.selected_action_id || null,
+    action_type: latestAction.action_type || null,
+    result: latestAction.result,
+    pre_state_version: latestAction.pre_action_state_version ?? null,
+    result_observed_state_version: latestAction.result_observed_state_version ?? null,
+    post_state_version: envelope.state_version,
+    state_delta: delta
+  });
+}
+
+function summarizeStateForAction(combatState, selectedActionId) {
+  if (!isPlainObject(combatState)) {
+    return null;
+  }
+
+  const player = isPlainObject(combatState.player) ? combatState.player : {};
+  const piles = isPlainObject(combatState.piles) ? combatState.piles : {};
+  const hand = Array.isArray(piles.hand) ? piles.hand : [];
+  const enemies = Array.isArray(combatState.enemies) ? combatState.enemies : [];
+  const potionSlots = Array.isArray(player.potion_slots) ? player.potion_slots : [];
+  const legalAction = getLegalActionById(combatState, selectedActionId);
+
+  return {
+    phase: typeof combatState.phase === "string" ? combatState.phase : null,
+    state_id: getStateId(combatState),
+    player: {
+      hp: toNullableNumber(player.hp),
+      block: toNullableNumber(player.block),
+      energy: toNullableNumber(player.energy),
+      gold: toNullableNumber(player.gold)
+    },
+    hand: hand.map((card) => ({
+      instance_id: readTrimmedString(card && (card.instance_id || card.instanceId)),
+      combat_card_id: toNullableNumber(card && (card.combat_card_id ?? card.combatCardId)),
+      card_id: readTrimmedString(card && (card.card_id || card.cardId)),
+      name: readTrimmedString(card && card.name)
+    })),
+    enemies: enemies.map((enemy) => ({
+      id: readTrimmedString(enemy && enemy.id),
+      combat_id: toNullableNumber(enemy && (enemy.combat_id ?? enemy.combatId)),
+      name: readTrimmedString(enemy && enemy.name),
+      hp: toNullableNumber(enemy && enemy.hp),
+      block: toNullableNumber(enemy && enemy.block),
+      alive: enemy && typeof enemy.alive === "boolean" ? enemy.alive : null
+    })),
+    potion_slots: potionSlots.map((slot) => {
+      const potion = isPlainObject(slot && slot.potion) ? slot.potion : null;
+      return {
+        slot_index: toNullableNumber(slot && (slot.slot_index ?? slot.slotIndex)),
+        empty: slot && typeof slot.empty === "boolean" ? slot.empty : null,
+        potion_id: potion ? readTrimmedString(potion.potion_id || potion.potionId || potion.id) : null
+      };
+    }),
+    selected_action: legalAction ? {
+      action_id: readTrimmedString(legalAction.action_id || legalAction.actionId),
+      type: readTrimmedString(legalAction.type),
+      card_instance_id: readTrimmedString(legalAction.card_instance_id || legalAction.cardInstanceId),
+      combat_card_id: toNullableNumber(legalAction.combat_card_id ?? legalAction.combatCardId),
+      potion_slot_index: toNullableNumber(legalAction.potion_slot_index ?? legalAction.potionSlotIndex),
+      target_id: readTrimmedString(legalAction.target_id || legalAction.targetId)
+    } : null
+  };
+}
+
+function compareActionStateSummaries(before, after, action) {
+  if (!before || !after) {
+    return {
+      comparable: false,
+      reason: "pre 또는 post 상태 요약이 없습니다."
+    };
+  }
+
+  const actionType = readTrimmedString(action && action.type);
+  const selectedCombatCardId = toNullableNumber(action && (action.combat_card_id ?? action.combatCardId));
+  const selectedPotionSlotIndex = toNullableNumber(action && (action.potion_slot_index ?? action.potionSlotIndex));
+  const selectedTargetCombatId = toNullableNumber(action && (action.target_combat_id ?? action.targetCombatId));
+
+  const beforeHandIds = new Set((before.hand || []).map((card) => card.combat_card_id).filter((value) => value !== null));
+  const afterHandIds = new Set((after.hand || []).map((card) => card.combat_card_id).filter((value) => value !== null));
+  const selectedCardLeftHand = selectedCombatCardId !== null
+    ? beforeHandIds.has(selectedCombatCardId) && !afterHandIds.has(selectedCombatCardId)
+    : null;
+
+  const beforePotion = findPotionSlotSummary(before, selectedPotionSlotIndex);
+  const afterPotion = findPotionSlotSummary(after, selectedPotionSlotIndex);
+  const potionSlotChanged = beforePotion && afterPotion
+    ? beforePotion.empty !== afterPotion.empty || beforePotion.potion_id !== afterPotion.potion_id
+    : null;
+
+  const beforeTarget = findEnemySummary(before, selectedTargetCombatId);
+  const afterTarget = findEnemySummary(after, selectedTargetCombatId);
+  const targetHpChanged = beforeTarget && afterTarget
+    ? beforeTarget.hp !== afterTarget.hp
+    : null;
+
+  return {
+    comparable: true,
+    action_type: actionType || null,
+    phase_changed: before.phase !== after.phase,
+    state_id_changed: before.state_id !== after.state_id,
+    player_energy_changed: before.player.energy !== after.player.energy,
+    player_block_changed: before.player.block !== after.player.block,
+    hand_count_delta: (after.hand || []).length - (before.hand || []).length,
+    selected_card_left_hand: selectedCardLeftHand,
+    potion_slot_changed: potionSlotChanged,
+    target_hp_changed: targetHpChanged,
+    enemy_count_delta: (after.enemies || []).length - (before.enemies || []).length
+  };
+}
+
+function findPotionSlotSummary(summary, slotIndex) {
+  if (slotIndex === null || !summary || !Array.isArray(summary.potion_slots)) {
+    return null;
+  }
+
+  return summary.potion_slots.find((slot) => slot.slot_index === slotIndex) || null;
+}
+
+function findEnemySummary(summary, combatId) {
+  if (combatId === null || !summary || !Array.isArray(summary.enemies)) {
+    return null;
+  }
+
+  return summary.enemies.find((enemy) => enemy.combat_id === combatId) || null;
+}
+
+function toNullableNumber(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
 }
 
 function getSupportedActionTypes(claimArguments) {
@@ -1224,9 +1396,12 @@ function createActionResult(state, resultArguments) {
     submission_id: latestAction.submission_id,
     claim_token: latestAction.claim_token,
     executor_id: executorId || null,
+    selected_action_id: latestAction.selected_action_id || null,
+    action_type: latestAction.action_type || null,
     result,
     observed_state_id: observedStateId || null,
-    observed_state_version: observedStateVersion >= 0 ? observedStateVersion : null
+    observed_state_version: observedStateVersion >= 0 ? observedStateVersion : null,
+    result_note: note || null
   });
 
   if (result === "stale") {
