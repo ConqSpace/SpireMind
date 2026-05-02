@@ -1256,10 +1256,33 @@ function getCurrentStatePayload(state) {
     state_version: state.stateVersion,
     received_at: state.currentStateReceivedAt,
     state_id: state.currentStateId,
+    room_context_summary: getRoomContextSummary(state.currentState),
     legal_action_ids: state.legalActionIds,
     state: state.currentState,
     latest_action: state.latestAction,
     action_plan: state.actionPlan
+  };
+}
+
+function getRoomContextSummary(currentState) {
+  if (!isPlainObject(currentState)) {
+    return null;
+  }
+
+  const roomContext = isPlainObject(currentState.room_context) ? currentState.room_context : {};
+  const currentRoom = isPlainObject(roomContext.current_room) ? roomContext.current_room : {};
+  const currentMapPoint = isPlainObject(roomContext.current_map_point) ? roomContext.current_map_point : {};
+  return {
+    phase: typeof currentState.phase === "string" ? currentState.phase : null,
+    room_kind: typeof currentRoom.kind === "string" ? currentRoom.kind : null,
+    room_type: typeof currentRoom.type_name === "string" ? currentRoom.type_name : null,
+    room_name: typeof currentRoom.name === "string" ? currentRoom.name : null,
+    screen_type: typeof roomContext.current_screen_type === "string" ? roomContext.current_screen_type : null,
+    map_point_kind: typeof currentMapPoint.kind === "string" ? currentMapPoint.kind : null,
+    map_row: readOptionalInteger(currentMapPoint.row),
+    map_column: readOptionalInteger(currentMapPoint.column),
+    run_in_progress: roomContext.run_in_progress === true ? true : (roomContext.run_in_progress === false ? false : null),
+    combat_in_progress: roomContext.combat_in_progress === true ? true : (roomContext.combat_in_progress === false ? false : null)
   };
 }
 

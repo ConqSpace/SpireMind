@@ -464,6 +464,7 @@ internal static class CombatStateExporter
         bool force,
         bool tickAfterExport)
     {
+        state["room_context"] = BuildRoomContext(runtimeRoot, state);
         string stateFingerprint = ComputeStateFingerprint(state);
         state["state_id"] = $"{stateIdPrefix}_{stateFingerprint[..16]}";
         state["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -506,6 +507,125 @@ internal static class CombatStateExporter
         }
 
         return safeState;
+    }
+
+    private static Dictionary<string, object?> BuildRoomContext(object runtimeRoot, Dictionary<string, object?> state)
+    {
+        object? runManager = GetStaticPropertyValue("MegaCrit.Sts2.Core.Runs.RunManager", "Instance");
+        object? runState = FindMemberValue(runManager, "RunState", "runState", "_runState", "State", "state")
+            ?? FindMemberValue(runtimeRoot, "RunState", "runState", "_runState", "State", "state");
+        object? currentRoom = FindMemberValue(runManager, "CurrentRoom", "currentRoom", "_currentRoom")
+            ?? FindMemberValue(runState, "CurrentRoom", "currentRoom", "_currentRoom")
+            ?? FindMemberValue(runtimeRoot, "CurrentRoom", "currentRoom", "_currentRoom");
+        object? currentMapPoint = FindMemberValue(runState, "CurrentMapPoint", "currentMapPoint", "_currentMapPoint")
+            ?? FindMemberValue(runManager, "CurrentMapPoint", "currentMapPoint", "_currentMapPoint");
+        object? currentCoord = FindMemberValue(runState, "CurrentMapCoord", "currentMapCoord", "_currentMapCoord")
+            ?? FindMemberValue(currentMapPoint, "coord", "Coord", "_coord");
+        object? combatManager = GetCombatManagerInstance();
+        object? screenContext = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext",
+            "Instance");
+        object? currentScreen = TryInvokeMethod(screenContext, "GetCurrentScreen");
+        string phase = ReadDictionaryString(state, "phase") ?? "unknown";
+
+        return new Dictionary<string, object?>
+        {
+            ["phase"] = phase,
+            ["observed_root_type"] = runtimeRoot.GetType().FullName ?? runtimeRoot.GetType().Name,
+            ["observed_root_name"] = GetReadableName(runtimeRoot),
+            ["current_screen_type"] = currentScreen?.GetType().FullName ?? currentScreen?.GetType().Name,
+            ["current_screen_name"] = currentScreen is null ? null : GetReadableName(currentScreen),
+            ["run_in_progress"] = ReadBool(runManager, "IsInProgress", "isInProgress", "_isInProgress"),
+            ["combat_in_progress"] = ReadBool(combatManager, "IsInProgress", "isInProgress", "_isInProgress"),
+            ["combat_play_phase"] = ReadBool(combatManager, "IsPlayPhase", "isPlayPhase", "_isPlayPhase"),
+            ["current_room"] = BuildRoomObjectSummary(currentRoom),
+            ["current_map_point"] = BuildMapPointObjectSummary(currentMapPoint, currentCoord)
+        };
+    }
+
+    private static Dictionary<string, object?>? BuildRoomObjectSummary(object? room)
+    {
+        if (room is null)
+        {
+            return null;
+        }
+
+        string typeName = room.GetType().FullName ?? room.GetType().Name;
+        return new Dictionary<string, object?>
+        {
+            ["type_name"] = typeName,
+            ["kind"] = ClassifyRoomKind(typeName, GetReadableName(room)),
+            ["name"] = GetReadableName(room),
+            ["room_id"] = ReadModelIdentifier(room),
+            ["is_complete"] = ReadBool(room, "IsComplete", "isComplete", "_isComplete", "Complete", "complete"),
+            ["is_visited"] = ReadBool(room, "IsVisited", "isVisited", "_isVisited", "Visited", "visited")
+        };
+    }
+
+    private static Dictionary<string, object?>? BuildMapPointObjectSummary(object? mapPoint, object? coord)
+    {
+        if (mapPoint is null && coord is null)
+        {
+            return null;
+        }
+
+        object? pointType = FindMemberValue(mapPoint, "Type", "type", "_type", "PointType", "pointType", "_pointType");
+        string? readableName = mapPoint is null ? null : GetReadableName(mapPoint);
+        return new Dictionary<string, object?>
+        {
+            ["type_name"] = mapPoint?.GetType().FullName ?? mapPoint?.GetType().Name,
+            ["kind"] = pointType?.ToString() ?? ClassifyRoomKind(mapPoint?.GetType().FullName, readableName),
+            ["name"] = readableName,
+            ["row"] = ReadInt(coord, "Row", "row", "Y", "y"),
+            ["column"] = ReadInt(coord, "Column", "column", "X", "x"),
+            ["map_point_id"] = ReadModelIdentifier(mapPoint)
+        };
+    }
+
+    private static string ClassifyRoomKind(string? typeName, string? readableName)
+    {
+        string text = $"{typeName ?? string.Empty} {readableName ?? string.Empty}";
+        if (ContainsAny(text, "Shop", "Merchant", "Store"))
+        {
+            return "shop";
+        }
+
+        if (ContainsAny(text, "Rest", "Campfire", "Bonfire"))
+        {
+            return "rest_site";
+        }
+
+        if (ContainsAny(text, "Event", "Unknown"))
+        {
+            return "event";
+        }
+
+        if (ContainsAny(text, "Treasure", "Chest"))
+        {
+            return "treasure";
+        }
+
+        if (ContainsAny(text, "Elite"))
+        {
+            return "elite";
+        }
+
+        if (ContainsAny(text, "Boss"))
+        {
+            return "boss";
+        }
+
+        if (ContainsAny(text, "Monster", "Combat"))
+        {
+            return "monster";
+        }
+
+        if (ContainsAny(text, "Map"))
+        {
+            return "map";
+        }
+
+        return "unknown";
     }
 
     private static CombatExportProbe BuildExportProbe(Dictionary<string, object?>? state, bool isInProgress, string reason)

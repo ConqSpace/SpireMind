@@ -381,11 +381,26 @@ function summarizeState(snapshot) {
   const enemies = Array.isArray(state.enemies) ? state.enemies.filter(isPlainObject) : [];
   const legalActions = Array.isArray(state.legal_actions) ? state.legal_actions.filter(isPlainObject) : [];
   const gameOver = isPlainObject(state.game_over) ? state.game_over : null;
+  const roomContext = isPlainObject(state.room_context) ? state.room_context : {};
+  const currentRoom = isPlainObject(roomContext.current_room) ? roomContext.current_room : {};
+  const currentMapPoint = isPlainObject(roomContext.current_map_point) ? roomContext.current_map_point : {};
 
   return {
     state_version: readNumber(snapshot.state_version),
     state_id: typeof snapshot.state_id === "string" ? snapshot.state_id : state.state_id || null,
     phase: typeof state.phase === "string" ? state.phase : null,
+    room_context: {
+      room_kind: typeof currentRoom.kind === "string" ? currentRoom.kind : null,
+      room_type: typeof currentRoom.type_name === "string" ? currentRoom.type_name : null,
+      room_name: typeof currentRoom.name === "string" ? currentRoom.name : null,
+      screen_type: typeof roomContext.current_screen_type === "string" ? roomContext.current_screen_type : null,
+      screen_name: typeof roomContext.current_screen_name === "string" ? roomContext.current_screen_name : null,
+      map_point_kind: typeof currentMapPoint.kind === "string" ? currentMapPoint.kind : null,
+      map_row: readNumber(currentMapPoint.row),
+      map_column: readNumber(currentMapPoint.column),
+      run_in_progress: roomContext.run_in_progress === true ? true : (roomContext.run_in_progress === false ? false : null),
+      combat_in_progress: roomContext.combat_in_progress === true ? true : (roomContext.combat_in_progress === false ? false : null)
+    },
     terminal: gameOver
       ? {
           result: typeof gameOver.result === "string" ? gameOver.result : null,
