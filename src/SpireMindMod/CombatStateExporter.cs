@@ -368,6 +368,32 @@ internal static class CombatStateExporter
         }
     }
 
+    internal static bool TryExportTreasureStateIfVisible()
+    {
+        try
+        {
+            object? treasureRoom = FindTreasureRoom();
+            if (treasureRoom is null)
+            {
+                return false;
+            }
+
+            if (FindMapScreen() is not null)
+            {
+                return false;
+            }
+
+            Dictionary<string, object?> state = BuildTreasureState(treasureRoom);
+            WriteState(treasureRoom, state, "treasure", force: false, tickAfterExport: false);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"보물방 상태 추출에 실패했습니다. 게임 진행은 멈추지 않습니다. {exception.GetType().Name}: {exception.Message}");
+            return false;
+        }
+    }
+
     internal static bool TryExportShopStateIfVisible()
     {
         try
@@ -517,7 +543,8 @@ internal static class CombatStateExporter
     private static Dictionary<string, object?> BuildRoomContext(object runtimeRoot, Dictionary<string, object?> state)
     {
         object? runManager = GetStaticPropertyValue("MegaCrit.Sts2.Core.Runs.RunManager", "Instance");
-        object? runState = FindMemberValue(runManager, "RunState", "runState", "_runState", "State", "state")
+        object? runState = ReadRunManagerDebugState(runManager)
+            ?? FindMemberValue(runManager, "RunState", "runState", "_runState", "State", "state")
             ?? FindMemberValue(runtimeRoot, "RunState", "runState", "_runState", "State", "state");
         object? currentRoom = FindMemberValue(runManager, "CurrentRoom", "currentRoom", "_currentRoom")
             ?? FindMemberValue(runState, "CurrentRoom", "currentRoom", "_currentRoom")
@@ -657,9 +684,19 @@ internal static class CombatStateExporter
         return GetStaticPropertyValue("MegaCrit.Sts2.Core.Combat.CombatManager", "Instance");
     }
 
+    private static object? GetRunManagerInstance()
+    {
+        return GetStaticPropertyValue("MegaCrit.Sts2.Core.Runs.RunManager", "Instance");
+    }
+
     private static object? ReadCombatManagerDebugState(object? combatManager)
     {
         return TryInvokeMethod(combatManager, "DebugOnlyGetState");
+    }
+
+    private static object? ReadRunManagerDebugState(object? runManager)
+    {
+        return TryInvokeMethod(runManager, "DebugOnlyGetState");
     }
 
     private static void RememberObservedRoot(object instance)
@@ -1657,6 +1694,150 @@ internal static class CombatStateExporter
         };
     }
 
+    private static Dictionary<string, object?> BuildTreasureState(object treasureRoom)
+    {
+        object? runManager = GetRunManagerInstance();
+        object? runState = ReadRunManagerDebugState(runManager)
+            ?? FindMemberValue(treasureRoom, "_runState", "runState", "RunState")
+            ?? FindMemberValue(runManager, "RunState", "runState", "_runState", "State", "state");
+        object? currentRoom = FindMemberValue(runState, "CurrentRoom", "currentRoom", "_currentRoom")
+            ?? FindMemberValue(runManager, "CurrentRoom", "currentRoom", "_currentRoom");
+        object? player = recentPlayer
+            ?? recentPlayerCombatState
+            ?? EnumerateObjects(FindMemberValue(runState, "Players", "players", "_players")).FirstOrDefault();
+        object? relicsSource = FindMemberValue(player, "relics")
+            ?? FindMemberValue(runState, "relics");
+        object? synchronizer = FindMemberValue(runManager, "TreasureRoomRelicSynchronizer", "treasureRoomRelicSynchronizer", "_treasureRoomRelicSynchronizer");
+        List<object> roots = new();
+        AddRoot(roots, treasureRoom);
+        AddRoot(roots, runState);
+        AddRoot(roots, currentRoom);
+        AddRoot(roots, player);
+        AddRoot(roots, synchronizer);
+        ObjectGraph graph = ObjectGraph.Collect(roots, 3, 260);
+
+        return new Dictionary<string, object?>
+        {
+            ["schema_version"] = "combat_state.v1",
+            ["phase"] = "treasure",
+            ["state_id"] = "treasure_pending",
+            ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["run"] = BuildRun(runState ?? treasureRoom, graph),
+            ["player"] = player is null ? new Dictionary<string, object?>() : BuildPlayer(player),
+            ["piles"] = BuildEmptyPiles(),
+            ["enemies"] = new List<Dictionary<string, object?>>(),
+            ["treasure"] = BuildTreasureRoomState(treasureRoom, currentRoom, synchronizer),
+            ["legal_actions"] = new List<Dictionary<string, object?>>(),
+            ["relics"] = BuildRelics(relicsSource, graph),
+            ["debug"] = BuildTreasureDebug(treasureRoom, currentRoom, synchronizer, graph)
+        };
+    }
+
+    private static object? FindTreasureRoom()
+    {
+        object? nRun = GetStaticPropertyValue("MegaCrit.Sts2.Core.Nodes.NRun", "Instance");
+        object? nRunTreasureRoom = FindMemberValue(nRun, "TreasureRoom", "treasureRoom", "_treasureRoom");
+        if (IsTreasureRoomVisible(nRunTreasureRoom))
+        {
+            return nRunTreasureRoom;
+        }
+
+        object? runManager = GetRunManagerInstance();
+        object? runState = ReadRunManagerDebugState(runManager)
+            ?? FindMemberValue(runManager, "RunState", "runState", "_runState", "State", "state");
+        object? currentRoom = FindMemberValue(runState, "CurrentRoom", "currentRoom", "_currentRoom")
+            ?? FindMemberValue(runManager, "CurrentRoom", "currentRoom", "_currentRoom");
+        if (IsTreasureRoomLike(currentRoom))
+        {
+            return currentRoom;
+        }
+
+        object? screenContext = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext",
+            "Instance");
+        object? currentScreen = TryInvokeMethod(screenContext, "GetCurrentScreen");
+        return IsTreasureRoomVisible(currentScreen) ? currentScreen : null;
+    }
+
+    private static bool IsTreasureRoomVisible(object? source)
+    {
+        if (!IsTreasureRoomLike(source))
+        {
+            return false;
+        }
+
+        bool? isQueuedForDeletion = TryInvokeBoolMethod(source, "IsQueuedForDeletion");
+        if (isQueuedForDeletion == true)
+        {
+            return false;
+        }
+
+        bool? isInsideTree = TryInvokeBoolMethod(source, "IsInsideTree");
+        bool? visible = ReadBool(source, "Visible", "visible");
+        return isInsideTree != false && visible != false;
+    }
+
+    private static bool IsTreasureRoomLike(object? source)
+    {
+        if (source is null)
+        {
+            return false;
+        }
+
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        return typeName.Contains("TreasureRoom", StringComparison.OrdinalIgnoreCase)
+            || typeName.Contains("Chest", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, object?> BuildTreasureRoomState(object treasureRoom, object? currentRoom, object? synchronizer)
+    {
+        List<Dictionary<string, object?>> relicOptions = BuildTreasureRelicOptions(synchronizer);
+        return new Dictionary<string, object?>
+        {
+            ["screen_type"] = treasureRoom.GetType().FullName ?? treasureRoom.GetType().Name,
+            ["room_type"] = currentRoom?.GetType().FullName ?? currentRoom?.GetType().Name,
+            ["room_kind"] = ClassifyRoomKind(currentRoom?.GetType().FullName, currentRoom is null ? null : GetReadableName(currentRoom)),
+            ["is_inside_tree"] = TryInvokeBoolMethod(treasureRoom, "IsInsideTree"),
+            ["visible"] = ReadBool(treasureRoom, "Visible", "visible"),
+            ["default_focused_control_found"] = FindMemberValue(treasureRoom, "DefaultFocusedControl", "defaultFocusedControl") is not null,
+            ["relic_options"] = relicOptions,
+            ["relic_option_count"] = relicOptions.Count
+        };
+    }
+
+    private static List<Dictionary<string, object?>> BuildTreasureRelicOptions(object? synchronizer)
+    {
+        object? currentRelics = FindMemberValue(synchronizer, "CurrentRelics", "currentRelics", "_currentRelics");
+        List<Dictionary<string, object?>> result = new();
+        int index = 0;
+        foreach (object relic in EnumerateObjects(currentRelics))
+        {
+            result.Add(new Dictionary<string, object?>
+            {
+                ["index"] = index,
+                ["id"] = ReadModelIdentifier(relic),
+                ["name"] = GetReadableName(relic),
+                ["type_name"] = relic.GetType().FullName ?? relic.GetType().Name,
+                ["rarity"] = ReadString(relic, "Rarity", "rarity", "_rarity")
+            });
+            index++;
+        }
+
+        return result;
+    }
+
+    private static Dictionary<string, object?> BuildTreasureDebug(object treasureRoom, object? currentRoom, object? synchronizer, ObjectGraph graph)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["current_root_type"] = treasureRoom.GetType().FullName ?? treasureRoom.GetType().Name,
+            ["current_room_type"] = currentRoom?.GetType().FullName ?? currentRoom?.GetType().Name,
+            ["synchronizer_found"] = synchronizer is not null,
+            ["synchronizer_type"] = synchronizer?.GetType().FullName ?? synchronizer?.GetType().Name,
+            ["graph_node_count"] = graph.Nodes.Count
+        };
+    }
+
     private static Dictionary<string, object?> BuildShopState(object shopScreen)
     {
         object? managerCombatState = ReadCombatManagerDebugState(GetCombatManagerInstance());
@@ -1665,8 +1846,9 @@ internal static class CombatStateExporter
             RememberObservedRoot(managerCombatState);
         }
 
-        object? runManager = GetStaticPropertyValue("MegaCrit.Sts2.Core.Runs.RunManager", "Instance");
-        object? runState = FindMemberValue(shopScreen, "_runState", "runState", "RunState")
+        object? runManager = GetRunManagerInstance();
+        object? runState = ReadRunManagerDebugState(runManager)
+            ?? FindMemberValue(shopScreen, "_runState", "runState", "RunState")
             ?? FindMemberValue(runManager, "RunState", "runState", "_runState", "State", "state");
         object? player = recentPlayer
             ?? recentPlayerCombatState
@@ -2907,8 +3089,10 @@ internal static class CombatStateExporter
             RememberObservedRoot(managerCombatState);
         }
 
-        object? runState = FindMemberValue(mapScreen, "_runState", "runState", "RunState")
-            ?? FindMemberValue(GetStaticPropertyValue("MegaCrit.Sts2.Core.Runs.RunManager", "Instance"), "RunState", "runState", "_runState", "State", "state");
+        object? runManager = GetRunManagerInstance();
+        object? runState = ReadRunManagerDebugState(runManager)
+            ?? FindMemberValue(mapScreen, "_runState", "runState", "RunState")
+            ?? FindMemberValue(runManager, "RunState", "runState", "_runState", "State", "state");
         object? player = recentPlayer
             ?? recentPlayerCombatState
             ?? EnumerateObjects(FindMemberValue(runState, "Players", "players", "_players")).FirstOrDefault();

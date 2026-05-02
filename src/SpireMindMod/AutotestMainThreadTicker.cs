@@ -38,13 +38,16 @@ internal static class AutotestMainThreadTicker
                     {
                         if (!CombatStateExporter.TryExportRewardStateIfVisible())
                         {
-                            if (!CombatStateExporter.TryExportMapStateIfVisible())
+                            if (!CombatStateExporter.TryExportTreasureStateIfVisible())
                             {
-                                if (!CombatStateExporter.TryExportShopStateIfVisible())
+                                if (!CombatStateExporter.TryExportMapStateIfVisible())
                                 {
-                                    if (!CombatStateExporter.TryExportRestSiteStateIfVisible())
+                                    if (!CombatStateExporter.TryExportShopStateIfVisible())
                                     {
-                                        CombatStateExporter.FlushPendingExportIfReady();
+                                        if (!CombatStateExporter.TryExportRestSiteStateIfVisible())
+                                        {
+                                            CombatStateExporter.FlushPendingExportIfReady();
+                                        }
                                     }
                                 }
                             }

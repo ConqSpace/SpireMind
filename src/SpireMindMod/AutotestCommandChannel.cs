@@ -2469,6 +2469,7 @@ internal static class AutotestCommandChannel
                 || CombatStateExporter.TryExportCardSelectionStateIfVisible()
                 || CombatStateExporter.TryExportEventStateIfVisible()
                 || CombatStateExporter.TryExportRewardStateIfVisible()
+                || CombatStateExporter.TryExportTreasureStateIfVisible()
                 || CombatStateExporter.TryExportMapStateIfVisible()
                 || CombatStateExporter.TryExportShopStateIfVisible()
                 || CombatStateExporter.TryExportRestSiteStateIfVisible();
@@ -2482,6 +2483,7 @@ internal static class AutotestCommandChannel
             if (string.Equals(phase, "map", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(phase, "event", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(phase, "reward", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(phase, "treasure", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(phase, "shop", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(phase, "rest_site", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(phase, "card_selection", StringComparison.OrdinalIgnoreCase)
