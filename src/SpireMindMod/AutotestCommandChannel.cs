@@ -2361,6 +2361,7 @@ internal static class AutotestCommandChannel
             CaptureRetainedContinuationDiagnostics();
             exportReadyWaitCount++;
             long elapsedMs = Environment.TickCount64 - exportReadyWaitStartedAtMs;
+            bool visibleRunStateExported = TryExportVisibleRunStateForContinue();
             CombatStateExporter.CombatExportProbe fileProbe = CombatStateExporter.ReadLatestStateFileProbe("continue_run");
             string? latestFilePhase = CombatStateExporter.ReadLatestStateFilePhase("continue_run");
             bool exportPending = CombatStateExporter.HasPendingExport;
@@ -2374,6 +2375,7 @@ internal static class AutotestCommandChannel
             diagnostics["export_ready_wait_count"] = exportReadyWaitCount;
             diagnostics["export_ready_wait_elapsed_ms"] = elapsedMs;
             diagnostics["export_ready_timeout_ms"] = readyTimeoutMs;
+            diagnostics["export_ready_visible_run_state_exported"] = visibleRunStateExported;
             diagnostics["export_ready_force_export_requested"] = forceExportRequested;
             diagnostics["export_ready_force_export_attempted"] = canForceExport;
             diagnostics["export_ready_force_export_interval_ms"] = ExportReadyForceExportIntervalMs;
@@ -2407,25 +2409,13 @@ internal static class AutotestCommandChannel
             combatInProgress = combatInProgress || probe.IsInProgress;
             diagnostics["export_ready_combat_in_progress_for_file_fallback"] = combatInProgress;
 
-            if (!exportPending && string.Equals(latestFilePhase, "map", StringComparison.OrdinalIgnoreCase))
+            if (!exportPending && IsContinueAcceptedRunPhase(latestFilePhase, fileProbe, combatPlayPhase))
             {
                 stage = "done";
                 diagnostics["export_ready_success_source"] = "latest_state_file";
-                diagnostics["export_ready_success_phase"] = "map";
-                ClearRetainedContinuationContext("export_ready_map");
-                WriteCommandResult(command, "running", "지도 상태 파일이 안정된 것을 확인했습니다.", diagnostics);
-                return false;
-            }
-
-            // 대기 단계에서는 파일 기반 판정을 우선합니다.
-            // 강제 export는 전투 준비가 안정적으로 보일 때만 낮은 빈도로 보조 확인합니다.
-            if (combatPlayPhase && !exportPending && (probe.IsStable || (combatInProgress && fileProbe.IsStable)))
-            {
-                stage = "done";
-                diagnostics["export_ready_success_source"] = probe.IsStable ? "combat_manager_force_export" : "latest_state_file";
-                diagnostics["export_ready_success_phase"] = "combat_turn";
-                ClearRetainedContinuationContext("export_ready");
-                WriteCommandResult(command, "running", "전투 상태 export 또는 최신 상태 파일이 안정된 것을 확인했습니다.", diagnostics);
+                diagnostics["export_ready_success_phase"] = latestFilePhase;
+                ClearRetainedContinuationContext("export_ready_" + (latestFilePhase ?? "unknown"));
+                WriteCommandResult(command, "running", "계속하기 이후 조작 가능한 방 상태 파일을 확인했습니다.", diagnostics);
                 return false;
             }
 
@@ -2471,6 +2461,38 @@ internal static class AutotestCommandChannel
             diagnostics["export_ready_waiting_reason"] = "state_not_stable_yet";
             WriteRunningResultIfDue("전투 상태 export가 안정되기를 기다리는 중입니다.");
             return false;
+        }
+
+        private static bool TryExportVisibleRunStateForContinue()
+        {
+            return CombatStateExporter.TryExportGameOverStateIfVisible()
+                || CombatStateExporter.TryExportCardSelectionStateIfVisible()
+                || CombatStateExporter.TryExportEventStateIfVisible()
+                || CombatStateExporter.TryExportRewardStateIfVisible()
+                || CombatStateExporter.TryExportMapStateIfVisible()
+                || CombatStateExporter.TryExportShopStateIfVisible()
+                || CombatStateExporter.TryExportRestSiteStateIfVisible();
+        }
+
+        private static bool IsContinueAcceptedRunPhase(
+            string? phase,
+            CombatStateExporter.CombatExportProbe fileProbe,
+            bool combatPlayPhase)
+        {
+            if (string.Equals(phase, "map", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(phase, "event", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(phase, "reward", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(phase, "shop", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(phase, "rest_site", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(phase, "card_selection", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(phase, "game_over", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return string.Equals(phase, "combat_turn", StringComparison.OrdinalIgnoreCase)
+                && combatPlayPhase
+                && fileProbe.IsStable;
         }
 
         private bool ShouldForceExportDuringReadyWait(bool stableCombatInProgress, long elapsedMs)

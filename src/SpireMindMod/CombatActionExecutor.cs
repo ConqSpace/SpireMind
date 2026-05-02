@@ -1234,15 +1234,54 @@ internal static class CombatActionExecutor
             return false;
         }
 
-        if (!TryInvokeMethod(mapRoot, "OnMapPointSelectedLocally", out _, mapPoint))
+        List<string> invokedCandidates = new();
+        if (TryCallDeferredNoArgs(mapPoint, "ForceClick", out string deferredFailureReason))
         {
-            detail = $"지도 노드 선택 호출에 실패했습니다. node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}";
-            return false;
+            invokedCandidates.Add("point.CallDeferred(ForceClick)");
+            if (WaitForMapNodeSelection(mapRoot, legalAction))
+            {
+                detail = $"지도 노드 선택을 완료했습니다. method=point.CallDeferred(ForceClick), node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}, row={legalAction.MapRow?.ToString() ?? "?"}, column={legalAction.MapColumn?.ToString() ?? "?"}";
+                Logger.Info(detail);
+                return true;
+            }
         }
 
-        detail = $"지도 노드 선택을 요청했습니다. node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}, row={legalAction.MapRow?.ToString() ?? "?"}, column={legalAction.MapColumn?.ToString() ?? "?"}";
-        Logger.Info(detail);
-        return true;
+        List<(string Label, object? Source, string MethodName, object?[] Args)> candidates = new()
+        {
+            ("point.ForceClick", mapPoint, "ForceClick", Array.Empty<object?>()),
+            ("point.OnRelease", mapPoint, "OnRelease", Array.Empty<object?>()),
+            ("point.OnPressed", mapPoint, "OnPressed", Array.Empty<object?>()),
+            ("map.OnMapPointSelectedLocally(point)", mapRoot, "OnMapPointSelectedLocally", new object?[] { mapPoint })
+        };
+
+        foreach ((string label, object? source, string methodName, object?[] args) in candidates)
+        {
+            if (!TryInvokeMethod(source, methodName, out _, args))
+            {
+                continue;
+            }
+
+            invokedCandidates.Add(label);
+            if (WaitForMapNodeSelection(mapRoot, legalAction))
+            {
+                detail = $"지도 노드 선택을 완료했습니다. method={label}, node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}, row={legalAction.MapRow?.ToString() ?? "?"}, column={legalAction.MapColumn?.ToString() ?? "?"}";
+                Logger.Info(detail);
+                return true;
+            }
+        }
+
+        if (deferredFailureReason.Length > 0)
+        {
+            invokedCandidates.Insert(0, $"point.CallDeferred(ForceClick): {deferredFailureReason}");
+        }
+
+        string currentScreenTypeName = GetCurrentScreenTypeName();
+        string tried = invokedCandidates.Count == 0 ? "<none>" : string.Join(", ", invokedCandidates);
+        bool? isStillTraveling = ReadNamedMember(mapRoot, "IsTraveling") is bool stillTraveling
+            ? stillTraveling
+            : null;
+        detail = $"지도 노드 선택 호출 뒤에도 목적지에 도달하지 못했습니다. tried={tried}, current_screen={currentScreenTypeName}, is_traveling={isStillTraveling?.ToString() ?? "<unknown>"}, node_id={legalAction.NodeId ?? BuildMapNodeId(mapPoint)}";
+        return false;
     }
 
     private static bool TryExecuteRewardAction(
@@ -1529,6 +1568,36 @@ internal static class CombatActionExecutor
         return false;
     }
 
+    private static bool WaitForMapNodeSelection(object mapRoot, LegalActionSnapshot legalAction)
+    {
+        const int timeoutMs = 8000;
+        const int pollIntervalMs = 100;
+        Stopwatch stopwatch = Stopwatch.StartNew();
+        int stableCompletionPollCount = 0;
+        while (stopwatch.ElapsedMilliseconds < timeoutMs)
+        {
+            Thread.Sleep(pollIntervalMs);
+            object? currentScreen = GetCurrentScreen();
+            bool screenLeftMap = currentScreen is not null && !IsMapScreen(currentScreen);
+            bool traveling = ReadNamedMember(mapRoot, "IsTraveling") is bool isTraveling && isTraveling;
+            bool arrivedAtTargetOnMap = !traveling && IsCurrentMapPointTarget(mapRoot, legalAction);
+            if (screenLeftMap || arrivedAtTargetOnMap)
+            {
+                stableCompletionPollCount++;
+                if (stableCompletionPollCount >= 5)
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                stableCompletionPollCount = 0;
+            }
+        }
+
+        return false;
+    }
+
     private static object? GetCurrentScreen()
     {
         Type? screenContextType = AccessTools.TypeByName("MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext");
@@ -1647,6 +1716,33 @@ internal static class CombatActionExecutor
             || typeName.Contains(".Map.", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsCurrentMapPointTarget(object mapRoot, LegalActionSnapshot legalAction)
+    {
+        object? runState = ReadNamedMember(mapRoot, "_runState")
+            ?? ReadNamedMember(mapRoot, "RunState")
+            ?? ReadNamedMember(mapRoot, "runState");
+        object? currentMapPoint = ReadNamedMember(runState, "CurrentMapPoint")
+            ?? ReadNamedMember(runState, "currentMapPoint")
+            ?? ReadNamedMember(runState, "_currentMapPoint");
+        if (currentMapPoint is null)
+        {
+            return false;
+        }
+
+        string nodeId = BuildMapNodeIdFromPoint(currentMapPoint);
+        if (!string.IsNullOrWhiteSpace(legalAction.NodeId)
+            && string.Equals(nodeId, legalAction.NodeId, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        (int? row, int? column) = ReadMapCoord(currentMapPoint);
+        return row is not null
+            && column is not null
+            && legalAction.MapRow == row
+            && legalAction.MapColumn == column;
+    }
+
     private static bool IsCardSelectionScreen(object? source)
     {
         if (source is null)
@@ -1749,9 +1845,20 @@ internal static class CombatActionExecutor
         return row is null || column is null ? "map_unknown" : $"map_r{row.Value}_c{column.Value}";
     }
 
+    private static string BuildMapNodeIdFromPoint(object point)
+    {
+        (int? row, int? column) = ReadMapCoord(point);
+        return row is null || column is null ? "map_unknown" : $"map_r{row.Value}_c{column.Value}";
+    }
+
     private static (int? row, int? column) ReadMapPointCoord(object mapPoint)
     {
         object? point = ReadNamedMember(mapPoint, "Point");
+        return point is null ? (null, null) : ReadMapCoord(point);
+    }
+
+    private static (int? row, int? column) ReadMapCoord(object point)
+    {
         object? coord = ReadNamedMember(point, "coord") ?? ReadNamedMember(point, "Coord");
         int? column = ReadInt(coord, "col") ?? ReadInt(coord, "Col") ?? ReadInt(coord, "column") ?? ReadInt(coord, "Column");
         int? row = ReadInt(coord, "row") ?? ReadInt(coord, "Row");
