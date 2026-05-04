@@ -181,6 +181,7 @@ function compactRequest(request) {
   return {
     play_session_id: typeof request.play_session_id === "string" ? request.play_session_id : null,
     state_version: readNumber(request.state_version),
+    phase: typeof state.phase === "string" ? state.phase : null,
     recent_history: compactRecentHistory(request),
     player: {
       hp: readNumber(player.hp),
@@ -224,8 +225,13 @@ function compactRequest(request) {
       action_id: typeof action.action_id === "string" ? action.action_id : null,
       type: typeof action.type === "string" ? action.type : null,
       combat_card_id: readNumber(action.combat_card_id),
+      potion_slot_index: readNumber(action.potion_slot_index),
       target_combat_id: readNumber(action.target_combat_id),
+      target_id: typeof action.target_id === "string" ? action.target_id : null,
+      target_kind: typeof action.target_kind === "string" ? action.target_kind : null,
       energy_cost: readNumber(action.energy_cost),
+      title: typeof action.title === "string" ? action.title : null,
+      description: typeof action.description === "string" ? action.description : null,
       summary: typeof action.summary === "string" ? action.summary : null
     }))
   };
@@ -265,16 +271,27 @@ function buildCodexPrompt(request) {
   const compact = compactRequest(request);
   return [
     "너는 Slay the Spire 2를 플레이하는 의사결정기다.",
-    "현재 전투 상태를 보고 이번 턴에 실행할 행동 JSON만 반환한다.",
+    "목표는 이번 실행에서 가능한 한 높은 층까지 도달하는 것이다.",
+    "현재 게임 상태를 보고 지금 실행할 행동 JSON만 반환한다.",
+    "",
+    "판단 기준:",
+    "- 즉시 피해량만 보지 말고, 장기 도달 층을 기준으로 체력, 덱 성장, 포션, 골드, 보상, 경로 위험을 함께 평가한다.",
+    "- 현재 행동이 다음 방과 이후 전투 생존 가능성에 어떤 영향을 주는지 직접 판단한다.",
+    "- 같은 턴 안에서 공격, 방어, 포션, 턴 종료의 기대값을 비교하되 특정 행동을 고정 우선순위로 두지 않는다.",
     "",
     "규칙:",
     "- legal_actions에 맞는 행동만 선택한다.",
+    "- 전투 밖 화면에서는 actions 배열을 비워 두고 selected_action_id 하나만 선택한다.",
+    "- 이벤트, 지도, 보상, 상점, 카드 선택 화면에서는 legal_actions의 action_id를 그대로 selected_action_id에 넣는다.",
+    "- 전투 화면에서만 여러 행동을 actions 배열로 계획할 수 있다.",
+    "- 전투에서 actions 배열에는 play_card와 end_turn만 넣는다.",
+    "- 포션 사용처럼 카드가 아닌 전투 행동은 actions 배열에 넣지 말고 legal_actions의 use_potion_* action_id를 selected_action_id에 그대로 넣는다.",
     "- 카드를 사용할 때는 combat_card_id를 사용한다.",
     "- 적 대상은 target_combat_id를 사용한다.",
     "- 대상이 없는 카드는 target_combat_id를 null로 둔다.",
     "- cost가 -1인 X비용 카드는 현재 에너지를 모두 쓰는 행동으로 본다.",
     "- X비용 카드를 쓴 뒤에는 에너지를 쓰는 카드를 이어서 계획하지 않는다.",
-    "- 여러 카드를 순서대로 쓸 수 있으면 actions 배열에 순서대로 넣는다.",
+    "- 전투에서 여러 카드를 순서대로 쓸 수 있으면 actions 배열에 순서대로 넣는다.",
     "- actions 배열 안에서는 selected_action_id를 사용하지 않는다.",
     "- 더 할 행동이 없으면 end_turn을 포함한다.",
     "- recent_history가 있으면 이전 판단 결과와 체력 변화를 참고하되, 현재 legal_actions를 더 우선한다.",
@@ -416,12 +433,104 @@ function trimActionsByKnownEnergy(actions, request) {
   return trimmed;
 }
 
+function findLegalActionById(legalActions, actionId) {
+  return legalActions.find((action) => action.action_id === actionId) || null;
+}
+
+function findLegalPotionActionForDecision(decision, compact) {
+  const legalPotionActions = compact.legal_actions.filter((action) => action.type === "use_potion"
+    && typeof action.action_id === "string"
+    && action.action_id !== "");
+  if (legalPotionActions.length === 0) {
+    return null;
+  }
+
+  if (typeof decision.selected_action_id === "string" && decision.selected_action_id.trim() !== "") {
+    const selectedAction = findLegalActionById(legalPotionActions, decision.selected_action_id.trim());
+    if (selectedAction) {
+      return selectedAction;
+    }
+  }
+
+  const firstPotionAction = Array.isArray(decision.actions)
+    ? decision.actions.find((action) => isPlainObject(action) && action.type === "use_potion")
+    : null;
+  if (!firstPotionAction) {
+    return null;
+  }
+
+  const requestedTargetCombatId = readNumber(firstPotionAction.target_combat_id);
+  if (requestedTargetCombatId !== null) {
+    const targetMatch = legalPotionActions.find((action) => action.target_combat_id === requestedTargetCombatId);
+    if (targetMatch) {
+      return targetMatch;
+    }
+  }
+
+  const requestedSlotIndex = readNumber(firstPotionAction.potion_slot_index);
+  if (requestedSlotIndex !== null) {
+    const slotMatch = legalPotionActions.find((action) => action.potion_slot_index === requestedSlotIndex);
+    if (slotMatch) {
+      return slotMatch;
+    }
+  }
+
+  return legalPotionActions.length === 1 ? legalPotionActions[0] : null;
+}
+
+function copyDecisionMetadata(normalized, decision) {
+  normalized.reason = typeof decision.reason === "string" && decision.reason.trim() !== ""
+    ? decision.reason.trim()
+    : "Codex 판단";
+
+  const confidence = readNumber(decision.confidence);
+  if (confidence !== null) {
+    normalized.confidence = confidence;
+  }
+}
+
 function normalizeDecision(decision, request) {
   if (!isPlainObject(decision)) {
     throw new Error("Codex 응답이 JSON 객체가 아닙니다.");
   }
 
   const normalized = {};
+  const compact = compactRequest(request);
+  const phase = typeof compact.phase === "string" ? compact.phase : "";
+  const legalActionIds = new Set(compact.legal_actions
+    .map((action) => action.action_id)
+    .filter((actionId) => typeof actionId === "string" && actionId !== ""));
+
+  if (typeof decision.selected_action_id === "string" && decision.selected_action_id.trim() !== "") {
+    normalized.selected_action_id = decision.selected_action_id.trim();
+  }
+
+  if (normalized.selected_action_id && legalActionIds.has(normalized.selected_action_id)) {
+    const selectedAction = findLegalActionById(compact.legal_actions, normalized.selected_action_id);
+    const isCombatCardPlanAction = phase === "combat_turn"
+      && selectedAction
+      && (selectedAction.type === "play_card" || selectedAction.type === "end_turn");
+    if (phase !== "combat_turn" || !isCombatCardPlanAction) {
+      copyDecisionMetadata(normalized, decision);
+      return normalized;
+    }
+  }
+
+  if (phase === "combat_turn") {
+    const potionAction = findLegalPotionActionForDecision(decision, compact);
+    if (potionAction) {
+      normalized.selected_action_id = potionAction.action_id;
+      delete normalized.actions;
+      copyDecisionMetadata(normalized, decision);
+      return normalized;
+    }
+  }
+
+  if (phase !== "combat_turn" && normalized.selected_action_id && legalActionIds.has(normalized.selected_action_id)) {
+    copyDecisionMetadata(normalized, decision);
+    return normalized;
+  }
+
   if (Array.isArray(decision.actions)) {
     normalized.actions = decision.actions
       .filter(isPlainObject)
@@ -448,18 +557,7 @@ function normalizeDecision(decision, request) {
     normalized.actions = trimActionsByKnownEnergy(normalized.actions, request);
   }
 
-  if (typeof decision.selected_action_id === "string" && decision.selected_action_id.trim() !== "") {
-    normalized.selected_action_id = decision.selected_action_id.trim();
-  }
-
-  normalized.reason = typeof decision.reason === "string" && decision.reason.trim() !== ""
-    ? decision.reason.trim()
-    : "Codex 판단";
-
-  const confidence = readNumber(decision.confidence);
-  if (confidence !== null) {
-    normalized.confidence = confidence;
-  }
+  copyDecisionMetadata(normalized, decision);
 
   if ((!Array.isArray(normalized.actions) || normalized.actions.length === 0) && !normalized.selected_action_id) {
     throw new Error("Codex 응답에 actions 또는 selected_action_id가 없습니다.");

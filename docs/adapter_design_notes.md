@@ -225,10 +225,9 @@ event_option_{index}_{sanitized_fingerprint}
         "is_locked": false,
         "is_proceed": false,
         "is_likely_leave_or_exit": false,
-        "will_kill_player": false,
-        "support_level": "special_high_confidence",
-        "trust_level": "high",
-        "safe_for_llm_execution": true,
+        "adapter_confidence": "high",
+        "outcome_known_level": "known",
+        "runtime_warnings": [],
         "known_outcome": {
           "hp_delta": -11,
           "max_hp_delta": 0,
@@ -244,7 +243,6 @@ event_option_{index}_{sanitized_fingerprint}
           "has_randomness": false,
           "has_unknown_effects": false
         },
-        "risk_notes": [],
         "summary_for_llm": "체력 11을 잃고 카드 1장을 제거합니다."
       }
     ]
@@ -261,7 +259,6 @@ event_option_{index}_{sanitized_fingerprint}
 - 설명
 - 잠김 여부
 - 진행 여부
-- 즉사 위험
 - 붙어 있는 유물
 - hover tip 종류
 
@@ -269,8 +266,9 @@ event_option_{index}_{sanitized_fingerprint}
 
 ```json
 {
-  "support_level": "generic_partial",
-  "trust_level": "low",
+  "adapter_confidence": "low",
+  "outcome_known_level": "unknown",
+  "runtime_warnings": ["unknown_event_outcome"],
   "known_outcome": {
     "has_unknown_effects": true
   }
@@ -278,6 +276,7 @@ event_option_{index}_{sanitized_fingerprint}
 ```
 
 이벤트별 해석기는 `known_outcome`을 채우는 역할만 한다. 자동 선택기가 아니라 “LLM용 결과 번역기”다.
+체력 손실, 저주, 전투 진입, 무작위 보상은 실행 차단 조건이 아니다. LLM이 판단할 수 있도록 관측 정보로만 제공한다.
 
 ### 행동 계약
 
@@ -312,7 +311,8 @@ SpireMind 적용:
 - 선택지 인덱스가 범위 안인지 확인한다.
 - 선택지가 잠겨 있지 않은지 확인한다.
 - `TextKey`가 일치하는지 확인한다.
-- 즉사 선택지는 LLM이 골라도 실행하지 않는 안전장치를 둘 수 있다.
+
+실행기는 선택의 유불리나 위험성을 판단하지 않는다. 어댑터가 막아야 하는 것은 위험한 선택이 아니라 현재 상태와 일치하지 않는 선택이다.
 
 ### 실패 처리
 

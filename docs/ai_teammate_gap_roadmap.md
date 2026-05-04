@@ -220,11 +220,10 @@ LLM 관측 필드:
   - 제목, 설명
   - 잠김 여부
   - 진행/나가기 여부
-  - 즉사 위험
   - `known_outcome`
-  - `trust_level`
-  - `support_level`
-  - `risk_notes`
+  - `adapter_confidence`
+  - `outcome_known_level`
+  - `runtime_warnings`
   - `summary_for_llm`
 
 `known_outcome` 필드:

@@ -8,8 +8,9 @@ const https = require("https");
 const path = require("path");
 
 const DEFAULT_BRIDGE_URL = "http://127.0.0.1:17832";
-const DEFAULT_POLL_MS = 1000;
+const DEFAULT_POLL_MS = 250;
 const DEFAULT_TIMEOUT_MS = 30000;
+const DEFAULT_MAX_STALE_RETRIES = 5;
 
 function parseArgs(argv) {
   const options = {
@@ -24,6 +25,7 @@ function parseArgs(argv) {
     maxDecisions: 1,
     maxDecisionsWasSet: false,
     maxActionsPerTurn: 3,
+    maxStaleRetries: DEFAULT_MAX_STALE_RETRIES,
     recentHistoryLimit: parsePositiveInt(process.env.SPIREMIND_RECENT_HISTORY_LIMIT, 8),
     pollMs: DEFAULT_POLL_MS,
     timeoutMs: DEFAULT_TIMEOUT_MS,
@@ -99,6 +101,17 @@ function parseArgs(argv) {
 
     if (token === "--wait-result") {
       options.waitResult = true;
+      continue;
+    }
+
+    if (token === "--max-stale-retries" && index + 1 < argv.length) {
+      options.maxStaleRetries = parsePositiveInt(argv[index + 1], options.maxStaleRetries);
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--max-stale-retries=")) {
+      options.maxStaleRetries = parsePositiveInt(token.slice("--max-stale-retries=".length), options.maxStaleRetries);
       continue;
     }
 
@@ -384,6 +397,7 @@ function summarizeState(snapshot) {
   const roomContext = isPlainObject(state.room_context) ? state.room_context : {};
   const currentRoom = isPlainObject(roomContext.current_room) ? roomContext.current_room : {};
   const currentMapPoint = isPlainObject(roomContext.current_map_point) ? roomContext.current_map_point : {};
+  const map = isPlainObject(state.map) ? state.map : {};
 
   return {
     state_version: readNumber(snapshot.state_version),
@@ -438,7 +452,8 @@ function summarizeState(snapshot) {
     legal_action_count: legalActions.length,
     legal_action_ids: legalActions
       .map((action) => (typeof action.action_id === "string" ? action.action_id : null))
-      .filter((actionId) => actionId !== null)
+      .filter((actionId) => actionId !== null),
+    map: summarizeMapPlanning(map)
   };
 }
 
@@ -1387,6 +1402,31 @@ function hasPendingAction(snapshot) {
     && latestAction.execution_status !== "unsupported";
 }
 
+function isPostEndTurnTransitionSnapshot(snapshot) {
+  if (!isPlainObject(snapshot)) {
+    return false;
+  }
+
+  const state = isPlainObject(snapshot.state) ? snapshot.state : {};
+  if (state.phase !== "combat_turn") {
+    return false;
+  }
+
+  const player = isPlainObject(state.player) ? state.player : {};
+  const energy = readNumber(player.energy);
+  const piles = isPlainObject(state.piles) ? state.piles : {};
+  const hand = Array.isArray(piles.hand) ? piles.hand : [];
+  const legalActions = Array.isArray(state.legal_actions) ? state.legal_actions.filter(isPlainObject) : [];
+  const legalActionIds = legalActions
+    .map((action) => (typeof action.action_id === "string" ? action.action_id : ""))
+    .filter((actionId) => actionId !== "");
+
+  return hand.length === 0
+    && energy === 0
+    && legalActionIds.length === 1
+    && legalActionIds[0] === "end_turn";
+}
+
 function readNumber(value) {
   if (value === null || value === undefined || value === "") {
     return null;
@@ -1394,6 +1434,139 @@ function readNumber(value) {
 
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function readCount(source, key) {
+  if (!isPlainObject(source)) {
+    return 0;
+  }
+
+  const value = readNumber(source[key]);
+  return value === null ? 0 : value;
+}
+
+function readString(value) {
+  return typeof value === "string" ? value : "";
+}
+
+function findPathOptionForMapAction(map, legalAction) {
+  if (!isPlainObject(map) || !isPlainObject(legalAction)) {
+    return null;
+  }
+
+  const summary = isPlainObject(map.path_options_summary) ? map.path_options_summary : {};
+  const options = Array.isArray(summary.options) ? summary.options.filter(isPlainObject) : [];
+  const nodeId = readString(legalAction.node_id);
+  if (nodeId === "") {
+    return null;
+  }
+
+  return options.find((option) => readString(option.start_node_id) === nodeId) || null;
+}
+
+function scoreMapPathOption(option, player) {
+  if (!isPlainObject(option)) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  const counts = isPlainObject(option.reachable_room_counts) ? option.reachable_room_counts : {};
+  const playerHp = readNumber(player.hp);
+  const playerMaxHp = readNumber(player.max_hp);
+  const hpRatio = playerHp !== null && playerMaxHp !== null && playerMaxHp > 0
+    ? playerHp / playerMaxHp
+    : null;
+  const lowHp = hpRatio !== null && hpRatio < 0.45;
+  const veryLowHp = hpRatio !== null && hpRatio < 0.25;
+
+  let score = 0;
+  score += readCount(counts, "RestSite") * (lowHp ? 18 : 7);
+  score += readCount(counts, "Shop") * 6;
+  score += readCount(counts, "Treasure") * 5;
+  score += readCount(counts, "Monster") * (lowHp ? -4 : 2);
+  score += readCount(counts, "Elite") * (veryLowHp ? -18 : (lowHp ? -10 : 8));
+  score += readCount(counts, "Unknown") * (lowHp ? -1 : 1);
+  score += readCount(counts, "Boss") * 1;
+
+  const startRoomType = readString(option.start_room_type);
+  if (startRoomType === "RestSite") {
+    score += lowHp ? 30 : 8;
+  } else if (startRoomType === "Shop") {
+    score += 6;
+  } else if (startRoomType === "Elite") {
+    score += veryLowHp ? -35 : (lowHp ? -20 : 10);
+  } else if (startRoomType === "Monster") {
+    score += lowHp ? -8 : 2;
+  }
+
+  return score;
+}
+
+function summarizeMapOptionForReason(option) {
+  if (!isPlainObject(option)) {
+    return "경로 요약 없음";
+  }
+
+  const counts = isPlainObject(option.reachable_room_counts) ? option.reachable_room_counts : {};
+  const fragments = [
+    `시작=${readString(option.start_room_type) || "Unknown"}`,
+    `샘플=${readNumber(option.path_count_sampled) ?? 0}`,
+    `휴식=${readCount(counts, "RestSite")}`,
+    `상점=${readCount(counts, "Shop")}`,
+    `엘리트=${readCount(counts, "Elite")}`,
+    `보물=${readCount(counts, "Treasure")}`,
+    `전투=${readCount(counts, "Monster")}`,
+    `이벤트=${readCount(counts, "Unknown")}`
+  ];
+  return fragments.join(", ");
+}
+
+function summarizeMapPlanning(map) {
+  if (!isPlainObject(map)) {
+    return null;
+  }
+
+  const summary = isPlainObject(map.path_options_summary) ? map.path_options_summary : {};
+  const options = Array.isArray(summary.options) ? summary.options.filter(isPlainObject) : [];
+  return {
+    current_node_id: isPlainObject(map.current) ? readString(map.current.node_id) || null : null,
+    available_next_node_count: readNumber(map.available_next_node_count),
+    full_graph_node_count: isPlainObject(map.full_graph) ? readNumber(map.full_graph.node_count) : null,
+    full_graph_edge_count: isPlainObject(map.full_graph) ? readNumber(map.full_graph.edge_count) : null,
+    path_option_count: options.length,
+    path_options: options.map((option) => ({
+      start_node_id: readString(option.start_node_id) || null,
+      start_room_type: readString(option.start_room_type) || null,
+      path_count_sampled: readNumber(option.path_count_sampled),
+      reachable_room_counts: isPlainObject(option.reachable_room_counts) ? option.reachable_room_counts : {}
+    }))
+  };
+}
+
+function chooseMapDecision(state, legalActions, player) {
+  const map = isPlainObject(state.map) ? state.map : {};
+  const mapActions = legalActions.filter((legalAction) =>
+    legalAction.type === "choose_map_node" && typeof legalAction.action_id === "string"
+  );
+  if (mapActions.length === 0) {
+    return null;
+  }
+
+  const rankedActions = mapActions
+    .map((legalAction) => {
+      const option = findPathOptionForMapAction(map, legalAction);
+      return {
+        legalAction,
+        option,
+        score: option ? scoreMapPathOption(option, player) : 0
+      };
+    })
+    .sort((left, right) => right.score - left.score);
+
+  const selected = rankedActions[0];
+  return {
+    selected_action_id: selected.legalAction.action_id,
+    reason: `휴리스틱 지도 선택: ${selected.legalAction.node_id || selected.legalAction.action_id}. ${summarizeMapOptionForReason(selected.option)}`
+  };
 }
 
 function scoreFutureOfPotionsOption(legalAction) {
@@ -1412,6 +1585,67 @@ function scoreFutureOfPotionsOption(legalAction) {
   }
 
   return 20;
+}
+
+function hasFilledPotionSlot(state) {
+  const player = isPlainObject(state && state.player) ? state.player : {};
+  const potionSlots = Array.isArray(player.potion_slots) ? player.potion_slots : [];
+  return potionSlots.some((slot) => {
+    if (!isPlainObject(slot) || slot.empty === true) {
+      return false;
+    }
+
+    return isPlainObject(slot.potion) || readNumber(slot.slot_index) !== null;
+  });
+}
+
+function choosePotionAdapterAction(state, legalActions) {
+  const usablePotionAction = legalActions.find((legalAction) =>
+    legalAction.type === "use_potion" && typeof legalAction.action_id === "string"
+  );
+  if (usablePotionAction) {
+    return {
+      selected_action_id: usablePotionAction.action_id,
+      reason: `어댑터 검증: 인벤토리 포션을 즉시 사용합니다. ${usablePotionAction.potion_id || usablePotionAction.action_id}`
+    };
+  }
+
+  if (!hasFilledPotionSlot(state)) {
+    return null;
+  }
+
+  const discardPotionAction = legalActions.find((legalAction) => {
+    if (typeof legalAction.action_id !== "string") {
+      return false;
+    }
+
+    const text = [
+      legalAction.type,
+      legalAction.action_id,
+      legalAction.summary,
+      legalAction.description,
+      legalAction.potion_id,
+      legalAction.name
+    ].filter((value) => typeof value === "string").join(" ").toLowerCase();
+
+    const mentionsPotion = text.includes("potion") || text.includes("포션");
+    const mentionsDiscard = text.includes("discard")
+      || text.includes("drop")
+      || text.includes("remove_potion")
+      || text.includes("throw_away")
+      || text.includes("버리")
+      || text.includes("폐기");
+    return mentionsPotion && mentionsDiscard;
+  });
+
+  if (!discardPotionAction) {
+    return null;
+  }
+
+  return {
+    selected_action_id: discardPotionAction.action_id,
+    reason: `어댑터 검증: 인벤토리 포션을 사용할 수 없어 버립니다. ${discardPotionAction.potion_id || discardPotionAction.action_id}`
+  };
 }
 
 function chooseCardSelectionDecision(state, legalActions) {
@@ -1626,6 +1860,35 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
     return null;
   }
 
+  if (phase === "main_menu") {
+    const continueAction = legalActions.find((legalAction) =>
+      legalAction.type === "continue_run" && typeof legalAction.action_id === "string"
+    );
+    if (continueAction) {
+      return {
+        selected_action_id: continueAction.action_id,
+        reason: "휴리스틱 메인 메뉴 처리: 저장된 런을 이어서 진행"
+      };
+    }
+  }
+
+  if (phase === "main_menu") {
+    const startNewRunAction = legalActions.find((legalAction) =>
+      legalAction.type === "start_new_run" && typeof legalAction.action_id === "string"
+    );
+    if (startNewRunAction) {
+      return {
+        selected_action_id: startNewRunAction.action_id,
+        reason: "메인 메뉴에서 저장된 런이 없어 새 싱글플레이 런을 시작"
+      };
+    }
+  }
+
+  const potionAdapterAction = choosePotionAdapterAction(state, legalActions);
+  if (potionAdapterAction) {
+    return potionAdapterAction;
+  }
+
   if (phase === "reward") {
     const preferredRewardActionTypes = [
       "claim_gold_reward",
@@ -1650,6 +1913,24 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
     return chooseCardSelectionDecision(state, legalActions);
   }
 
+  if (phase === "treasure") {
+    const preferredTreasureActionTypes = [
+      "open_treasure_chest",
+      "claim_treasure_relic",
+      "choose_treasure_relic",
+      "proceed_treasure"
+    ];
+    for (const actionType of preferredTreasureActionTypes) {
+      const treasureAction = legalActions.find((legalAction) => legalAction.type === actionType);
+      if (treasureAction && typeof treasureAction.action_id === "string") {
+        return {
+          selected_action_id: treasureAction.action_id,
+          reason: `Heuristic treasure action: ${actionType}`
+        };
+      }
+    }
+  }
+
   if (phase === "event") {
     const eventActions = legalActions.filter((legalAction) =>
       legalAction.type === "choose_event_option" && typeof legalAction.action_id === "string"
@@ -1658,7 +1939,6 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
     const eventId = typeof event.event_id === "string" ? event.event_id : "";
     if (eventId === "EVENT.THE_FUTURE_OF_POTIONS") {
       const rankedPotionActions = eventActions
-        .filter((legalAction) => legalAction.will_kill_player !== true)
         .map((legalAction) => ({
           legalAction,
           score: scoreFutureOfPotionsOption(legalAction)
@@ -1673,8 +1953,7 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
       }
     }
 
-    const eventAction = eventActions.find((legalAction) => legalAction.will_kill_player !== true)
-      || eventActions[0];
+    const eventAction = eventActions[0];
     if (eventAction) {
       return {
         selected_action_id: eventAction.action_id,
@@ -1702,7 +1981,11 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
       ].filter((value) => typeof value === "string").join(" ").toLowerCase();
       return text.includes("heal") || text.includes("rest") || text.includes("회복") || text.includes("휴식");
     });
-    const selectedAction = (shouldHeal ? healAction : null) || restActions[0] || proceedAction;
+    const nonHealAction = restActions.find((legalAction) => legalAction !== healAction);
+    const selectedAction = (shouldHeal ? healAction : null)
+      || proceedAction
+      || nonHealAction
+      || restActions[0];
     if (selectedAction) {
       return {
         selected_action_id: selectedAction.action_id,
@@ -1724,12 +2007,9 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
   }
 
   if (phase === "map") {
-    const mapAction = legalActions.find((legalAction) => legalAction.type === "choose_map_node");
-    if (mapAction && typeof mapAction.action_id === "string") {
-      return {
-        selected_action_id: mapAction.action_id,
-        reason: `휴리스틱 지도 노드 선택: ${mapAction.node_id || mapAction.action_id}`
-      };
+    const mapDecision = chooseMapDecision(state, legalActions, player);
+    if (mapDecision) {
+      return mapDecision;
     }
   }
 
@@ -1739,13 +2019,23 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
   const primaryEnemy = enemies[0] || null;
   const targetCombatId = primaryEnemy ? readNumber(primaryEnemy.combat_id) : null;
 
-  const actions = [];
-  const usedCombatCardIds = new Set();
-  for (const legalAction of legalActions) {
-    if (actions.length >= maxActionsPerTurn) {
-      break;
+  const attackAction = legalActions.find((legalAction) => {
+    if (legalAction.type !== "play_card" || typeof legalAction.action_id !== "string") {
+      return false;
     }
 
+    const execution = isPlainObject(legalAction.execution) ? legalAction.execution : {};
+    const card = isPlainObject(execution.card) ? execution.card : {};
+    return readString(card.type).toLowerCase().includes("attack");
+  });
+  if (attackAction) {
+    return {
+      selected_action_id: attackAction.action_id,
+      reason: `휴리스틱 전투 처리: 공격 카드 하나를 선택합니다. ${attackAction.summary || attackAction.action_id}`
+    };
+  }
+
+  for (const legalAction of legalActions) {
     if (legalAction.type !== "play_card" || legalAction.target_id === null || legalAction.target_id === undefined) {
       continue;
     }
@@ -1765,35 +2055,21 @@ function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
       continue;
     }
 
-    actions.push({
-      type: "play_card",
-      combat_card_id: combatCardId,
-      target_combat_id: actionTargetCombatId
-    });
-    usedCombatCardIds.add(combatCardId);
-
-    if (energy !== null && cost !== null && cost > 0) {
-      energy -= cost;
-    }
+    return {
+      selected_action_id: legalAction.action_id,
+      reason: `휴리스틱 전투 처리: 사용 가능한 공격 카드 하나를 선택합니다. combat_card_id=${combatCardId}, target_combat_id=${actionTargetCombatId}`
+    };
   }
 
-  if (actions.length === 0) {
-    const endTurn = legalActions.find((legalAction) => legalAction.type === "end_turn");
-    if (!endTurn) {
-      return null;
-    }
-
+  const endTurn = legalActions.find((legalAction) => legalAction.type === "end_turn");
+  if (endTurn) {
     return {
       selected_action_id: endTurn.action_id,
       note: "사용할 공격 카드가 없어 턴을 종료합니다."
     };
   }
 
-  actions.push({ type: "end_turn" });
-  return {
-    actions,
-    reason: "휴리스틱 정책: 사용 가능한 공격 카드를 에너지 범위 안에서 사용한 뒤 턴을 종료합니다."
-  };
+  return null;
 }
 
 function buildCommandPrompt(options, snapshot) {
@@ -1819,6 +2095,9 @@ function buildCommandPrompt(options, snapshot) {
         "card_selection에서 적절한 대상이 없고 cancel_card_selection이 legal_actions에 있으면 취소할 수 있습니다.",
         "전투에서 use_potion을 고를 때는 potion_slot_index와 target_combat_id가 이미 legal_actions에 고정되어 있는 action_id를 선택하세요.",
         "카드 선택 화면에서는 selected_count, min_select, max_select를 보고 다음에 필요한 카드 선택 또는 확인 행동 하나만 고르세요.",
+        "지도 화면에서는 state.map.path_options_summary.options를 먼저 읽고, 각 start_node_id 이후 보스까지 이어지는 휴식, 상점, 엘리트, 보물, 전투, 이벤트 분포를 비교한 뒤 choose_map_node 하나를 고르세요.",
+        "지도에서 실제로 제출할 값은 sample_paths 안의 중간 노드가 아니라 legal_actions에 있는 현재 선택 가능 노드의 action_id입니다.",
+        "메인 메뉴에서 continue_run이 legal_actions에 있으면 저장된 런을 이어가는 행동입니다.",
         "전투에서도 한 번에 카드 한 장 또는 턴 종료 하나만 선택하세요. 실행 후 상태를 다시 관찰합니다.",
         "설명 없이 JSON 객체만 출력하세요."
       ],
@@ -1900,7 +2179,10 @@ async function waitForReadySnapshot(options, lastSeenVersion) {
     const snapshot = await getCurrentState(options.bridgeUrl, options.timeoutMs);
     lastSnapshot = snapshot;
     const stateVersion = readNumber(snapshot.state_version) ?? 0;
-    if (snapshot.status === "ready" && stateVersion >= lastSeenVersion && !hasPendingAction(snapshot)) {
+    if (snapshot.status === "ready"
+      && stateVersion >= lastSeenVersion
+      && !hasPendingAction(snapshot)
+      && !isPostEndTurnTransitionSnapshot(snapshot)) {
       return snapshot;
     }
 
@@ -1918,7 +2200,10 @@ async function waitForCombatDecisionOrStop(options, lastSeenVersion) {
     const snapshot = await getCurrentState(options.bridgeUrl, options.timeoutMs);
     lastSnapshot = snapshot;
     const stateVersion = readNumber(snapshot.state_version) ?? 0;
-    if (snapshot.status === "ready" && stateVersion >= lastSeenVersion && !hasPendingAction(snapshot)) {
+    if (snapshot.status === "ready"
+      && stateVersion >= lastSeenVersion
+      && !hasPendingAction(snapshot)
+      && !isPostEndTurnTransitionSnapshot(snapshot)) {
       const readiness = classifyCombatReadiness(snapshot);
       lastReadiness = readiness;
       if (readiness.readyForDecision || readiness.shouldStop) {
@@ -1958,6 +2243,7 @@ async function main() {
   let lastSeenVersion = 0;
   let combatLoopStopped = false;
   let combatProgress = null;
+  let staleRetryCount = 0;
   while (decisions < options.maxDecisions) {
     const readiness = options.untilCombatEnd
       ? await waitForCombatDecisionOrStop(options, lastSeenVersion)
@@ -2019,9 +2305,10 @@ async function main() {
       addDecisionRecordToCombatProgress(combatProgress, record, stateSummary);
       process.stdout.write(`${JSON.stringify({ status: "dry_run", state_version: stateVersion, decision }, null, 2)}\n`);
     } else {
-      if (options.untilCombatEnd) {
+      {
         const latestBeforeSubmit = await getCurrentState(options.bridgeUrl, options.timeoutMs);
         if (hasStateChangedSinceDecision(snapshot, latestBeforeSubmit)) {
+          staleRetryCount += 1;
           const latestBeforeSubmitSummary = summarizeState(latestBeforeSubmit);
           const record = {
             event_type: "decision_recorded",
@@ -2048,10 +2335,13 @@ async function main() {
             status: "decision_stale_before_submit",
             state_version: stateVersion,
             latest_state_version: readNumber(latestBeforeSubmit.state_version),
+            stale_retry_count: staleRetryCount,
             decision
           }, null, 2)}\n`);
-          decisions += 1;
           lastSeenVersion = readNumber(latestBeforeSubmit.state_version) ?? stateVersion;
+          if (staleRetryCount > options.maxStaleRetries) {
+            decisions += 1;
+          }
           continue;
         }
       }
@@ -2109,7 +2399,13 @@ async function main() {
       } else if (options.waitResult) {
         finalLatest = { latest_action: submitted.latest_action || null, action_plan: submitted.action_plan || null };
       }
-      const finalPlan = finalLatest && isPlainObject(finalLatest.action_plan) ? finalLatest.action_plan : null;
+      const rawFinalPlan = finalLatest && isPlainObject(finalLatest.action_plan) ? finalLatest.action_plan : null;
+      const finalPlan = rawFinalPlan
+        && planId
+        && typeof rawFinalPlan.plan_id === "string"
+        && rawFinalPlan.plan_id === planId
+        ? rawFinalPlan
+        : null;
       const finalLatestAction = finalLatest && isPlainObject(finalLatest.latest_action) ? finalLatest.latest_action : null;
       const finalStatus = waitError
         ? "result_timeout"
@@ -2172,8 +2468,20 @@ async function main() {
         final_latest_action: finalLatest ? finalLatest.latest_action || null : null,
         final_action_plan: finalPlan
       }, null, 2)}\n`);
+
+      if (finalStatus === "stale") {
+        staleRetryCount += 1;
+        const retryVersion = afterStateSummary
+          ? readNumber(afterStateSummary.state_version)
+          : null;
+        lastSeenVersion = retryVersion !== null ? retryVersion : stateVersion + 1;
+        if (staleRetryCount <= options.maxStaleRetries) {
+          continue;
+        }
+      }
     }
 
+    staleRetryCount = 0;
     decisions += 1;
     lastSeenVersion = stateVersion + 1;
     if (options.once) {

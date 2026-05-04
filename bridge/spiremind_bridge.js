@@ -147,6 +147,20 @@ function getStateId(stateObject) {
   return candidate.trim();
 }
 
+function isTerminalStateEnvelope(state) {
+  if (!state) {
+    return false;
+  }
+
+  const currentState = isPlainObject(state.currentState) ? state.currentState : null;
+  const phase = currentState && typeof currentState.phase === "string" ? currentState.phase.trim() : "";
+  if (phase === "game_over") {
+    return true;
+  }
+
+  return typeof state.currentStateId === "string" && state.currentStateId.startsWith("game_over_");
+}
+
 function getLegalActionIds(stateObject) {
   const legalActions = isPlainObject(stateObject) ? stateObject.legal_actions : null;
   if (!Array.isArray(legalActions)) {
@@ -528,15 +542,21 @@ function resolveLegalActionForPlannedStep(stateObject, actionObject) {
       }
 
       if (requestedSelectionId !== "") {
-        return readTrimmedString(candidate.card_selection_id) === requestedSelectionId;
+        return readTrimmedString(candidate.card_selection_id) === requestedSelectionId
+          && (requestedIndex === null || readOptionalInteger(candidate.card_selection_index) === requestedIndex)
+          && (requestedCardId === "" || readTrimmedString(candidate.card_id) === requestedCardId)
+          && (requestedName === "" || readTrimmedString(candidate.name) === requestedName);
       }
 
       if (requestedIndex !== null) {
-        return readOptionalInteger(candidate.card_selection_index) === requestedIndex;
+        return readOptionalInteger(candidate.card_selection_index) === requestedIndex
+          && (requestedCardId === "" || readTrimmedString(candidate.card_id) === requestedCardId)
+          && (requestedName === "" || readTrimmedString(candidate.name) === requestedName);
       }
 
       if (requestedCardId !== "") {
-        return readTrimmedString(candidate.card_id) === requestedCardId;
+        return readTrimmedString(candidate.card_id) === requestedCardId
+          && (requestedName === "" || readTrimmedString(candidate.name) === requestedName);
       }
 
       if (requestedName !== "") {
@@ -549,6 +569,135 @@ function resolveLegalActionForPlannedStep(stateObject, actionObject) {
       return {
         ok: false,
         error: "현재 legal_actions에서 요청한 choose_card_selection을 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType === "choose_card_reward") {
+    const requestedRewardId = readTrimmedString(actionObject.reward_id);
+    const requestedStableId = readTrimmedString(actionObject.reward_stable_id || actionObject.card_reward_stable_id);
+    const requestedModelId = readTrimmedString(actionObject.model_id || actionObject.card_id);
+    const requestedIndex = readOptionalInteger(actionObject.card_reward_index);
+    const legalAction = getLegalActions(stateObject).find((candidate) => {
+      if (readTrimmedString(candidate.type) !== "choose_card_reward") {
+        return false;
+      }
+
+      if (requestedRewardId !== "" && readTrimmedString(candidate.reward_id) !== requestedRewardId) {
+        return false;
+      }
+
+      if (requestedStableId !== "" && readTrimmedString(candidate.reward_stable_id || candidate.card_reward_stable_id) !== requestedStableId) {
+        return false;
+      }
+
+      if (requestedModelId !== "" && readTrimmedString(candidate.model_id || candidate.card_id) !== requestedModelId) {
+        return false;
+      }
+
+      return requestedIndex === null || readOptionalInteger(candidate.card_reward_index) === requestedIndex;
+    });
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: "현재 legal_actions에서 요청한 choose_card_reward를 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType === "claim_potion_reward_with_discard") {
+    const requestedRewardId = readTrimmedString(actionObject.reward_id);
+    const requestedStableId = readTrimmedString(actionObject.reward_stable_id);
+    const requestedModelId = readTrimmedString(actionObject.model_id || actionObject.potion_id);
+    const requestedDiscardSlotIndex = readOptionalInteger(actionObject.discard_potion_slot_index);
+    const requestedDiscardPotionId = readTrimmedString(actionObject.discard_potion_id);
+    const legalAction = getLegalActions(stateObject).find((candidate) => {
+      if (readTrimmedString(candidate.type) !== "claim_potion_reward_with_discard") {
+        return false;
+      }
+
+      if (requestedRewardId !== "" && readTrimmedString(candidate.reward_id) !== requestedRewardId) {
+        return false;
+      }
+
+      if (requestedStableId !== "" && readTrimmedString(candidate.reward_stable_id) !== requestedStableId) {
+        return false;
+      }
+
+      if (requestedModelId !== "" && readTrimmedString(candidate.model_id || candidate.potion_id) !== requestedModelId) {
+        return false;
+      }
+
+      if (requestedDiscardPotionId !== "" && readTrimmedString(candidate.discard_potion_id) !== requestedDiscardPotionId) {
+        return false;
+      }
+
+      return requestedDiscardSlotIndex === null
+        || readOptionalInteger(candidate.discard_potion_slot_index) === requestedDiscardSlotIndex;
+    });
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: "현재 legal_actions에서 요청한 claim_potion_reward_with_discard를 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType === "claim_treasure_relic" || actionType === "choose_treasure_relic") {
+    const requestedStableId = readTrimmedString(actionObject.treasure_relic_id);
+    const requestedRelicId = readTrimmedString(actionObject.relic_id || actionObject.model_id);
+    const requestedIndex = readOptionalInteger(actionObject.treasure_relic_index);
+    const legalAction = getLegalActions(stateObject).find((candidate) => {
+      if (readTrimmedString(candidate.type) !== actionType) {
+        return false;
+      }
+
+      if (requestedStableId !== "" && readTrimmedString(candidate.treasure_relic_id) !== requestedStableId) {
+        return false;
+      }
+
+      if (requestedRelicId !== "" && readTrimmedString(candidate.relic_id || candidate.model_id) !== requestedRelicId) {
+        return false;
+      }
+
+      return requestedIndex === null || readOptionalInteger(candidate.treasure_relic_index) === requestedIndex;
+    });
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: `현재 legal_actions에서 요청한 ${actionType}를 찾지 못했습니다.`
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType === "open_treasure_chest" || actionType === "proceed_treasure") {
+    const legalAction = getLegalActions(stateObject).find((candidate) =>
+      readTrimmedString(candidate.type) === actionType
+    );
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: `현재 legal_actions에서 ${actionType}를 찾지 못했습니다.`
       };
     }
 
@@ -1059,6 +1208,8 @@ function summarizeStateForAction(combatState, selectedActionId) {
   const hand = Array.isArray(piles.hand) ? piles.hand : [];
   const enemies = Array.isArray(combatState.enemies) ? combatState.enemies : [];
   const potionSlots = Array.isArray(player.potion_slots) ? player.potion_slots : [];
+  const shop = isPlainObject(combatState.shop) ? combatState.shop : {};
+  const shopItems = Array.isArray(shop.items) ? shop.items : [];
   const legalAction = getLegalActionById(combatState, selectedActionId);
 
   return {
@@ -1092,13 +1243,33 @@ function summarizeStateForAction(combatState, selectedActionId) {
         potion_id: potion ? readTrimmedString(potion.potion_id || potion.potionId || potion.id) : null
       };
     }),
+    shop: {
+      item_count: toNullableNumber(shop.item_count) ?? shopItems.length,
+      gold: toNullableNumber(shop.gold),
+      items: shopItems.map((item) => ({
+        shop_item_id: readTrimmedString(item && (item.shop_item_id || item.shopItemId)),
+        kind: readTrimmedString(item && (item.kind || item.item_type || item.itemType)),
+        model_id: readTrimmedString(item && (item.model_id || item.modelId)),
+        name: readTrimmedString(item && item.name),
+        cost: toNullableNumber(item && (item.cost ?? item.price)),
+        slot_group: readTrimmedString(item && (item.slot_group || item.slotGroup)),
+        slot_index: toNullableNumber(item && (item.slot_index ?? item.slotIndex)),
+        locator_id: readTrimmedString(item && (item.locator_id || item.locatorId)),
+        is_stocked: item && typeof item.is_stocked === "boolean" ? item.is_stocked : null,
+        is_purchase_legal_now: item && typeof item.is_purchase_legal_now === "boolean" ? item.is_purchase_legal_now : null
+      }))
+    },
     selected_action: legalAction ? {
       action_id: readTrimmedString(legalAction.action_id || legalAction.actionId),
       type: readTrimmedString(legalAction.type),
       card_instance_id: readTrimmedString(legalAction.card_instance_id || legalAction.cardInstanceId),
       combat_card_id: toNullableNumber(legalAction.combat_card_id ?? legalAction.combatCardId),
       potion_slot_index: toNullableNumber(legalAction.potion_slot_index ?? legalAction.potionSlotIndex),
-      target_id: readTrimmedString(legalAction.target_id || legalAction.targetId)
+      target_id: readTrimmedString(legalAction.target_id || legalAction.targetId),
+      shop_item_id: readTrimmedString(legalAction.shop_item_id || legalAction.shopItemId),
+      slot_group: readTrimmedString(legalAction.slot_group || legalAction.slotGroup),
+      slot_index: toNullableNumber(legalAction.slot_index ?? legalAction.slotIndex),
+      locator_id: readTrimmedString(legalAction.locator_id || legalAction.locatorId)
     } : null
   };
 }
@@ -1133,6 +1304,17 @@ function compareActionStateSummaries(before, after, action) {
   const targetHpChanged = beforeTarget && afterTarget
     ? beforeTarget.hp !== afterTarget.hp
     : null;
+  const beforeGold = before.player && before.player.gold;
+  const afterGold = after.player && after.player.gold;
+  const playerGoldDelta = beforeGold !== null && afterGold !== null
+    ? afterGold - beforeGold
+    : null;
+  const selectedShopItemId = readTrimmedString(action && (action.shop_item_id || action.shopItemId));
+  const beforeShopItem = findShopItemSummary(before, selectedShopItemId);
+  const afterShopItem = findShopItemSummary(after, selectedShopItemId);
+  const selectedShopItemRemoved = selectedShopItemId
+    ? beforeShopItem !== null && afterShopItem === null
+    : null;
 
   return {
     comparable: true,
@@ -1145,7 +1327,10 @@ function compareActionStateSummaries(before, after, action) {
     selected_card_left_hand: selectedCardLeftHand,
     potion_slot_changed: potionSlotChanged,
     target_hp_changed: targetHpChanged,
-    enemy_count_delta: (after.enemies || []).length - (before.enemies || []).length
+    enemy_count_delta: (after.enemies || []).length - (before.enemies || []).length,
+    player_gold_delta: playerGoldDelta,
+    shop_item_count_delta: ((after.shop && after.shop.items) || []).length - ((before.shop && before.shop.items) || []).length,
+    selected_shop_item_removed: selectedShopItemRemoved
   };
 }
 
@@ -1163,6 +1348,14 @@ function findEnemySummary(summary, combatId) {
   }
 
   return summary.enemies.find((enemy) => enemy.combat_id === combatId) || null;
+}
+
+function findShopItemSummary(summary, shopItemId) {
+  if (!shopItemId || !summary || !summary.shop || !Array.isArray(summary.shop.items)) {
+    return null;
+  }
+
+  return summary.shop.items.find((item) => item.shop_item_id === shopItemId) || null;
 }
 
 function toNullableNumber(value) {
@@ -1220,16 +1413,30 @@ function createActionClaim(state, claimArguments) {
     };
   }
 
+  const legalAction = getLegalActionById(state.currentState, latestAction.selected_action_id);
+  const actionType = legalAction && typeof legalAction.type === "string" ? legalAction.type.trim() : "";
   const stateMatches = latestAction.state_id === state.currentStateId
     && latestAction.state_version === state.stateVersion
     && latestAction.state_id === observedStateId
     && latestAction.state_version === observedStateVersion;
+  const canClaimAcrossFreshCombatState = !stateMatches
+    && legalAction
+    && latestAction.state_id.startsWith("combat_")
+    && state.currentStateId.startsWith("combat_")
+    && observedStateId === state.currentStateId
+    && observedStateVersion === state.stateVersion
+    && (actionType === "play_card" || actionType === "use_potion");
 
-  if (!stateMatches) {
-    latestAction.execution_status = "stale";
-    latestAction.result = "stale";
+  if (!stateMatches && !canClaimAcrossFreshCombatState) {
+    const terminalTransition = isTerminalStateEnvelope(state);
+    const claimResult = terminalTransition ? "terminal_transition" : "stale";
+    const claimNote = terminalTransition
+      ? "claim 시점에 종료 상태로 전환되었습니다. terminal_phase=game_over"
+      : "claim 시점의 상태가 제출 시점 상태와 다릅니다.";
+    latestAction.execution_status = claimResult;
+    latestAction.result = claimResult;
     latestAction.result_reported_at = toIsoString(new Date());
-    latestAction.result_note = "claim 시점의 상태가 제출 시점 상태와 다릅니다.";
+    latestAction.result_note = claimNote;
     updateLatestAction(state, "action_marked_stale", {
       submission_id: latestAction.submission_id,
       state_id: latestAction.state_id,
@@ -1237,6 +1444,15 @@ function createActionClaim(state, claimArguments) {
       observed_state_id: observedStateId,
       observed_state_version: observedStateVersion
     });
+
+    if (terminalTransition) {
+      return {
+        ok: true,
+        status: claimResult,
+        reason: claimNote,
+        action: latestAction
+      };
+    }
 
     const retrySubmission = retryCurrentPlanStepAfterStale(state, latestAction, latestAction.result_note);
     if (retrySubmission) {
@@ -1257,7 +1473,6 @@ function createActionClaim(state, claimArguments) {
     };
   }
 
-  const legalAction = getLegalActionById(state.currentState, latestAction.selected_action_id);
   if (!legalAction) {
     latestAction.execution_status = "stale";
     latestAction.result = "stale";
@@ -1287,7 +1502,6 @@ function createActionClaim(state, claimArguments) {
     };
   }
 
-  const actionType = typeof legalAction.type === "string" ? legalAction.type.trim() : "";
   if (supportedActionTypes.length > 0 && !supportedActionTypes.includes(actionType)) {
     latestAction.execution_status = "unsupported";
     latestAction.result = "unsupported";
@@ -1343,7 +1557,7 @@ function createActionResult(state, resultArguments) {
   const note = typeof resultArguments.note === "string" ? resultArguments.note.trim() : "";
   const observedStateId = typeof resultArguments.observed_state_id === "string" ? resultArguments.observed_state_id.trim() : "";
   const observedStateVersion = normalizeStateVersion(resultArguments.observed_state_version, -1);
-  const allowedResults = new Set(["applied", "stale", "unsupported", "failed", "ignored_duplicate"]);
+  const allowedResults = new Set(["applied", "stale", "terminal_transition", "unsupported", "failed", "ignored_duplicate"]);
 
   if (!latestAction || latestAction.submission_id !== submissionId) {
     return {
@@ -1369,25 +1583,33 @@ function createActionResult(state, resultArguments) {
     };
   }
 
+  const terminalTransition = result === "stale" && isTerminalStateEnvelope(state);
+  const effectiveResult = terminalTransition ? "terminal_transition" : result;
+  const effectiveNote = terminalTransition
+    ? [note, "terminal_phase=game_over"].filter((item) => item !== "").join(" ")
+    : note;
+
   const reportedAt = toIsoString(new Date());
-  latestAction.execution_status = result;
-  latestAction.result = result;
+  latestAction.execution_status = effectiveResult;
+  latestAction.result = effectiveResult;
   latestAction.result_reported_at = reportedAt;
   latestAction.result_executor_id = executorId || null;
   latestAction.result_observed_state_id = observedStateId || null;
   latestAction.result_observed_state_version = observedStateVersion >= 0 ? observedStateVersion : null;
-  latestAction.result_note = note || null;
+  latestAction.result_note = effectiveNote || null;
+  attachObservedResultStateIfCurrent(state, latestAction);
 
   if (state.actionPlan
     && state.actionPlan.status === "running"
     && latestAction.plan_id === state.actionPlan.plan_id
-    && result !== "applied"
-    && result !== "stale") {
+    && effectiveResult !== "applied"
+    && effectiveResult !== "stale"
+    && effectiveResult !== "terminal_transition") {
     state.actionPlan.status = "failed";
     state.actionPlan.failure = {
       action_index: latestAction.plan_action_index,
       submission_id: latestAction.submission_id,
-      result,
+      result: effectiveResult,
       reason: note || "행동 실행 결과가 applied가 아니어서 남은 행동을 중단했습니다."
     };
   }
@@ -1398,14 +1620,14 @@ function createActionResult(state, resultArguments) {
     executor_id: executorId || null,
     selected_action_id: latestAction.selected_action_id || null,
     action_type: latestAction.action_type || null,
-    result,
+    result: effectiveResult,
     observed_state_id: observedStateId || null,
     observed_state_version: observedStateVersion >= 0 ? observedStateVersion : null,
-    result_note: note || null
+    result_note: effectiveNote || null
   });
 
-  if (result === "stale") {
-    const retrySubmission = retryCurrentPlanStepAfterStale(state, latestAction, note);
+  if (effectiveResult === "stale") {
+    const retrySubmission = retryCurrentPlanStepAfterStale(state, latestAction, effectiveNote);
     if (retrySubmission) {
       return {
         ok: true,
@@ -1415,15 +1637,45 @@ function createActionResult(state, resultArguments) {
       };
     }
 
-    failCurrentPlanStepAfterStale(state, latestAction, note);
+    failCurrentPlanStepAfterStale(state, latestAction, effectiveNote);
+  }
+
+  if (effectiveResult === "applied") {
+    advanceActionPlanAfterStateUpdate(state);
   }
 
   return {
     ok: true,
-    status: result,
-    latest_action: latestAction,
+    status: effectiveResult,
+    latest_action: state.latestAction,
     action_plan: state.actionPlan
   };
+}
+
+function attachObservedResultStateIfCurrent(state, latestAction) {
+  if (!latestAction
+    || latestAction.result === null
+    || latestAction.post_result_state_version !== undefined
+    || latestAction.result_observed_state_version === null
+    || latestAction.result_observed_state_version === undefined
+    || latestAction.result_observed_state_version <= latestAction.state_version
+    || state.currentState === null
+    || state.stateVersion <= latestAction.state_version) {
+    return;
+  }
+
+  const envelope = buildStateEnvelope(state);
+  const postSummary = summarizeStateForAction(envelope.state, latestAction.selected_action_id);
+  const delta = compareActionStateSummaries(
+    latestAction.pre_action_state_summary || null,
+    postSummary,
+    latestAction.action || null);
+
+  latestAction.post_result_state_id = envelope.state_id;
+  latestAction.post_result_state_version = envelope.state_version;
+  latestAction.post_result_received_at = envelope.received_at;
+  latestAction.post_result_state_summary = postSummary;
+  latestAction.state_delta = delta;
 }
 
 function getCurrentStatePayload(state) {
@@ -1705,3 +1957,4 @@ process.on("SIGTERM", () => {
 
   process.exit(0);
 });
+

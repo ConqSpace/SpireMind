@@ -56,6 +56,40 @@ internal static class AutotestCommandChannel
         TryAdvanceStartNewRunOperation();
     }
 
+    public static bool TryStartContinueRunFromLegalAction(string submissionId, out string detail)
+    {
+        string commandId = string.IsNullOrWhiteSpace(submissionId)
+            ? $"legal-continue-{Guid.NewGuid():N}"
+            : $"legal-continue-{submissionId}";
+        AutotestCommand command = new()
+        {
+            Id = commandId,
+            Action = "continue_run",
+            Params = new Dictionary<string, JsonElement>()
+        };
+
+        TryContinueRun(command);
+        detail = $"continue_run legal action accepted. command_id={commandId}";
+        return true;
+    }
+
+    public static bool TryStartNewRunFromLegalAction(string submissionId, out string detail)
+    {
+        string commandId = string.IsNullOrWhiteSpace(submissionId)
+            ? $"legal-start-{Guid.NewGuid():N}"
+            : $"legal-start-{submissionId}";
+        AutotestCommand command = new()
+        {
+            Id = commandId,
+            Action = "start_new_run",
+            Params = new Dictionary<string, JsonElement>()
+        };
+
+        TryStartNewRun(command);
+        detail = $"start_new_run legal action accepted. command_id={commandId}";
+        return true;
+    }
+
     private static void TryProcessCommandFile()
     {
         string commandPath = GetCommandPath();
@@ -138,6 +172,12 @@ internal static class AutotestCommandChannel
             if (command.Action.Equals("start_new_run", StringComparison.OrdinalIgnoreCase))
             {
                 TryStartNewRun(command);
+                return;
+            }
+
+            if (command.Action.Equals("probe_card_selection_validation", StringComparison.OrdinalIgnoreCase))
+            {
+                TryProbeCardSelectionValidation(command);
                 return;
             }
 
@@ -265,6 +305,157 @@ internal static class AutotestCommandChannel
     {
         Interlocked.Exchange(ref continueRunInFlight, 0);
         Interlocked.Exchange(ref commandInFlight, 0);
+    }
+
+    private static void TryProbeCardSelectionValidation(AutotestCommand command)
+    {
+        PendingAdapterCardSelection? pending = AdapterCardSelectionBridge.GetPendingSelectionSnapshot();
+        List<AdapterCardSelectionOption> options = pending?.Options.ToList() ?? new List<AdapterCardSelectionOption>();
+        List<int> selectedIndexes = pending?.SelectedIndexes.ToList() ?? new List<int>();
+        bool includeDuplicateProbe = ReadBool(command.Params, "include_duplicate_probe") == true;
+        Dictionary<string, object?> diagnostics = new(StringComparer.Ordinal)
+        {
+            ["pending_found"] = pending is not null,
+            ["selection_id"] = pending?.SelectionId,
+            ["option_count"] = options.Count,
+            ["selected_count_before"] = selectedIndexes.Count,
+            ["min_select"] = pending?.MinSelect,
+            ["max_select"] = pending?.MaxSelect,
+            ["include_duplicate_probe"] = includeDuplicateProbe
+        };
+
+        if (pending is null || pending.Completion.Task.IsCompleted)
+        {
+            WriteCommandResult(command, "rejected", "검증할 어댑터 카드 선택 대기 상태가 없습니다.", diagnostics);
+            Interlocked.Exchange(ref commandInFlight, 0);
+            return;
+        }
+
+        if (options.Count == 0)
+        {
+            WriteCommandResult(command, "failed", "어댑터 카드 선택 대기 상태는 있지만 선택 후보가 없습니다.", diagnostics);
+            Interlocked.Exchange(ref commandInFlight, 0);
+            return;
+        }
+
+        AdapterCardSelectionOption option = options[0];
+        bool staleSelectionResult = AdapterCardSelectionBridge.TryChoose(
+            option.Index,
+            option.CardSelectionId,
+            option.CardId,
+            option.Name,
+            option.Upgraded,
+            option.Pile,
+            pending.SelectionId + ":stale-probe",
+            out string staleSelectionDetail,
+            out CardSelectionActionStatus staleSelectionStatus);
+
+        bool staleCardResult = AdapterCardSelectionBridge.TryChoose(
+            option.Index,
+            option.CardSelectionId,
+            option.CardId + ":stale-probe",
+            option.Name,
+            option.Upgraded,
+            option.Pile,
+            pending.SelectionId,
+            out string staleCardDetail,
+            out CardSelectionActionStatus staleCardStatus);
+
+        bool rangeResult = AdapterCardSelectionBridge.TryChoose(
+            options.Count + 100,
+            null,
+            null,
+            null,
+            null,
+            null,
+            pending.SelectionId,
+            out string rangeDetail,
+            out CardSelectionActionStatus rangeStatus);
+
+        diagnostics["stale_selection_result"] = staleSelectionResult;
+        diagnostics["stale_selection_status"] = FormatCardSelectionStatus(staleSelectionStatus);
+        diagnostics["stale_selection_detail"] = staleSelectionDetail;
+        diagnostics["stale_card_result"] = staleCardResult;
+        diagnostics["stale_card_status"] = FormatCardSelectionStatus(staleCardStatus);
+        diagnostics["stale_card_detail"] = staleCardDetail;
+        diagnostics["range_result"] = rangeResult;
+        diagnostics["range_status"] = FormatCardSelectionStatus(rangeStatus);
+        diagnostics["range_detail"] = rangeDetail;
+
+        bool passed = !staleSelectionResult
+            && staleSelectionStatus == CardSelectionActionStatus.Stale
+            && !staleCardResult
+            && staleCardStatus == CardSelectionActionStatus.Stale
+            && !rangeResult
+            && rangeStatus == CardSelectionActionStatus.Failed;
+
+        if (includeDuplicateProbe)
+        {
+            int duplicateIndex = ReadInt(command.Params, "duplicate_index") ?? option.Index;
+            AdapterCardSelectionOption? duplicateOption = options.FirstOrDefault(candidate => candidate.Index == duplicateIndex);
+            diagnostics["duplicate_requested_index"] = duplicateIndex;
+            diagnostics["duplicate_option_found"] = duplicateOption is not null;
+
+            if (duplicateOption is null)
+            {
+                passed = false;
+                diagnostics["duplicate_probe_skipped"] = true;
+                diagnostics["duplicate_probe_skip_reason"] = "requested_index_not_found";
+            }
+            else
+            {
+                bool firstChooseResult = AdapterCardSelectionBridge.TryChoose(
+                    duplicateOption.Index,
+                    duplicateOption.CardSelectionId,
+                    duplicateOption.CardId,
+                    duplicateOption.Name,
+                    duplicateOption.Upgraded,
+                    duplicateOption.Pile,
+                    pending.SelectionId,
+                    out string firstChooseDetail,
+                    out CardSelectionActionStatus firstChooseStatus);
+
+                bool duplicateChooseResult = AdapterCardSelectionBridge.TryChoose(
+                    duplicateOption.Index,
+                    duplicateOption.CardSelectionId,
+                    duplicateOption.CardId,
+                    duplicateOption.Name,
+                    duplicateOption.Upgraded,
+                    duplicateOption.Pile,
+                    pending.SelectionId,
+                    out string duplicateChooseDetail,
+                    out CardSelectionActionStatus duplicateChooseStatus);
+
+                diagnostics["first_choose_result"] = firstChooseResult;
+                diagnostics["first_choose_status"] = FormatCardSelectionStatus(firstChooseStatus);
+                diagnostics["first_choose_detail"] = firstChooseDetail;
+                diagnostics["duplicate_choose_result"] = duplicateChooseResult;
+                diagnostics["duplicate_choose_status"] = FormatCardSelectionStatus(duplicateChooseStatus);
+                diagnostics["duplicate_choose_detail"] = duplicateChooseDetail;
+
+                passed = passed
+                    && firstChooseResult
+                    && firstChooseStatus == CardSelectionActionStatus.Applied
+                    && !duplicateChooseResult
+                    && duplicateChooseStatus == CardSelectionActionStatus.Failed;
+            }
+        }
+
+        PendingAdapterCardSelection? afterPending = AdapterCardSelectionBridge.GetPendingSelectionSnapshot();
+        diagnostics["selected_count_after"] = afterPending?.SelectedIndexes.Count;
+        diagnostics["selection_completed_after_probe"] = afterPending?.Completion.Task.IsCompleted;
+
+        WriteCommandResult(
+            command,
+            passed ? "applied" : "failed",
+            passed ? "카드 선택 검증 경로가 예상대로 stale/failed/applied를 구분했습니다." : "카드 선택 검증 경로가 예상과 다릅니다.",
+            diagnostics);
+        Interlocked.Exchange(ref commandInFlight, 0);
+    }
+
+    private static string FormatCardSelectionStatus(CardSelectionActionStatus status)
+    {
+        return status.ToString().ToLowerInvariant();
     }
 
     private static void TryEnterCombatDebug(AutotestCommand command)
@@ -2466,9 +2657,10 @@ internal static class AutotestCommandChannel
         private static bool TryExportVisibleRunStateForContinue()
         {
             return CombatStateExporter.TryExportGameOverStateIfVisible()
+                || CombatStateExporter.TryExportAdapterCardSelectionStateIfPending()
                 || CombatStateExporter.TryExportCardSelectionStateIfVisible()
-                || CombatStateExporter.TryExportEventStateIfVisible()
                 || CombatStateExporter.TryExportRewardStateIfVisible()
+                || CombatStateExporter.TryExportEventStateIfVisible()
                 || CombatStateExporter.TryExportTreasureStateIfVisible()
                 || CombatStateExporter.TryExportMapStateIfVisible()
                 || CombatStateExporter.TryExportShopStateIfVisible()

@@ -32,21 +32,33 @@ internal static class AutotestMainThreadTicker
             Interlocked.Increment(ref tickCount);
             if (!CombatStateExporter.TryExportGameOverStateIfVisible())
             {
-                if (!CombatStateExporter.TryExportCardSelectionStateIfVisible())
+                if (!CombatStateExporter.TryExportAdapterCardSelectionStateIfPending())
                 {
-                    if (!CombatStateExporter.TryExportEventStateIfVisible())
+                    if (!CombatStateExporter.TryExportCardSelectionStateIfVisible())
                     {
-                        if (!CombatStateExporter.TryExportRewardStateIfVisible())
+                        if (!CombatStateExporter.TryExportHandCardSelectionStateIfVisible())
                         {
-                            if (!CombatStateExporter.TryExportTreasureStateIfVisible())
+                            if (!CombatStateExporter.TryRefreshCombatStateFromCombatManager("autotest_timer"))
                             {
-                                if (!CombatStateExporter.TryExportMapStateIfVisible())
+                                if (!CombatStateExporter.TryExportRewardStateIfVisible())
                                 {
-                                    if (!CombatStateExporter.TryExportShopStateIfVisible())
+                                    if (!CombatStateExporter.TryExportEventStateIfVisible())
                                     {
-                                        if (!CombatStateExporter.TryExportRestSiteStateIfVisible())
+                                        if (!CombatStateExporter.TryExportTreasureStateIfVisible())
                                         {
-                                            CombatStateExporter.FlushPendingExportIfReady();
+                                            if (!CombatStateExporter.TryExportMapStateIfVisible())
+                                            {
+                                                if (!CombatStateExporter.TryExportShopStateIfVisible())
+                                                {
+                                                    if (!CombatStateExporter.TryExportRestSiteStateIfVisible())
+                                                    {
+                                                        if (!CombatStateExporter.TryExportMainMenuStateIfVisible())
+                                                        {
+                                                            CombatStateExporter.FlushPendingExportIfReady();
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

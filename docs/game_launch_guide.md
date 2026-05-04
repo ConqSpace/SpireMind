@@ -256,3 +256,22 @@ Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:17832/health" -TimeoutSec 2
 ```powershell
 Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:17832/action/latest" -TimeoutSec 2
 ```
+## 방 단위 어댑터 검증
+
+긴 런을 한 번에 돌리면 실패 원인이 출력에 묻히기 쉽다. 어댑터 검증은 먼저 방 단위 러너로 끊어서 본다.
+
+```powershell
+node .\bridge\spiremind_room_runner.js `
+  --max-rooms 1 `
+  --max-steps 8 `
+  --label smoke
+```
+
+러너는 각 단계의 전후 상태, 마지막 행동, 실패 사유를 `logs\room_runner\<timestamp>\events.jsonl`과 `summary.json`에 남긴다.
+
+중요한 해석 기준은 다음과 같다.
+
+- `action_failed`: `legal_actions`에 있던 행동을 실행자가 처리하지 못했다. 어댑터 결함 후보로 본다.
+- `action_stale`: 상태가 바뀌어 같은 행동을 더 이상 적용할 수 없다. 반복되면 전환 대기나 최신 상태 매칭을 점검한다.
+- `terminal_transition`: 행동 결과로 `game_over` 같은 종료 상태에 도달했다. 실패가 아니라 종료 전환이다.
+- `decision_timeout`: 판단 루프 또는 게임 실행 대기가 제한 시간을 넘겼다.

@@ -17,6 +17,8 @@ internal static class CombatStateExporter
     private const int MaxSafeJsonDepth = 12;
     private const int MaxSafeJsonListItems = 200;
     private static readonly bool EnableUnsafeUiHandDebug = false;
+    private const long CardSelectionSourceRememberMs = 30000;
+    private static CardSelectionSourceHint? latestCardSelectionSourceHint;
     private static readonly string[] PowerSourceMemberNames =
     {
         "powers",
@@ -27,6 +29,20 @@ internal static class CombatStateExporter
         "buffs",
         "debuffs"
     };
+
+    internal static void RememberCardSelectionSourceHint(string? cardId, string? cardName, bool? upgraded)
+    {
+        if (string.IsNullOrWhiteSpace(cardId) && string.IsNullOrWhiteSpace(cardName))
+        {
+            return;
+        }
+
+        latestCardSelectionSourceHint = new CardSelectionSourceHint(
+            cardId,
+            cardName,
+            upgraded,
+            Environment.TickCount64);
+    }
 
     private static readonly string[] BuffPowerKeywords =
     {
@@ -84,6 +100,8 @@ internal static class CombatStateExporter
     private static object? recentPlayerCombatState;
     private static readonly List<object> RecentCardPiles = new();
     private static readonly List<string> LastObservedTypes = new();
+    private static string? lastPublishedPhase;
+    private static int lastPublishedLegalActionCount;
 
     public static void Observe(object? instance)
     {
@@ -99,6 +117,35 @@ internal static class CombatStateExporter
     internal static object? GetLatestRuntimePlayer()
     {
         return recentPlayer;
+    }
+
+    internal static object? FindLatestRuntimeHandCardByCombatCardId(int combatCardId)
+    {
+        object? managerCombatState = ReadCombatManagerDebugState(GetCombatManagerInstance());
+        object? combatRoot = managerCombatState ?? recentCombatState;
+        if (combatRoot is null)
+        {
+            return null;
+        }
+
+        List<object> roots = GetExportRoots(combatRoot, managerCombatState);
+        ObjectGraph graph = ObjectGraph.Collect(roots, MaxSearchDepth, MaxVisitedObjects);
+        object? player = ResolveRuntimePlayer(combatRoot, graph)
+            ?? recentPlayer
+            ?? recentPlayerCombatState
+            ?? FindFirst(graph, "Player", "PlayerCombatState");
+        CardMovementObserver.ObserveContext(combatRoot, player);
+
+        foreach (object card in SelectMergedHandSource(combatRoot, player, graph))
+        {
+            uint? runtimeCombatCardId = TryReadCombatCardId(card);
+            if (runtimeCombatCardId is not null && runtimeCombatCardId.Value == (uint)combatCardId)
+            {
+                return card;
+            }
+        }
+
+        return null;
     }
 
     internal static CombatExportProbe ForceExportFromCombatManager(string reason)
@@ -248,6 +295,34 @@ internal static class CombatStateExporter
         }
     }
 
+    internal static bool TryRefreshCombatStateFromCombatManager(string reason)
+    {
+        try
+        {
+            RuntimePhaseResolution runtimePhase = RuntimePhaseResolver.Resolve();
+            if (!runtimePhase.CombatInProgress)
+            {
+                return false;
+            }
+
+            if (runtimePhase.CombatState is null)
+            {
+                Logger.Warning($"전투가 진행 중이지만 CombatManager.DebugOnlyGetState 값을 읽지 못했습니다. 화면 export를 건너뜁니다. reason={reason}, block_reason={runtimePhase.BlockScreenExportReason}");
+                return true;
+            }
+
+            object combatRoot = runtimePhase.CombatState;
+            RememberObservedRoot(combatRoot);
+            TryExport(combatRoot);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"CombatManager 기준 전투 상태 갱신 중 예외가 발생했습니다. 다음 타이머 틱에서 다시 시도합니다. reason={reason}, {exception.GetType().Name}: {exception.Message}");
+            return false;
+        }
+    }
+
     internal static bool TryExportGameOverStateIfVisible()
     {
         try
@@ -312,6 +387,51 @@ internal static class CombatStateExporter
         catch (Exception exception)
         {
             Logger.Warning($"Card selection state export failed. The game will keep running. {exception.GetType().Name}: {exception.Message}");
+            return false;
+        }
+    }
+
+    internal static bool TryExportHandCardSelectionStateIfVisible()
+    {
+        try
+        {
+            object? hand = FindHandCardSelectionRoot();
+            if (hand is null)
+            {
+                return false;
+            }
+
+            Dictionary<string, object?> state = BuildCardSelectionState(hand);
+            WriteState(hand, state, "hand_card_selection", force: false, tickAfterExport: false);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"Hand card selection state export failed. The game will keep running. {exception.GetType().Name}: {exception.Message}");
+            return false;
+        }
+    }
+
+    internal static bool TryExportAdapterCardSelectionStateIfPending()
+    {
+        try
+        {
+            PendingAdapterCardSelection? pending = AdapterCardSelectionBridge.GetPendingSelectionSnapshot();
+            if (pending is null || pending.Completion.Task.IsCompleted)
+            {
+                return false;
+            }
+
+            object? combatRoot = ReadCombatManagerDebugState(GetCombatManagerInstance())
+                ?? GetCombatManagerInstance()
+                ?? pending;
+            Dictionary<string, object?> state = BuildAdapterCardSelectionState(pending, combatRoot);
+            WriteState(combatRoot, state, "adapter_card_selection", force: true, tickAfterExport: false);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"어댑터 카드 선택 상태 추출에 실패했습니다. 게임 진행은 멈추지 않습니다. {exception.GetType().Name}: {exception.Message}");
             return false;
         }
     }
@@ -396,12 +516,12 @@ internal static class CombatStateExporter
 
     internal static bool TryExportShopStateIfVisible()
     {
-        try
-        {
-            object? shopScreen = FindShopScreen();
-            if (shopScreen is null)
+            try
             {
-                return false;
+                object? shopScreen = ShopRuntimeLocator.FindShopScreen(CreateShopRuntimeLocatorContext());
+                if (shopScreen is null)
+                {
+                    return false;
             }
 
             if (FindMapScreen() is not null)
@@ -430,6 +550,11 @@ internal static class CombatStateExporter
                 return false;
             }
 
+            if (TryExportCombatInsteadOfScreen("map", mapScreen, tickAfterExport: false))
+            {
+                return true;
+            }
+
             Dictionary<string, object?> state = BuildMapState(mapScreen);
             WriteState(mapScreen, state, "map", force: false, tickAfterExport: false);
             return true;
@@ -437,6 +562,27 @@ internal static class CombatStateExporter
         catch (Exception exception)
         {
             Logger.Warning($"지도 화면 상태 추출에 실패했습니다. 게임 진행은 멈추지 않습니다. {exception.GetType().Name}: {exception.Message}");
+            return false;
+        }
+    }
+
+    internal static bool TryExportMainMenuStateIfVisible()
+    {
+        try
+        {
+            object? mainMenu = FindMainMenu();
+            if (mainMenu is null || !IsLiveVisibleControl(mainMenu))
+            {
+                return false;
+            }
+
+            Dictionary<string, object?> state = BuildMainMenuState(mainMenu);
+            WriteState(mainMenu, state, "main_menu", force: false, tickAfterExport: false);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            Logger.Warning($"메인 메뉴 상태 추출에 실패했습니다. 게임 진행은 멈추지 않습니다. {exception.GetType().Name}: {exception.Message}");
             return false;
         }
     }
@@ -459,7 +605,7 @@ internal static class CombatStateExporter
         }
         catch (Exception exception)
         {
-            Logger.Warning($"전투 상태 추출에 실패했습니다. 게임 진행은 멈추지 않습니다. {exception.GetType().Name}: {exception.Message}");
+            Logger.Warning($"전투 상태 추출에 실패했습니다. 게임 진행은 멈추지 않습니다. {exception}");
         }
     }
 
@@ -495,7 +641,36 @@ internal static class CombatStateExporter
         bool force,
         bool tickAfterExport)
     {
+        RuntimePhaseResolution runtimePhase = RuntimePhaseResolver.Resolve();
+        string requestedPhase = ReadDictionaryString(state, "phase") ?? stateIdPrefix;
+        if (ShouldBlockNonCombatExport(runtimePhase, requestedPhase))
+        {
+            if (runtimePhase.CombatState is null)
+            {
+                Logger.Warning($"전투 진행 중 {requestedPhase} export를 차단했습니다. 전투 debug state가 없어 이전 안정 상태를 유지합니다. reason={runtimePhase.BlockScreenExportReason}");
+                ClearPendingExport();
+                return null;
+            }
+
+            object combatRoot = runtimePhase.CombatState;
+            RememberObservedRoot(combatRoot);
+            Dictionary<string, object?> combatState = BuildState(combatRoot);
+            Logger.Info($"전투 진행 중 {requestedPhase} export를 차단하고 전투 상태로 전환합니다. reason={runtimePhase.BlockScreenExportReason}");
+            return WriteState(combatRoot, combatState, "combat", force, tickAfterExport);
+        }
+
+        if (!state.ContainsKey("runtime_phase"))
+        {
+            state["runtime_phase"] = runtimePhase.ToDiagnostics(requestedPhase);
+        }
         state["room_context"] = BuildRoomContext(runtimeRoot, state);
+        if (ShouldSuppressUnstableExport(runtimePhase, state, requestedPhase, out string unstableReason))
+        {
+            Logger.Info($"불안정한 중간 export를 보류합니다. requested_phase={requestedPhase}, reason={unstableReason}");
+            ClearPendingExport();
+            return null;
+        }
+
         string stateFingerprint = ComputeStateFingerprint(state);
         state["state_id"] = $"{stateIdPrefix}_{stateFingerprint[..16]}";
         state["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -507,9 +682,10 @@ internal static class CombatStateExporter
             CombatStateBridgePoster.PostedStateSnapshot? postedState = CombatStateBridgePoster.GetLatestPostedState();
             if (postedState is null || postedState.StateId != safeState["state_id"]?.ToString())
             {
-                CombatStateBridgePoster.TryPost(json);
+                    CombatStateBridgePoster.TryPost(json);
             }
 
+            RememberPublishedState(safeState);
             ClearPendingExport();
             if (tickAfterExport)
             {
@@ -525,6 +701,7 @@ internal static class CombatStateExporter
         File.WriteAllText(outputPath, json);
         CombatActionRuntimeContext.UpdateFromExport(runtimeRoot, json);
         CombatStateBridgePoster.TryPost(json);
+        RememberPublishedState(safeState);
         ClearPendingExport();
         if (tickAfterExport)
         {
@@ -538,6 +715,165 @@ internal static class CombatStateExporter
         }
 
         return safeState;
+    }
+
+    private static bool TryExportCombatInsteadOfScreen(string requestedPhase, object screenRoot, bool tickAfterExport)
+    {
+        RuntimePhaseResolution runtimePhase = RuntimePhaseResolver.Resolve();
+        if (!runtimePhase.ShouldBlockScreenExport)
+        {
+            return false;
+        }
+
+        if (runtimePhase.CombatState is null)
+        {
+            Logger.Warning($"전투 진행 중 {requestedPhase} export를 차단했습니다. 전투 debug state가 없어 이전 안정 상태를 유지합니다. reason={runtimePhase.BlockScreenExportReason}");
+            return true;
+        }
+
+        object combatRoot = runtimePhase.CombatState;
+        RememberObservedRoot(combatRoot);
+        Dictionary<string, object?> combatState = BuildState(combatRoot);
+        combatState["runtime_phase"] = runtimePhase.ToDiagnostics(requestedPhase);
+        Logger.Info($"전투 진행 중 {requestedPhase} export를 차단하고 전투 상태로 전환합니다. reason={runtimePhase.BlockScreenExportReason}");
+        WriteState(combatRoot, combatState, "combat", force: false, tickAfterExport: tickAfterExport);
+        return true;
+    }
+
+    private static bool ShouldBlockNonCombatExport(RuntimePhaseResolution runtimePhase, string requestedPhase)
+    {
+        return runtimePhase.ShouldBlockScreenExport
+            && !IsCombatExportPhase(requestedPhase);
+    }
+
+    private static bool IsCombatExportPhase(string requestedPhase)
+    {
+        return requestedPhase.Equals("combat_turn", StringComparison.OrdinalIgnoreCase)
+            || requestedPhase.Equals("combat", StringComparison.OrdinalIgnoreCase)
+            || requestedPhase.Equals("card_selection", StringComparison.OrdinalIgnoreCase)
+            || requestedPhase.Equals("hand_card_selection", StringComparison.OrdinalIgnoreCase)
+            || requestedPhase.Equals("adapter_card_selection", StringComparison.OrdinalIgnoreCase)
+            || requestedPhase.Equals("unstable", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ShouldSuppressUnstableExport(
+        RuntimePhaseResolution runtimePhase,
+        Dictionary<string, object?> state,
+        string requestedPhase,
+        out string reason)
+    {
+        reason = string.Empty;
+        if (runtimePhase.Phase.Equals("unstable", StringComparison.OrdinalIgnoreCase))
+        {
+            reason = runtimePhase.UnstableReason ?? "runtime_phase_unstable";
+            return true;
+        }
+
+        if (IsStrictCombatTurnExport(requestedPhase) && !runtimePhase.CombatInProgress)
+        {
+            reason = "combat_turn_export_without_active_combat_manager";
+            return true;
+        }
+
+        if (IsStrictCombatTurnExport(requestedPhase)
+            && runtimePhase.CombatInProgress
+            && !runtimePhase.CombatPlayPhase)
+        {
+            reason = "combat_turn_export_before_play_phase";
+            return true;
+        }
+
+        Dictionary<string, object?> roomContext = ReadDictionary(state, "room_context");
+        string? roomPhase = ReadDictionaryString(roomContext, "phase");
+        bool? roomCombatInProgress = ReadDictionaryBool(roomContext, "combat_in_progress");
+        bool requestedCombatTurn = IsStrictCombatTurnExport(requestedPhase);
+        if (requestedCombatTurn
+            && !runtimePhase.Phase.Equals("combat_turn", StringComparison.OrdinalIgnoreCase))
+        {
+            reason = $"runtime_phase_mismatch:{runtimePhase.Phase}";
+            return true;
+        }
+
+        if (requestedCombatTurn && roomCombatInProgress == false)
+        {
+            reason = "room_context_reports_no_combat_for_combat_turn";
+            return true;
+        }
+
+        if (string.Equals(roomPhase, "combat_turn", StringComparison.OrdinalIgnoreCase)
+            && !runtimePhase.CombatInProgress)
+        {
+            reason = "room_context_combat_turn_without_runtime_combat";
+            return true;
+        }
+
+        if (requestedCombatTurn
+            && IsNonCombatPublishedPhase(lastPublishedPhase)
+            && LooksLikeCombatEntryHydrationState(state))
+        {
+            reason = "combat_entry_hydration_state";
+            return true;
+        }
+
+        if (string.Equals(requestedPhase, "main_menu", StringComparison.OrdinalIgnoreCase)
+            && IsMainMenuLoadingState(state))
+        {
+            reason = "main_menu_loading_without_legal_actions";
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsStrictCombatTurnExport(string requestedPhase)
+    {
+        return requestedPhase.Equals("combat_turn", StringComparison.OrdinalIgnoreCase)
+            || requestedPhase.Equals("combat", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool LooksLikeCombatEntryHydrationState(Dictionary<string, object?> state)
+    {
+        List<Dictionary<string, object?>> legalActions = ReadDictionaryList(state, "legal_actions");
+        if (legalActions.Count > 1)
+        {
+            return false;
+        }
+
+        string? onlyActionType = legalActions.Count == 1
+            ? ReadDictionaryString(legalActions[0], "type")
+            : null;
+        bool onlyEndTurn = legalActions.Count == 0
+            || string.Equals(onlyActionType, "end_turn", StringComparison.OrdinalIgnoreCase);
+        if (!onlyEndTurn)
+        {
+            return false;
+        }
+
+        Dictionary<string, object?> piles = ReadDictionary(state, "piles");
+        int handCount = ReadDictionaryList(piles, "hand").Count;
+        return handCount == 0 || legalActions.Count <= 1;
+    }
+
+    private static bool IsMainMenuLoadingState(Dictionary<string, object?> state)
+    {
+        List<Dictionary<string, object?>> legalActions = ReadDictionaryList(state, "legal_actions");
+        return legalActions.Count == 0;
+    }
+
+    private static bool IsNonCombatPublishedPhase(string? phase)
+    {
+        return string.IsNullOrWhiteSpace(phase)
+            || (!phase.Equals("combat_turn", StringComparison.OrdinalIgnoreCase)
+                && !phase.Equals("combat", StringComparison.OrdinalIgnoreCase)
+                && !phase.Equals("adapter_card_selection", StringComparison.OrdinalIgnoreCase)
+                && !phase.Equals("card_selection", StringComparison.OrdinalIgnoreCase)
+                && !phase.Equals("hand_card_selection", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static void RememberPublishedState(Dictionary<string, object?> state)
+    {
+        lastPublishedPhase = ReadDictionaryString(state, "phase");
+        lastPublishedLegalActionCount = ReadDictionaryList(state, "legal_actions").Count;
     }
 
     private static Dictionary<string, object?> BuildRoomContext(object runtimeRoot, Dictionary<string, object?> state)
@@ -784,20 +1120,13 @@ internal static class CombatStateExporter
         Dictionary<string, object?> piles = BuildPiles(combatRoot, player, graph);
         List<Dictionary<string, object?>> enemies = BuildEnemies(enemiesSource, graph);
 
-        return new Dictionary<string, object?>
-        {
-            ["schema_version"] = "combat_state.v1",
-            ["phase"] = "combat_turn",
-            ["state_id"] = "combat_pending",
-            ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            ["run"] = BuildRun(combatRoot, graph),
-            ["player"] = playerState,
-            ["piles"] = piles,
-            ["enemies"] = enemies,
-            ["legal_actions"] = BuildLegalActions(piles, enemies, playerState),
-            ["relics"] = BuildRelics(relicsSource, graph),
-            ["debug"] = BuildDebug(currentRoot, combatRoot, player, enemiesSource, graph)
-        };
+        return CombatSnapshotBuilder.Build(new CombatSnapshotBuildInput(
+            Run: BuildRun(combatRoot, graph),
+            Player: playerState,
+            Piles: piles,
+            Enemies: enemies,
+            Relics: BuildRelics(relicsSource, graph),
+            Debug: BuildDebug(currentRoot, combatRoot, player, enemiesSource, graph)));
     }
 
     private static Dictionary<string, object?> BuildGameOverState(object gameOverScreen)
@@ -823,6 +1152,8 @@ internal static class CombatStateExporter
         AddRoot(roots, player);
         ObjectGraph graph = ObjectGraph.Collect(roots, 3, 260);
 
+        Dictionary<string, object?> gameOverState = BuildGameOverScreenState(gameOverScreen, runState, history);
+
         return new Dictionary<string, object?>
         {
             ["schema_version"] = "combat_state.v1",
@@ -833,11 +1164,167 @@ internal static class CombatStateExporter
             ["player"] = player is null ? new Dictionary<string, object?>() : BuildPlayer(player),
             ["piles"] = BuildEmptyPiles(),
             ["enemies"] = new List<Dictionary<string, object?>>(),
-            ["game_over"] = BuildGameOverScreenState(gameOverScreen, runState, history),
-            ["legal_actions"] = new List<Dictionary<string, object?>>(),
+            ["game_over"] = gameOverState,
+            ["legal_actions"] = BuildGameOverLegalActions(gameOverState),
             ["relics"] = BuildRelics(relicsSource, graph),
             ["debug"] = BuildGameOverDebug(gameOverScreen, runState, history, graph)
         };
+    }
+
+    private static List<Dictionary<string, object?>> BuildGameOverLegalActions(Dictionary<string, object?> gameOverState)
+    {
+        List<Dictionary<string, object?>> actions = new();
+        Dictionary<string, object?> continueButton = ReadDictionary(gameOverState, "continue_button");
+        bool canContinue = ReadDictionaryBool(continueButton, "found") == true
+            && ReadDictionaryBool(continueButton, "visible") == true
+            && ReadDictionaryBool(continueButton, "visible_in_tree") == true
+            && ReadDictionaryBool(continueButton, "enabled") == true
+            && ReadDictionaryBool(gameOverState, "summary_animating") != true;
+        Dictionary<string, object?> mainMenuButton = ReadDictionary(gameOverState, "main_menu_button");
+        bool canReturnToMainMenu = ReadDictionaryBool(mainMenuButton, "found") == true
+            && ReadDictionaryBool(mainMenuButton, "visible") == true
+            && ReadDictionaryBool(mainMenuButton, "visible_in_tree") == true
+            && ReadDictionaryBool(mainMenuButton, "enabled") == true
+            && ReadDictionaryBool(gameOverState, "summary_animating") != true;
+
+        if (canContinue || canReturnToMainMenu)
+        {
+            actions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = "dismiss_game_over",
+                ["type"] = "dismiss_game_over",
+                ["summary"] = "게임 오버 화면의 계속 버튼을 눌러 다음 화면으로 진행한다.",
+                ["validation_note"] = "게임 오버 요약 애니메이션이 끝났고 계속 버튼이 보이며 활성화된 상태입니다."
+            });
+        }
+
+        return actions;
+    }
+
+    private static object? FindMainMenu()
+    {
+        object? nGame = GetStaticPropertyValue("MegaCrit.Sts2.Core.Nodes.NGame", "Instance");
+        object? mainMenu = FindMemberValue(nGame, "MainMenu", "mainMenu", "_mainMenu");
+        if (mainMenu is not null)
+        {
+            return mainMenu;
+        }
+
+        object? rootSceneContainer = FindMemberValue(nGame, "RootSceneContainer", "rootSceneContainer", "_rootSceneContainer");
+        object? currentScene = FindMemberValue(rootSceneContainer, "CurrentScene", "currentScene", "_currentScene");
+        if (IsMainMenuLike(currentScene))
+        {
+            return currentScene;
+        }
+
+        return EnumerateNodeDescendants(rootSceneContainer)
+            .FirstOrDefault(IsMainMenuLike);
+    }
+
+    private static bool IsMainMenuLike(object? source)
+    {
+        if (source is null)
+        {
+            return false;
+        }
+
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        return typeName.Contains("NMainMenu", StringComparison.OrdinalIgnoreCase)
+            || typeName.Contains("MainMenu", StringComparison.OrdinalIgnoreCase)
+            && TryInvokeBoolMethod(source, "IsVisibleInTree") == true;
+    }
+
+    private static Dictionary<string, object?> BuildMainMenuState(object mainMenu)
+    {
+        object? runManager = GetStaticPropertyValue("MegaCrit.Sts2.Core.Runs.RunManager", "Instance");
+        object? continueButton = FindMemberValue(mainMenu, "_continueButton", "ContinueButton", "continueButton");
+        object? singleplayerButton = FindMemberValue(mainMenu, "_singleplayerButton", "SingleplayerButton", "singleplayerButton");
+        object? readRunSaveResult = FindMemberValue(mainMenu, "_readRunSaveResult", "ReadRunSaveResult", "readRunSaveResult");
+        bool canContinue = IsMainMenuContinueUsable(continueButton, readRunSaveResult);
+        bool canStartNewRun = IsMainMenuButtonUsable(singleplayerButton);
+        List<Dictionary<string, object?>> legalActions = new();
+        if (canContinue)
+        {
+            legalActions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = "continue_run",
+                ["type"] = "continue_run",
+                ["summary"] = "저장된 런을 이어서 진행한다.",
+                ["validation_note"] = "메인 메뉴의 계속 버튼이 보이고, 활성화되어 있으며, 저장 데이터를 읽은 상태입니다."
+            });
+        }
+
+        if (!canContinue && canStartNewRun)
+        {
+            legalActions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = "start_new_run",
+                ["type"] = "start_new_run",
+                ["summary"] = "저장된 런이 없으므로 싱글플레이 새 런을 시작한다.",
+                ["validation_note"] = "메인 메뉴의 싱글플레이 버튼이 보이고 활성화된 상태입니다."
+            });
+        }
+
+        return new Dictionary<string, object?>
+        {
+            ["schema_version"] = "combat_state.v1",
+            ["phase"] = "main_menu",
+            ["state_id"] = "main_menu_pending",
+            ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["run"] = new Dictionary<string, object?>
+            {
+                ["game"] = "Slay the Spire 2",
+                ["mode"] = null,
+                ["run_in_progress"] = ReadBool(runManager, "IsInProgress", "isInProgress", "_isInProgress")
+            },
+            ["player"] = new Dictionary<string, object?>(),
+            ["piles"] = BuildEmptyPiles(),
+            ["enemies"] = new List<Dictionary<string, object?>>(),
+            ["main_menu"] = new Dictionary<string, object?>
+            {
+                ["screen_type"] = mainMenu.GetType().FullName ?? mainMenu.GetType().Name,
+                ["visible_in_tree"] = TryInvokeBoolMethod(mainMenu, "IsVisibleInTree"),
+                ["continue_button"] = BuildButtonState(continueButton),
+                ["singleplayer_button"] = BuildButtonState(singleplayerButton),
+                ["read_run_save_result_found"] = readRunSaveResult is not null,
+                ["read_run_save_success"] = ReadBool(readRunSaveResult, "Success", "success", "_success"),
+                ["save_data_found"] = FindMemberValue(readRunSaveResult, "SaveData", "saveData", "_saveData") is not null,
+                ["can_continue"] = canContinue,
+                ["can_start_new_run"] = canStartNewRun
+            },
+            ["legal_actions"] = legalActions,
+            ["relics"] = new List<Dictionary<string, object?>>(),
+            ["debug"] = new Dictionary<string, object?>
+            {
+                ["current_root_type"] = mainMenu.GetType().FullName ?? mainMenu.GetType().Name,
+                ["run_manager_type"] = runManager?.GetType().FullName ?? runManager?.GetType().Name,
+                ["observed_types"] = LastObservedTypes.ToArray()
+            }
+        };
+    }
+
+    private static bool IsMainMenuContinueUsable(object? continueButton, object? readRunSaveResult)
+    {
+        bool buttonEnabled = ReadBool(continueButton, "IsEnabled", "isEnabled", "_isEnabled") == true;
+        bool buttonVisible = TryInvokeBoolMethod(continueButton, "IsVisible") == true;
+        bool buttonVisibleInTree = TryInvokeBoolMethod(continueButton, "IsVisibleInTree") == true;
+        bool readSaveSuccess = ReadBool(readRunSaveResult, "Success", "success", "_success") == true;
+        bool saveDataFound = FindMemberValue(readRunSaveResult, "SaveData", "saveData", "_saveData") is not null;
+        return continueButton is not null
+            && buttonEnabled
+            && buttonVisible
+            && buttonVisibleInTree
+            && readRunSaveResult is not null
+            && readSaveSuccess
+            && saveDataFound;
+    }
+
+    private static bool IsMainMenuButtonUsable(object? button)
+    {
+        return button is not null
+            && ReadBool(button, "IsEnabled", "isEnabled", "_isEnabled") == true
+            && TryInvokeBoolMethod(button, "IsVisible") == true
+            && TryInvokeBoolMethod(button, "IsVisibleInTree") == true;
     }
 
     private static object? FindGameOverScreen()
@@ -983,6 +1470,103 @@ internal static class CombatStateExporter
         };
     }
 
+    private static Dictionary<string, object?> BuildAdapterCardSelectionState(PendingAdapterCardSelection pending, object combatRoot)
+    {
+        object? managerCombatState = ReadCombatManagerDebugState(GetCombatManagerInstance());
+        if (managerCombatState is not null)
+        {
+            RememberObservedRoot(managerCombatState);
+        }
+
+        List<object> roots = GetExportRoots(combatRoot, managerCombatState);
+        ObjectGraph graph = ObjectGraph.Collect(roots, MaxSearchDepth, MaxVisitedObjects);
+        object? player = ResolveRuntimePlayer(combatRoot, graph)
+            ?? recentPlayer
+            ?? recentPlayerCombatState
+            ?? FindFirst(graph, "Player", "PlayerCombatState");
+        object? runManager = GetRunManagerInstance();
+        object? runState = ReadRunManagerDebugState(runManager)
+            ?? FindMemberValue(runManager, "RunState", "runState", "_runState", "State", "state")
+            ?? FindMemberValue(combatRoot, "RunState", "runState", "_runState", "State", "state");
+        object? relicsSource = player ?? runState ?? combatRoot;
+
+        List<Dictionary<string, object?>> cards = BuildAdapterCardSelectionCards(pending);
+        string? sourcePile = InferCardSelectionSourcePile(cards);
+        CardSelectionSourceHint? sourceHint = ResolveCardSelectionSourceHint();
+        int selectedCount = pending.SelectedIndexes.Count;
+        Dictionary<string, object?> cardSelection = new()
+        {
+            ["selection_id"] = pending.SelectionId,
+            ["selection_kind"] = "adapter_card_selection",
+            ["selection_purpose"] = null,
+            ["selection_purpose_source"] = "not_inferred_by_adapter",
+            ["source_card_id"] = sourceHint?.CardId,
+            ["source_card_name"] = sourceHint?.CardName,
+            ["source_upgraded"] = sourceHint?.Upgraded,
+            ["source_card_observation_source"] = sourceHint is null ? null : "last_play_card_action",
+            ["source_pile"] = sourcePile,
+            ["prompt"] = null,
+            ["prompt_source"] = "selector_interface_does_not_expose_prompt",
+            ["min_select"] = pending.MinSelect,
+            ["max_select"] = pending.MaxSelect,
+            ["selected_count"] = selectedCount,
+            ["can_confirm"] = selectedCount >= pending.MinSelect,
+            ["can_cancel"] = pending.MinSelect <= 0,
+            ["cards"] = cards
+        };
+
+        return new Dictionary<string, object?>
+        {
+            ["schema_version"] = "combat_state.v1",
+            ["phase"] = "adapter_card_selection",
+            ["state_id"] = pending.SelectionId,
+            ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            ["run"] = BuildRun(runState ?? managerCombatState ?? combatRoot, graph),
+            ["player"] = player is null ? new Dictionary<string, object?>() : BuildPlayer(player),
+            ["piles"] = BuildEmptyPiles(),
+            ["enemies"] = new List<Dictionary<string, object?>>(),
+            ["card_selection"] = cardSelection,
+            ["legal_actions"] = BuildCardSelectionLegalActions(cardSelection, cards),
+            ["relics"] = BuildRelics(relicsSource, graph),
+            ["debug"] = new Dictionary<string, object?>
+            {
+                ["current_root_type"] = "AdapterCardSelectionBridge",
+                ["selection_started_at_ms"] = pending.StartedAtMs,
+                ["option_count"] = pending.Options.Count,
+                ["selected_indexes"] = pending.SelectedIndexes.ToArray()
+            }
+        };
+    }
+
+    private static List<Dictionary<string, object?>> BuildAdapterCardSelectionCards(PendingAdapterCardSelection pending)
+    {
+        List<Dictionary<string, object?>> cards = new();
+        HashSet<int> selectedIndexes = pending.SelectedIndexes.ToHashSet();
+
+        foreach (AdapterCardSelectionOption option in pending.Options)
+        {
+            Dictionary<string, object?> cardState = BuildCards("card_selection", new[] { option.Card }).FirstOrDefault()
+                ?? new Dictionary<string, object?>();
+            cardState["card_selection_id"] = option.CardSelectionId;
+            cardState["card_selection_index"] = option.Index;
+            cardState["card_selection_key"] = SanitizeActionId($"adapter_{option.CardId}_{option.Name}_{(option.Upgraded ? "upgraded" : "base")}");
+            cardState["card_id"] = option.CardId;
+            cardState["name"] = option.Name;
+            cardState["upgraded"] = option.Upgraded;
+            cardState["pile"] = option.Pile ?? ReadDictionaryString(cardState, "pile");
+            cardState["selected"] = selectedIndexes.Contains(option.Index);
+            cardState["visible"] = true;
+            cardState["visible_in_tree"] = false;
+            cardState["clickable"] = true;
+            cardState["holder_type"] = "AdapterCardSelectionOption";
+            cardState["runtime_type"] = option.Card.GetType().FullName ?? option.Card.GetType().Name;
+            cardState["observation_source"] = "CardSelectCmd.ICardSelector.options";
+            cards.Add(cardState);
+        }
+
+        return cards;
+    }
+
     private static object? FindCardSelectionScreen()
     {
         object? overlayStack = GetStaticPropertyValue(
@@ -1007,6 +1591,36 @@ internal static class CombatStateExporter
             .FirstOrDefault(IsCardSelectionScreen);
     }
 
+    private static object? FindHandCardSelectionRoot()
+    {
+        object? handTypeInstance = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Combat.NPlayerHand",
+            "Instance");
+        if (IsHandCardSelectionRoot(handTypeInstance))
+        {
+            return handTypeInstance;
+        }
+
+        object? combatRoom = GetStaticPropertyValue(
+            "MegaCrit.Sts2.Core.Nodes.Rooms.NCombatRoom",
+            "Instance");
+        object? combatUi = FindMemberValue(combatRoom, "Ui", "ui", "_ui");
+        object? hand = FindMemberValue(combatUi, "Hand", "hand", "_hand");
+        return IsHandCardSelectionRoot(hand) ? hand : null;
+    }
+
+    private static bool IsHandCardSelectionRoot(object? source)
+    {
+        if (source is null)
+        {
+            return false;
+        }
+
+        string typeName = source.GetType().FullName ?? source.GetType().Name;
+        return typeName.Contains("NPlayerHand", StringComparison.OrdinalIgnoreCase)
+            && ReadBool(source, "IsInCardSelection", "isInCardSelection") == true;
+    }
+
     private static bool IsCardSelectionScreen(object? source)
     {
         if (source is null)
@@ -1021,11 +1635,19 @@ internal static class CombatStateExporter
                 "NDeckEnchantSelectScreen",
                 "NDeckUpgradeSelectScreen",
                 "NDeckTransformSelectScreen",
-                "NDeckCardSelectScreen");
+                "NDeckCardSelectScreen",
+                "NChooseACardSelectionScreen",
+                "NSimpleCardSelectScreen",
+                "SimpleCardSelectScreen");
     }
 
     private static Dictionary<string, object?> BuildCardSelectionScreenState(object cardSelectionScreen)
     {
+        if (IsHandCardSelectionRoot(cardSelectionScreen))
+        {
+            return BuildHandCardSelectionScreenState(cardSelectionScreen);
+        }
+
         object? prefs = FindMemberValue(cardSelectionScreen, "_prefs", "Prefs", "prefs");
         object? selectedCardsSource = FindMemberValue(cardSelectionScreen, "_selectedCards", "SelectedCards", "selectedCards");
         List<object> selectedCards = EnumerateObjects(selectedCardsSource).ToList();
@@ -1034,18 +1656,75 @@ internal static class CombatStateExporter
         object? prompt = FindMemberValue(prefs, "Prompt", "prompt", "_prompt");
         string? promptText = ReadFormattedText(prompt);
         object? confirmButton = FindCardSelectionConfirmButton(cardSelectionScreen);
+        string selectionKind = InferCardSelectionKind(cardSelectionScreen, promptText);
+        List<Dictionary<string, object?>> cards = BuildCardSelectionCards(cardSelectionScreen, selectedCards, selectionKind);
+        string? sourcePile = InferCardSelectionSourcePile(cards);
+        CardSelectionSourceHint? sourceHint = ResolveCardSelectionSourceHint();
+        Dictionary<string, object?> confirmButtonState = BuildButtonState(confirmButton);
+        bool canConfirm = ReadDictionaryBool(confirmButtonState, "enabled") == true
+            || (selectedCards.Count >= Math.Max(1, minSelect ?? 1));
 
         return new Dictionary<string, object?>
         {
             ["screen_type"] = cardSelectionScreen.GetType().FullName ?? cardSelectionScreen.GetType().Name,
-            ["selection_kind"] = InferCardSelectionKind(cardSelectionScreen, promptText),
+            ["selection_kind"] = selectionKind,
+            ["selection_purpose"] = null,
+            ["selection_purpose_source"] = "not_inferred_by_adapter",
+            ["source_card_id"] = sourceHint?.CardId,
+            ["source_card_name"] = sourceHint?.CardName,
+            ["source_card_upgraded"] = sourceHint?.Upgraded,
+            ["source_card_observation_source"] = sourceHint is null ? null : "last_play_card_action",
+            ["source_pile"] = sourcePile,
             ["prompt"] = promptText,
             ["min_select"] = minSelect,
             ["max_select"] = maxSelect,
             ["selected_count"] = selectedCards.Count,
+            ["can_confirm"] = canConfirm,
             ["preview_visible"] = IsAnyCardSelectionPreviewVisible(cardSelectionScreen),
-            ["confirm_button"] = BuildButtonState(confirmButton),
-            ["cards"] = BuildCardSelectionCards(cardSelectionScreen, selectedCards)
+            ["confirm_button"] = confirmButtonState,
+            ["cards"] = cards
+        };
+    }
+
+    private static Dictionary<string, object?> BuildHandCardSelectionScreenState(object hand)
+    {
+        object? prefs = FindMemberValue(hand, "_prefs", "Prefs", "prefs");
+        object? selectedCardsSource = FindMemberValue(hand, "_selectedCards", "SelectedCards", "selectedCards");
+        List<object> selectedCards = EnumerateObjects(selectedCardsSource).ToList();
+        string currentMode = ReadString(hand, "CurrentMode", "_currentMode") ?? string.Empty;
+        int? minSelect = ReadInt(prefs, "MinSelect", "minSelect", "_minSelect") ?? 1;
+        int? maxSelect = ReadInt(prefs, "MaxSelect", "maxSelect", "_maxSelect") ?? 1;
+        object? prompt = FindMemberValue(prefs, "Prompt", "prompt", "_prompt");
+        string? promptText = ReadFormattedText(prompt);
+        object? confirmButton = FindCardSelectionConfirmButton(hand);
+        string selectionKind = currentMode.Contains("Upgrade", StringComparison.OrdinalIgnoreCase)
+            ? "upgrade"
+            : "choose_one";
+        List<Dictionary<string, object?>> cards = BuildCardSelectionCards(hand, selectedCards, selectionKind);
+        CardSelectionSourceHint? sourceHint = ResolveCardSelectionSourceHint();
+        Dictionary<string, object?> confirmButtonState = BuildButtonState(confirmButton);
+        bool canConfirm = ReadDictionaryBool(confirmButtonState, "enabled") == true
+            || selectedCards.Count >= Math.Max(1, minSelect ?? 1);
+
+        return new Dictionary<string, object?>
+        {
+            ["screen_type"] = hand.GetType().FullName ?? hand.GetType().Name,
+            ["selection_kind"] = selectionKind,
+            ["selection_purpose"] = null,
+            ["selection_purpose_source"] = "not_inferred_by_adapter",
+            ["source_card_id"] = sourceHint?.CardId,
+            ["source_card_name"] = sourceHint?.CardName,
+            ["source_card_upgraded"] = sourceHint?.Upgraded,
+            ["source_card_observation_source"] = sourceHint is null ? null : "last_play_card_action",
+            ["source_pile"] = "hand",
+            ["prompt"] = promptText,
+            ["min_select"] = minSelect,
+            ["max_select"] = maxSelect,
+            ["selected_count"] = selectedCards.Count,
+            ["can_confirm"] = canConfirm,
+            ["preview_visible"] = IsAnyCardSelectionPreviewVisible(hand),
+            ["confirm_button"] = confirmButtonState,
+            ["cards"] = cards
         };
     }
 
@@ -1078,10 +1757,79 @@ internal static class CombatStateExporter
             return "deck_card_select";
         }
 
+        if (typeName.Contains("ChooseACardSelection", StringComparison.OrdinalIgnoreCase))
+        {
+            return "choose_one";
+        }
+
         return "unknown";
     }
 
-    private static List<Dictionary<string, object?>> BuildCardSelectionCards(object cardSelectionScreen, List<object> selectedCards)
+    private static string InferCardSelectionPurpose(string selectionKind, string? prompt, string? sourcePile)
+    {
+        string text = $"{selectionKind} {prompt ?? string.Empty} {sourcePile ?? string.Empty}";
+        if (ContainsAny(text, "upgrade", "강화"))
+        {
+            return "upgrade_from_hand";
+        }
+
+        if (ContainsAny(text, "discard", "버림", "버려"))
+        {
+            return "discard_from_hand";
+        }
+
+        if (ContainsAny(text, "exhaust", "소멸"))
+        {
+            return "exhaust_from_hand";
+        }
+
+        if (ContainsAny(text, "transform", "변화", "변형"))
+        {
+            return "transform";
+        }
+
+        if (string.Equals(sourcePile, "discard_pile", StringComparison.OrdinalIgnoreCase))
+        {
+            return "move_from_discard_to_draw_top";
+        }
+
+        if (string.Equals(sourcePile, "draw_pile", StringComparison.OrdinalIgnoreCase))
+        {
+            return "put_back_on_draw_top";
+        }
+
+        if (string.Equals(sourcePile, "generated_choices", StringComparison.OrdinalIgnoreCase))
+        {
+            return "choose_generated_card";
+        }
+
+        return selectionKind;
+    }
+
+    private static string? InferCardSelectionSourcePile(List<Dictionary<string, object?>> cards)
+    {
+        List<string> piles = cards
+            .Select(card => ReadDictionaryString(card, "pile"))
+            .Where(pile => !string.IsNullOrWhiteSpace(pile))
+            .Select(pile => pile!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return piles.Count == 1 ? piles[0] : null;
+    }
+
+    private static CardSelectionSourceHint? ResolveCardSelectionSourceHint()
+    {
+        CardSelectionSourceHint? remembered = latestCardSelectionSourceHint;
+        if (remembered is not null && Environment.TickCount64 - remembered.ObservedAtMs <= CardSelectionSourceRememberMs)
+        {
+            return remembered;
+        }
+
+        return null;
+    }
+
+    private static List<Dictionary<string, object?>> BuildCardSelectionCards(object cardSelectionScreen, List<object> selectedCards, string selectionKind)
     {
         List<object> holders = FindGridCardHolders(cardSelectionScreen);
         List<Dictionary<string, object?>> cards = new();
@@ -1102,9 +1850,12 @@ internal static class CombatStateExporter
             string cardId = ReadDictionaryString(cardState, "card_id")
                 ?? ReadString(card, "Id", "id", "_id")
                 ?? name;
-            string cardSelectionId = SanitizeActionId($"card_selection_{index}_{cardId}");
+            bool? upgraded = ReadDictionaryBool(cardState, "upgraded");
+            string cardSelectionId = BuildCardSelectionId(selectionKind, index, cardId, name, upgraded);
             cardState["card_selection_id"] = cardSelectionId;
             cardState["card_selection_index"] = index;
+            cardState["card_selection_key"] = SanitizeActionId($"{selectionKind}_{cardId}_{name}_{(upgraded == true ? "upgraded" : "base")}");
+            cardState["pile"] = InferCardPileName(card);
             cardState["selected"] = IsCardSelected(card, selectedCards);
             cardState["visible"] = ReadBool(holder, "Visible", "visible");
             cardState["visible_in_tree"] = TryInvokeBoolMethod(holder, "IsVisibleInTree");
@@ -1116,8 +1867,69 @@ internal static class CombatStateExporter
         return cards;
     }
 
+    private static string? InferCardPileName(object card)
+    {
+        object? pile = FindMemberValue(card, "Pile", "pile", "_pile", "CardPile", "cardPile", "_cardPile");
+        string rawPile = ReadString(pile, "Type", "type", "PileType", "pileType", "Name", "name", "Id", "id")
+            ?? pile?.ToString()
+            ?? string.Empty;
+        string cardTypeName = card.GetType().FullName ?? card.GetType().Name;
+        string text = $"{rawPile} {cardTypeName}";
+        if (ContainsAny(text, "Discard"))
+        {
+            return "discard_pile";
+        }
+
+        if (ContainsAny(text, "Draw"))
+        {
+            return "draw_pile";
+        }
+
+        if (ContainsAny(text, "Hand"))
+        {
+            return "hand";
+        }
+
+        if (ContainsAny(text, "Deck"))
+        {
+            return "deck";
+        }
+
+        if (ContainsAny(text, "Generated", "Choice", "Reward"))
+        {
+            return "generated_choices";
+        }
+
+        return string.IsNullOrWhiteSpace(rawPile) ? null : SanitizeActionId(rawPile);
+    }
+
+    private static string BuildCardSelectionId(string selectionKind, int index, string cardId, string name, bool? upgraded)
+    {
+        string upgradeToken = upgraded == true ? "upgraded" : "base";
+        return SanitizeActionId($"card_selection_{selectionKind}_{index}_{cardId}_{name}_{upgradeToken}");
+    }
+
     private static List<object> FindGridCardHolders(object cardSelectionScreen)
     {
+        if (IsHandCardSelectionRoot(cardSelectionScreen))
+        {
+            object? activeHolders = FindMemberValue(cardSelectionScreen, "ActiveHolders");
+            List<object> handHolders = EnumerateObjects(activeHolders)
+                .Where(IsHandCardHolder)
+                .Where(holder => ReadBool(holder, "Visible", "visible") != false)
+                .ToList();
+            if (handHolders.Count > 0)
+            {
+                return handHolders;
+            }
+
+            object? holderContainer = FindMemberValue(cardSelectionScreen, "CardHolderContainer", "_cardHolderContainer");
+            return EnumerateNodeDescendants(holderContainer)
+                .Where(IsHandCardHolder)
+                .Where(holder => ReadBool(holder, "Visible", "visible") != false)
+                .ToList();
+        }
+
         object? grid = FindMemberValue(cardSelectionScreen, "_grid", "Grid", "grid");
         List<object> holders = EnumerateNodeDescendants(grid)
             .Where(IsGridCardHolder)
@@ -1136,6 +1948,12 @@ internal static class CombatStateExporter
     {
         string typeName = value.GetType().FullName ?? value.GetType().Name;
         return typeName.Contains("NGridCardHolder", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsHandCardHolder(object value)
+    {
+        string typeName = value.GetType().FullName ?? value.GetType().Name;
+        return typeName.Contains("NHandCardHolder", StringComparison.OrdinalIgnoreCase);
     }
 
     private static object? ExtractCardFromHolder(object holder)
@@ -1173,6 +1991,11 @@ internal static class CombatStateExporter
 
     private static object? FindCardSelectionConfirmButton(object cardSelectionScreen)
     {
+        if (IsHandCardSelectionRoot(cardSelectionScreen))
+        {
+            return FindMemberValue(cardSelectionScreen, "_selectModeConfirmButton", "SelectModeConfirmButton", "selectModeConfirmButton");
+        }
+
         string[] preferredMemberNames =
         {
             "_singlePreviewConfirmButton",
@@ -1197,11 +2020,18 @@ internal static class CombatStateExporter
     {
         List<Dictionary<string, object?>> actions = new();
         string selectionKind = ReadDictionaryString(cardSelection, "selection_kind") ?? "unknown";
+        string? selectionPurpose = ReadDictionaryString(cardSelection, "selection_purpose");
+        string? sourceCardId = ReadDictionaryString(cardSelection, "source_card_id");
+        string? sourceCardName = ReadDictionaryString(cardSelection, "source_card_name");
+        string? sourcePile = ReadDictionaryString(cardSelection, "source_pile");
+        string? selectionId = ReadDictionaryString(cardSelection, "selection_id");
         int? selectedCount = ReadDictionaryInt(cardSelection, "selected_count");
         int? minSelect = ReadDictionaryInt(cardSelection, "min_select");
         int? maxSelect = ReadDictionaryInt(cardSelection, "max_select");
         int requiredSelect = Math.Max(1, minSelect ?? 1);
         bool canChooseMore = maxSelect is null || (selectedCount ?? 0) < maxSelect.Value;
+        bool canConfirm = ReadDictionaryBool(cardSelection, "can_confirm") == true;
+        bool canCancel = ReadDictionaryBool(cardSelection, "can_cancel") != false;
 
         if (canChooseMore)
         {
@@ -1221,41 +2051,65 @@ internal static class CombatStateExporter
                     ["type"] = "choose_card_selection",
                     ["card_selection_id"] = cardSelectionId,
                     ["card_selection_index"] = cardSelectionIndex,
+                    ["card_selection_key"] = ReadDictionaryString(card, "card_selection_key"),
+                    ["selection_id"] = selectionId,
                     ["selection_kind"] = selectionKind,
+                    ["selection_purpose"] = selectionPurpose,
+                    ["source_card_id"] = sourceCardId,
+                    ["source_card_name"] = sourceCardName,
+                    ["source_pile"] = sourcePile,
                     ["card_id"] = ReadDictionaryString(card, "card_id"),
                     ["name"] = name,
                     ["card_type"] = ReadDictionaryString(card, "type"),
                     ["rarity"] = ReadDictionaryString(card, "rarity"),
                     ["cost"] = ReadDictionaryInt(card, "cost"),
                     ["upgraded"] = ReadDictionaryBool(card, "upgraded"),
+                    ["pile"] = ReadDictionaryString(card, "pile"),
+                    ["selected_count"] = selectedCount,
+                    ["min_select"] = minSelect,
+                    ["max_select"] = maxSelect,
                     ["summary"] = $"Choose card selection: {name}",
                     ["validation_note"] = "Visible card selection holder."
                 });
             }
         }
 
-        if ((selectedCount ?? 0) >= requiredSelect)
+        if ((selectedCount ?? 0) >= requiredSelect && canConfirm)
         {
             actions.Add(new Dictionary<string, object?>
             {
                 ["action_id"] = "confirm_card_selection",
                 ["type"] = "confirm_card_selection",
+                ["selection_id"] = selectionId,
                 ["selection_kind"] = selectionKind,
+                ["selection_purpose"] = selectionPurpose,
+                ["source_card_id"] = sourceCardId,
+                ["source_card_name"] = sourceCardName,
+                ["source_pile"] = sourcePile,
                 ["selected_count"] = selectedCount,
+                ["min_select"] = minSelect,
+                ["max_select"] = maxSelect,
                 ["summary"] = "Confirm current card selection.",
                 ["validation_note"] = "A card selection is already active."
             });
         }
 
-        actions.Add(new Dictionary<string, object?>
+        if (canCancel)
         {
-            ["action_id"] = "cancel_card_selection",
-            ["type"] = "cancel_card_selection",
-            ["selection_kind"] = selectionKind,
-            ["selected_count"] = selectedCount,
-            ["summary"] = "Cancel the current card selection and return to the previous screen when the UI supports it.",
-            ["validation_note"] = "Visible card selection screen cancel/back action."
-        });
+            actions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = "cancel_card_selection",
+                ["type"] = "cancel_card_selection",
+                ["selection_kind"] = selectionKind,
+                ["selection_purpose"] = selectionPurpose,
+                ["source_card_id"] = sourceCardId,
+                ["source_card_name"] = sourceCardName,
+                ["source_pile"] = sourcePile,
+                ["selected_count"] = selectedCount,
+                ["summary"] = "Cancel the current card selection and return to the previous screen when the UI supports it.",
+                ["validation_note"] = "Visible card selection screen cancel/back action."
+            });
+        }
 
         return actions;
     }
@@ -1380,11 +2234,13 @@ internal static class CombatStateExporter
 
     private static Dictionary<string, object?> BuildEventScreenState(object eventRoom, object? eventModel, object? layout)
     {
-        List<Dictionary<string, object?>> options = BuildEventOptions(layout, eventRoom);
+        List<Dictionary<string, object?>> options = BuildEventOptions(layout, eventRoom, eventModel);
+        string eventTypeName = eventModel?.GetType().FullName ?? eventModel?.GetType().Name ?? string.Empty;
         return new Dictionary<string, object?>
         {
             ["screen_type"] = eventRoom.GetType().FullName ?? eventRoom.GetType().Name,
             ["event_id"] = ReadString(eventModel, "Id", "id", "_id", "Key", "key", "TextKey", "textKey") ?? GetReadableName(eventModel ?? eventRoom),
+            ["event_type_name"] = eventTypeName,
             ["title"] = ReadFormattedText(FindMemberValue(eventModel, "Title", "title", "_title")),
             ["description"] = ReadFormattedText(FindMemberValue(eventModel, "Description", "description", "_description")),
             ["is_finished"] = ReadBool(eventModel, "IsFinished", "isFinished", "_isFinished"),
@@ -1394,7 +2250,7 @@ internal static class CombatStateExporter
         };
     }
 
-    private static List<Dictionary<string, object?>> BuildEventOptions(object? layout, object eventRoom)
+    private static List<Dictionary<string, object?>> BuildEventOptions(object? layout, object eventRoom, object? eventModel = null)
     {
         List<object> optionButtons = EnumerateObjects(FindMemberValue(layout, "OptionButtons", "optionButtons")).ToList();
         if (optionButtons.Count == 0)
@@ -1405,37 +2261,43 @@ internal static class CombatStateExporter
         }
 
         List<Dictionary<string, object?>> options = new();
+        string eventId = ReadString(eventModel, "Id", "id", "_id", "Key", "key", "TextKey", "textKey") ?? GetReadableName(eventModel ?? eventRoom);
+        string eventTypeName = eventModel?.GetType().Name ?? string.Empty;
         for (int index = 0; index < optionButtons.Count; index++)
         {
-            options.Add(BuildEventOption(optionButtons[index], index));
+            options.Add(BuildEventOption(optionButtons[index], index, eventId, eventTypeName));
         }
 
         return options;
     }
 
-    private static Dictionary<string, object?> BuildEventOption(object button, int fallbackIndex)
+    private static Dictionary<string, object?> BuildEventOption(object button, int fallbackIndex, string eventId, string eventTypeName)
     {
         object? option = FindMemberValue(button, "Option", "option", "_option");
         int optionIndex = ReadInt(button, "Index", "index", "_index") ?? fallbackIndex;
         string optionId = $"event_option_{optionIndex}";
         string? title = ReadFormattedText(FindMemberValue(option, "Title", "title", "_title"));
         string? description = ReadFormattedText(FindMemberValue(option, "Description", "description", "_description"));
-        bool? willKillPlayer = TryInvokeBoolMethod(button, "WillKillPlayer");
+        string? textKey = ReadString(option, "TextKey", "textKey", "_textKey");
+        Dictionary<string, object?> outcome = EventOutcomeInterpreter.BuildKnownOutcome(eventId, eventTypeName, textKey, title, description);
         return new Dictionary<string, object?>
         {
             ["event_option_id"] = optionId,
             ["event_option_index"] = optionIndex,
-            ["text_key"] = ReadString(option, "TextKey", "textKey", "_textKey"),
+            ["text_key"] = textKey,
             ["title"] = title,
             ["description"] = description,
             ["is_locked"] = ReadBool(option, "IsLocked", "isLocked", "_isLocked"),
             ["is_proceed"] = ReadBool(option, "IsProceed", "isProceed", "_isProceed"),
             ["was_chosen"] = ReadBool(option, "WasChosen", "wasChosen", "_wasChosen"),
-            ["will_kill_player"] = willKillPlayer,
             ["is_enabled"] = ReadBool(button, "IsEnabled", "isEnabled", "_isEnabled"),
+            ["adapter_confidence"] = outcome["adapter_confidence"],
+            ["outcome_known_level"] = outcome["outcome_known_level"],
+            ["runtime_warnings"] = outcome["runtime_warnings"],
+            ["known_outcome"] = outcome["known_outcome"],
             ["type_name"] = option?.GetType().FullName ?? option?.GetType().Name,
             ["button_type_name"] = button.GetType().FullName ?? button.GetType().Name,
-            ["fingerprint"] = BuildEventOptionFingerprint(optionId, optionIndex, title, description, ReadString(option, "TextKey", "textKey", "_textKey")),
+            ["fingerprint"] = BuildEventOptionFingerprint(optionId, optionIndex, title, description, textKey),
             ["summary"] = BuildEventOptionSummary(title, description, optionId)
         };
     }
@@ -1466,12 +2328,26 @@ internal static class CombatStateExporter
                 continue;
             }
 
+            bool isEnabled = ReadDictionaryBool(option, "is_enabled") != false;
+            bool wasChosen = ReadDictionaryBool(option, "was_chosen") == true;
+            if (!isEnabled && !wasChosen)
+            {
+                continue;
+            }
+
             int? optionIndex = ReadDictionaryInt(option, "event_option_index");
             string optionId = ReadDictionaryString(option, "event_option_id") ?? $"event_option_{optionIndex?.ToString() ?? "unknown"}";
             string summary = ReadDictionaryString(option, "summary") ?? optionId;
+            string actionIdPrefix = wasChosen && !isEnabled ? "continue_chosen" : "choose";
+            string actionSummary = wasChosen && !isEnabled
+                ? $"Continue chosen event option: {summary}"
+                : $"Choose event option: {summary}";
+            string validationNote = wasChosen && !isEnabled
+                ? "Already chosen event option button. Runtime execution rechecks option index and invokes the event release path again so combat-start transitions can finish."
+                : "Visible event option button. Runtime execution rechecks option index and current visible event screen.";
             actions.Add(new Dictionary<string, object?>
             {
-                ["action_id"] = SanitizeActionId($"choose_{optionId}"),
+                ["action_id"] = SanitizeActionId($"{actionIdPrefix}_{optionId}"),
                 ["type"] = "choose_event_option",
                 ["event_option_id"] = optionId,
                 ["event_option_index"] = optionIndex,
@@ -1481,7 +2357,10 @@ internal static class CombatStateExporter
                 ["event_fingerprint"] = eventFingerprint,
                 ["option_fingerprint"] = ReadDictionaryString(option, "fingerprint"),
                 ["is_proceed"] = ReadDictionaryBool(option, "is_proceed"),
-                ["will_kill_player"] = ReadDictionaryBool(option, "will_kill_player"),
+                ["adapter_confidence"] = ReadDictionaryString(option, "adapter_confidence"),
+                ["outcome_known_level"] = ReadDictionaryString(option, "outcome_known_level"),
+                ["runtime_warnings"] = option.TryGetValue("runtime_warnings", out object? runtimeWarnings) ? runtimeWarnings : null,
+                ["known_outcome"] = option.TryGetValue("known_outcome", out object? knownOutcome) ? knownOutcome : null,
                 ["execution"] = new Dictionary<string, object?>
                 {
                     ["schema"] = "event_action_execution.v1",
@@ -1492,11 +2371,12 @@ internal static class CombatStateExporter
                         ["event_option_index"] = optionIndex,
                         ["is_locked_at_export"] = ReadDictionaryBool(option, "is_locked") == true,
                         ["is_enabled_at_export"] = ReadDictionaryBool(option, "is_enabled"),
+                        ["was_chosen_at_export"] = wasChosen,
                         ["runtime_state_rechecked_before_execution"] = true
                     }
                 },
-                ["summary"] = $"Choose event option: {summary}",
-                ["validation_note"] = "Visible event option button. Runtime execution rechecks option index and current visible event screen."
+                ["summary"] = actionSummary,
+                ["validation_note"] = validationNote
             });
         }
 
@@ -1920,17 +2800,26 @@ internal static class CombatStateExporter
         List<Dictionary<string, object?>> actions = new();
         if (relicCollectionOpen)
         {
-            foreach (Dictionary<string, object?> relic in ReadDictionaryList(treasure, "relic_options"))
+            List<Dictionary<string, object?>> relicOptions = ReadDictionaryList(treasure, "relic_options");
+            string actionType = relicOptions.Count > 1 ? "choose_treasure_relic" : "claim_treasure_relic";
+            foreach (Dictionary<string, object?> relic in relicOptions)
             {
-                int? relicIndex = ReadDictionaryInt(relic, "index");
-                string relicId = ReadDictionaryString(relic, "id") ?? $"relic_{relicIndex?.ToString() ?? "unknown"}";
+                int? relicIndex = ReadDictionaryInt(relic, "treasure_relic_index") ?? ReadDictionaryInt(relic, "index");
+                string relicId = ReadDictionaryString(relic, "relic_id")
+                    ?? ReadDictionaryString(relic, "model_id")
+                    ?? ReadDictionaryString(relic, "id")
+                    ?? $"relic_{relicIndex?.ToString() ?? "unknown"}";
+                string treasureRelicId = ReadDictionaryString(relic, "treasure_relic_id")
+                    ?? BuildTreasureRelicStableId(relicIndex ?? -1, relicId);
                 string relicName = ReadDictionaryString(relic, "name") ?? relicId;
                 actions.Add(new Dictionary<string, object?>
                 {
-                    ["action_id"] = SanitizeActionId($"claim_treasure_relic_{relicIndex?.ToString() ?? "unknown"}_{relicId}"),
-                    ["type"] = "claim_treasure_relic",
+                    ["action_id"] = SanitizeActionId($"{actionType}_{treasureRelicId}"),
+                    ["type"] = actionType,
+                    ["treasure_relic_id"] = treasureRelicId,
                     ["treasure_relic_index"] = relicIndex,
                     ["relic_id"] = relicId,
+                    ["model_id"] = relicId,
                     ["name"] = relicName,
                     ["summary"] = $"보물방 유물을 획득합니다: {relicName}",
                     ["validation_note"] = "현재 보물방 유물 선택 UI의 실제 유물 홀더를 선택합니다."
@@ -1960,18 +2849,34 @@ internal static class CombatStateExporter
         int index = 0;
         foreach (object relic in EnumerateObjects(currentRelics))
         {
+            Dictionary<string, object?>? summary = BuildItemSummary(relic);
+            string relicId = ReadDictionaryString(summary ?? new Dictionary<string, object?>(), "id")
+                ?? ReadModelIdentifier(relic)
+                ?? $"relic_{index}";
+            string treasureRelicId = BuildTreasureRelicStableId(index, relicId);
             result.Add(new Dictionary<string, object?>
             {
                 ["index"] = index,
-                ["id"] = ReadModelIdentifier(relic),
-                ["name"] = GetReadableName(relic),
+                ["treasure_relic_id"] = treasureRelicId,
+                ["treasure_relic_index"] = index,
+                ["relic_id"] = relicId,
+                ["model_id"] = relicId,
+                ["id"] = relicId,
+                ["name"] = ReadDictionaryString(summary ?? new Dictionary<string, object?>(), "name") ?? GetReadableName(relic),
+                ["description"] = ReadDictionaryString(summary ?? new Dictionary<string, object?>(), "description"),
                 ["type_name"] = relic.GetType().FullName ?? relic.GetType().Name,
-                ["rarity"] = ReadString(relic, "Rarity", "rarity", "_rarity")
+                ["rarity"] = ReadDictionaryString(summary ?? new Dictionary<string, object?>(), "rarity")
+                    ?? ReadString(relic, "Rarity", "rarity", "_rarity")
             });
             index++;
         }
 
         return result;
+    }
+
+    private static string BuildTreasureRelicStableId(int index, string relicId)
+    {
+        return SanitizeActionId($"treasure_relic_{index}_{relicId}");
     }
 
     private static Dictionary<string, object?> BuildTreasureDebug(object treasureRoom, object? currentRoom, object? synchronizer, ObjectGraph graph)
@@ -1998,102 +2903,71 @@ internal static class CombatStateExporter
         object? runState = ReadRunManagerDebugState(runManager)
             ?? FindMemberValue(shopScreen, "_runState", "runState", "RunState")
             ?? FindMemberValue(runManager, "RunState", "runState", "_runState", "State", "state");
+        ShopRuntimeLocatorContext shopRuntimeContext = CreateShopRuntimeLocatorContext();
+        object? currentRoom = ShopRuntimeLocator.FindCurrentRoom(shopRuntimeContext, runState, runManager);
         object? player = recentPlayer
             ?? recentPlayerCombatState
             ?? EnumerateObjects(FindMemberValue(runState, "Players", "players", "_players")).FirstOrDefault();
         object? relicsSource = FindMemberValue(player, "relics")
             ?? FindMemberValue(runState, "relics");
+        object? runtimeInventory = ShopRuntimeLocator.FindRuntimeMerchantInventory(shopRuntimeContext, player, runState, currentRoom, null);
+        object? inventoryPlayer = FindMemberValue(runtimeInventory, "Player", "player", "_player");
+        player = inventoryPlayer ?? player;
+        relicsSource = FindMemberValue(player, "relics")
+            ?? relicsSource;
 
         List<object> roots = new();
         AddRoot(roots, shopScreen);
         AddRoot(roots, runState);
+        AddRoot(roots, currentRoom);
+        AddRoot(roots, runtimeInventory);
         AddRoot(roots, player);
         AddRoot(roots, managerCombatState);
         ObjectGraph graph = ObjectGraph.Collect(roots, 3, 320);
 
         Dictionary<string, object?> playerState = player is null ? new Dictionary<string, object?>() : BuildPlayer(player);
-        Dictionary<string, object?> shop = BuildShopScreenState(shopScreen, player, playerState, graph);
+        Dictionary<string, object?> shop = BuildShopScreenState(shopScreen, player, runState, currentRoom, runtimeInventory, playerState, graph);
         List<Dictionary<string, object?>> items = ReadDictionaryList(shop, "items");
 
-        return new Dictionary<string, object?>
-        {
-            ["schema_version"] = "combat_state.v1",
-            ["phase"] = "shop",
-            ["state_id"] = "shop_pending",
-            ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            ["run"] = BuildRun(runState ?? managerCombatState ?? shopScreen, graph),
-            ["player"] = playerState,
-            ["piles"] = BuildEmptyPiles(),
-            ["enemies"] = new List<Dictionary<string, object?>>(),
-            ["shop"] = shop,
-            ["legal_actions"] = BuildShopLegalActions(items, ReadDictionaryBool(shop, "proceed_enabled") == true),
-            ["relics"] = BuildRelics(relicsSource, graph),
-            ["debug"] = BuildShopDebug(shopScreen, graph)
-        };
-    }
-
-    private static object? FindShopScreen()
-    {
-        object? screenContext = GetStaticPropertyValue(
-            "MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext",
-            "Instance");
-        object? currentScreen = TryInvokeMethod(screenContext, "GetCurrentScreen");
-        if (IsShopScreen(currentScreen))
-        {
-            return currentScreen;
-        }
-
-        object? overlayStack = GetStaticPropertyValue(
-            "MegaCrit.Sts2.Core.Nodes.Screens.Overlays.NOverlayStack",
-            "Instance");
-        object? topOverlay = TryInvokeMethod(overlayStack, "Peek");
-        if (IsShopScreen(topOverlay))
-        {
-            return topOverlay;
-        }
-
-        object? runManager = GetStaticPropertyValue("MegaCrit.Sts2.Core.Runs.RunManager", "Instance");
-        object? currentRoom = FindMemberValue(runManager, "CurrentRoom", "currentRoom", "_currentRoom");
-        object? nGame = GetStaticPropertyValue("MegaCrit.Sts2.Core.Nodes.NGame", "Instance");
-
-        return EnumerateNodeDescendants(currentScreen)
-            .Concat(EnumerateNodeDescendants(overlayStack))
-            .Concat(EnumerateNodeDescendants(currentRoom))
-            .Concat(EnumerateNodeDescendants(nGame))
-            .FirstOrDefault(IsShopScreen);
-    }
-
-    private static bool IsShopScreen(object? source)
-    {
-        if (source is null)
-        {
-            return false;
-        }
-
-        string typeName = source.GetType().FullName ?? source.GetType().Name;
-        return ContainsAny(typeName, "Shop", "Merchant", "Store")
-            && IsLiveVisibleControl(source);
+        return ShopSnapshotBuilder.Build(new ShopSnapshotBuildInput(
+            Run: BuildRun(runState ?? managerCombatState ?? shopScreen, graph),
+            Player: playerState,
+            Piles: BuildEmptyPiles(),
+            Enemies: new List<Dictionary<string, object?>>(),
+            Shop: shop,
+            Items: items,
+            CanProceed: ReadDictionaryBool(shop, "proceed_enabled") == true,
+            Relics: BuildRelics(relicsSource, graph),
+            Debug: BuildShopDebug(shopScreen, graph)));
     }
 
     private static Dictionary<string, object?> BuildShopScreenState(
         object shopScreen,
         object? player,
+        object? runState,
+        object? currentRoom,
+        object? runtimeInventory,
         Dictionary<string, object?> playerState,
         ObjectGraph graph)
     {
         object? proceedButton = FindMemberValue(shopScreen, "_proceedButton", "proceedButton", "ProceedButton", "_continueButton", "continueButton");
-        object? inventory = FindShopInventory(shopScreen, graph);
-        object? runtimeInventory = FindRuntimeMerchantInventory(player, graph);
+        ShopRuntimeLocatorContext shopRuntimeContext = CreateShopRuntimeLocatorContext();
+        object? inventory = ShopRuntimeLocator.FindShopInventory(shopRuntimeContext, shopScreen, graph.Nodes.Select(node => node.Value));
+        runtimeInventory ??= ShopRuntimeLocator.FindRuntimeMerchantInventory(shopRuntimeContext, player, runState, currentRoom, graph.Nodes.Select(node => node.Value));
         int? gold = ReadFirstInt(new[] { player, recentPlayer }, "gold", "_gold", "currentGold", "_currentGold");
         List<Dictionary<string, object?>> items = BuildShopItems(shopScreen, runtimeInventory, graph);
-        NormalizeShopItems(items, gold, playerState);
+        ShopInventorySnapshotBuilder.NormalizeItems(items, gold, playerState);
 
         return new Dictionary<string, object?>
         {
             ["screen_type"] = shopScreen.GetType().FullName ?? shopScreen.GetType().Name,
+            ["current_room_type"] = currentRoom?.GetType().FullName ?? currentRoom?.GetType().Name,
+            ["is_current_room_merchant"] = ShopRuntimeLocator.IsMerchantRoom(currentRoom),
+            ["runtime_inventory_found"] = runtimeInventory is not null,
+            ["runtime_inventory_type"] = runtimeInventory?.GetType().FullName ?? runtimeInventory?.GetType().Name,
             ["gold"] = gold,
             ["inventory_open"] = ReadBool(inventory, "IsOpen", "isOpen", "_isOpen") ?? ReadBool(shopScreen, "IsOpen", "isOpen", "_isOpen"),
-            ["card_removal_available"] = items.Any(IsAvailableShopRemovalService),
+            ["card_removal_available"] = items.Any(ShopInventorySnapshotBuilder.IsAvailableRemovalService),
             ["potion_slots"] = playerState.TryGetValue("potion_slots", out object? potionSlots) ? potionSlots : null,
             ["filled_potion_slots"] = ReadDictionaryInt(playerState, "filled_potion_slots"),
             ["max_potion_slots"] = ReadDictionaryInt(playerState, "max_potion_slots"),
@@ -2106,440 +2980,36 @@ internal static class CombatStateExporter
         };
     }
 
+    private static ShopRuntimeLocatorContext CreateShopRuntimeLocatorContext()
+    {
+        return new ShopRuntimeLocatorContext(
+            GetStaticPropertyValue: GetStaticPropertyValue,
+            TryInvokeMethod: TryInvokeMethod,
+            FindMemberValue: FindMemberValue,
+            EnumerateNodeDescendants: EnumerateNodeDescendants,
+            IsLiveVisibleControl: IsLiveVisibleControl);
+    }
+
     private static List<Dictionary<string, object?>> BuildShopItems(object shopScreen, object? runtimeInventory, ObjectGraph graph)
     {
-        List<Dictionary<string, object?>> items = new();
-        HashSet<string> seenKeys = new(StringComparer.OrdinalIgnoreCase);
-
-        AddShopInventoryItems(runtimeInventory, items, seenKeys);
-        AddShopCardItems(shopScreen, items, seenKeys);
-        AddShopMerchantCardItems(shopScreen, items, seenKeys);
-        AddShopItemCandidates(shopScreen, graph, items, seenKeys, "relic", "Relic");
-        AddShopItemCandidates(shopScreen, graph, items, seenKeys, "potion", "Potion");
-        AddShopServiceCandidates(shopScreen, graph, items, seenKeys);
-
-        return items;
-    }
-
-    private static object? FindRuntimeMerchantInventory(object? player, ObjectGraph graph)
-    {
-        object? runState = FindMemberValue(player, "RunState", "runState", "_runState");
-        object? currentRoom = FindMemberValue(runState, "CurrentRoom", "currentRoom", "_currentRoom");
-        object? inventory = FindMemberValue(currentRoom, "Inventory", "inventory", "_inventory");
-        if (inventory is not null)
-        {
-            return inventory;
-        }
-
-        return graph.Nodes
-            .Select(node => node.Value)
-            .Where(value => value is not null)
-            .FirstOrDefault(value =>
-            {
-                string typeName = value!.GetType().FullName ?? value.GetType().Name;
-                return typeName.Contains("MegaCrit.Sts2.Core.Entities.Merchant.MerchantInventory", StringComparison.Ordinal);
-            });
-    }
-
-    private static object? FindShopInventory(object shopScreen, ObjectGraph graph)
-    {
-        object? directInventory = FindMemberValue(
-            shopScreen,
-            "Inventory",
-            "inventory",
-            "_inventory",
-            "MerchantInventory",
-            "merchantInventory",
-            "_merchantInventory");
-        if (directInventory is not null)
-        {
-            return directInventory;
-        }
-
-        return graph.Nodes
-            .Select(node => node.Value)
-            .Where(value => value is not null)
-            .FirstOrDefault(value =>
-            {
-                string typeName = value!.GetType().FullName ?? value.GetType().Name;
-                return ContainsAny(typeName, "MerchantInventory", "ShopInventory", "StoreInventory");
-            });
-    }
-
-    private static void AddShopInventoryItems(object? inventory, List<Dictionary<string, object?>> items, HashSet<string> seenKeys)
-    {
-        if (inventory is null)
-        {
-            return;
-        }
-
-        AddShopInventoryCardEntries(inventory, items, seenKeys, "CharacterCardEntries", "character_card");
-        AddShopInventoryCardEntries(inventory, items, seenKeys, "ColorlessCardEntries", "colorless_card");
-        AddShopInventoryModelEntries(inventory, items, seenKeys, "RelicEntries", "relic", "Model", "Relic");
-        AddShopInventoryModelEntries(inventory, items, seenKeys, "PotionEntries", "potion", "Model", "Potion");
-        AddShopInventoryRemovalEntry(inventory, items, seenKeys);
-    }
-
-    private static void AddShopInventoryCardEntries(
-        object inventory,
-        List<Dictionary<string, object?>> items,
-        HashSet<string> seenKeys,
-        string entriesMemberName,
-        string slotGroup)
-    {
-        object? entries = FindMemberValue(inventory, entriesMemberName, "_" + entriesMemberName, ToCamelCase(entriesMemberName));
-        List<object> entryList = EnumerateObjects(entries).ToList();
-        for (int index = 0; index < entryList.Count; index++)
-        {
-            object entry = entryList[index];
-            object? creationResult = FindMemberValue(entry, "CreationResult", "creationResult", "_creationResult");
-            object? card = FindMemberValue(creationResult, "Card", "card", "_card");
-            if (card is null)
-            {
-                continue;
-            }
-
-            Dictionary<string, object?> cardState = BuildCards("shop", new[] { card }).FirstOrDefault()
-                ?? new Dictionary<string, object?>();
-            string cardId = ReadDictionaryString(cardState, "card_id")
-                ?? ReadString(card, "Id", "id", "_id")
-                ?? "unknown_card";
-            string name = ReadDictionaryString(cardState, "name")
-                ?? ReadCardName(card)
-                ?? cardId;
-            string dedupeKey = $"card:{cardId}:{index}";
-            if (!seenKeys.Add(dedupeKey))
-            {
-                continue;
-            }
-
-            items.Add(BuildShopInventoryItem(
-                itemType: "card",
-                slotGroup: slotGroup,
-                slotIndex: index,
-                name: name,
-                modelId: cardId,
-                entry: entry,
-                nestedKey: "card",
-                nestedValue: cardState));
-        }
-    }
-
-    private static void AddShopInventoryModelEntries(
-        object inventory,
-        List<Dictionary<string, object?>> items,
-        HashSet<string> seenKeys,
-        string entriesMemberName,
-        string itemType,
-        string modelMemberName,
-        string fallbackTypeName)
-    {
-        object? entries = FindMemberValue(inventory, entriesMemberName, "_" + entriesMemberName, ToCamelCase(entriesMemberName));
-        List<object> entryList = EnumerateObjects(entries).ToList();
-        for (int index = 0; index < entryList.Count; index++)
-        {
-            object entry = entryList[index];
-            object? model = FindMemberValue(entry, modelMemberName, ToCamelCase(modelMemberName), "_" + ToCamelCase(modelMemberName));
-            Dictionary<string, object?>? summary = BuildItemSummary(model);
-            if (summary is null)
-            {
-                continue;
-            }
-
-            string modelId = ReadDictionaryString(summary, "id") ?? $"unknown_{itemType}";
-            string name = ReadDictionaryString(summary, "name") ?? modelId;
-            string dedupeKey = $"{itemType}:{modelId}:{name}";
-            if (!seenKeys.Add(dedupeKey))
-            {
-                continue;
-            }
-
-            items.Add(BuildShopInventoryItem(
-                itemType: itemType,
-                slotGroup: itemType,
-                slotIndex: index,
-                name: name,
-                modelId: modelId,
-                entry: entry,
-                nestedKey: itemType,
-                nestedValue: summary,
-                fallbackTypeName: fallbackTypeName));
-        }
-    }
-
-    private static void AddShopInventoryRemovalEntry(object inventory, List<Dictionary<string, object?>> items, HashSet<string> seenKeys)
-    {
-        object? entry = FindMemberValue(inventory, "CardRemovalEntry", "cardRemovalEntry", "_cardRemovalEntry");
-        if (entry is null || !seenKeys.Add("service:CARD_REMOVAL:0"))
-        {
-            return;
-        }
-
-        items.Add(BuildShopInventoryItem(
-            itemType: "service",
-            slotGroup: "service",
-            slotIndex: 0,
-            name: "Card Removal",
-            modelId: "CARD_REMOVAL",
-            entry: entry,
-            nestedKey: null,
-            nestedValue: null,
-            fallbackTypeName: "CardRemoval"));
-    }
-
-    private static Dictionary<string, object?> BuildShopInventoryItem(
-        string itemType,
-        string slotGroup,
-        int slotIndex,
-        string name,
-        string modelId,
-        object entry,
-        string? nestedKey,
-        object? nestedValue,
-        string? fallbackTypeName = null)
-    {
-        Dictionary<string, object?> item = new()
-        {
-            ["shop_item_id"] = SanitizeActionId($"{slotGroup}_{slotIndex}_{modelId}"),
-            ["shop_item_index"] = 0,
-            ["item_type"] = itemType,
-            ["kind"] = itemType,
-            ["name"] = name,
-            ["model_id"] = modelId,
-            ["price"] = ReadPrice(entry),
-            ["cost"] = ReadPrice(entry),
-            ["sold_out"] = ReadBool(entry, "SoldOut", "soldOut", "_soldOut", "IsSoldOut", "isSoldOut", "_isSoldOut"),
-            ["is_stocked"] = ReadBool(entry, "IsStocked", "isStocked", "_isStocked") ?? ReadBool(entry, "SoldOut", "soldOut", "_soldOut") != true,
-            ["is_affordable"] = ReadBool(entry, "EnoughGold", "enoughGold", "_enoughGold", "CanAfford", "canAfford", "_canAfford"),
-            ["is_on_sale"] = ReadBool(entry, "IsOnSale", "isOnSale", "_isOnSale"),
-            ["slot_group"] = slotGroup,
-            ["slot_index"] = slotIndex,
-            ["locator_id"] = $"{slotGroup}:{slotIndex}",
-            ["entry_type"] = entry.GetType().FullName ?? entry.GetType().Name,
-            ["model_type"] = fallbackTypeName
-        };
-
-        if (!string.IsNullOrWhiteSpace(nestedKey) && nestedValue is not null)
-        {
-            item[nestedKey] = nestedValue;
-        }
-
-        return item;
-    }
-
-    private static string ToCamelCase(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return value;
-        }
-
-        return char.ToLowerInvariant(value[0]) + value[1..];
-    }
-
-    private static void AddShopCardItems(object shopScreen, List<Dictionary<string, object?>> items, HashSet<string> seenKeys)
-    {
-        List<object> holders = FindGridCardHolders(shopScreen);
-        for (int index = 0; index < holders.Count; index++)
-        {
-            object holder = holders[index];
-            if (IsLiveVisibleControlOrNull(holder) == false)
-            {
-                continue;
-            }
-
-            object? card = ExtractCardFromHolder(holder);
-            if (card is null)
-            {
-                continue;
-            }
-
-            Dictionary<string, object?> cardState = BuildCards("shop", new[] { card }).FirstOrDefault()
-                ?? new Dictionary<string, object?>();
-            string name = ReadDictionaryString(cardState, "name")
-                ?? ReadCardName(card)
-                ?? GetReadableName(card);
-            string dedupeKey = $"card:{ReadDictionaryString(cardState, "card_id") ?? name}:{index}";
-            if (!seenKeys.Add(dedupeKey))
-            {
-                continue;
-            }
-
-            items.Add(new Dictionary<string, object?>
-            {
-                ["shop_item_id"] = SanitizeActionId($"shop_card_{index}_{name}"),
-                ["shop_item_index"] = items.Count,
-                ["item_type"] = "card",
-                ["name"] = name,
-                ["price"] = ReadPrice(holder, card),
-                ["sold_out"] = ReadBool(holder, "IsSoldOut", "isSoldOut", "_isSoldOut"),
-                ["card"] = cardState,
-                ["holder_type"] = holder.GetType().FullName ?? holder.GetType().Name,
-                ["visible"] = ReadBool(holder, "Visible", "visible"),
-                ["visible_in_tree"] = TryInvokeBoolMethod(holder, "IsVisibleInTree")
-            });
-        }
-    }
-
-    private static void AddShopMerchantCardItems(object shopScreen, List<Dictionary<string, object?>> items, HashSet<string> seenKeys)
-    {
-        List<object> cardNodes = EnumerateNodeDescendants(shopScreen)
-            .Where(candidate => ContainsAny(candidate.GetType().FullName ?? candidate.GetType().Name, "NMerchantCard"))
-            .Where(candidate => IsLiveVisibleControlOrNull(candidate) != false)
-            .Distinct(ReferenceEqualityComparer.Instance)
-            .ToList();
-
-        for (int index = 0; index < cardNodes.Count; index++)
-        {
-            object cardNode = cardNodes[index];
-            object? card = FindMemberValue(cardNode, "Card", "card", "_card", "Model", "model", "_model", "CardModel", "cardModel", "_cardModel");
-            if (card is null)
-            {
-                continue;
-            }
-
-            Dictionary<string, object?> cardState = BuildCards("shop", new[] { card }).FirstOrDefault()
-                ?? new Dictionary<string, object?>();
-            string name = ReadDictionaryString(cardState, "name")
-                ?? ReadCardName(card)
-                ?? GetReadableName(card);
-            string dedupeKey = $"merchant_card:{ReadDictionaryString(cardState, "card_id") ?? name}:{index}";
-            if (!seenKeys.Add(dedupeKey))
-            {
-                continue;
-            }
-
-            items.Add(new Dictionary<string, object?>
-            {
-                ["shop_item_id"] = SanitizeActionId($"shop_card_{items.Count}_{name}"),
-                ["shop_item_index"] = items.Count,
-                ["item_type"] = "card",
-                ["name"] = name,
-                ["price"] = ReadPrice(cardNode, card),
-                ["sold_out"] = ReadBool(cardNode, "IsSoldOut", "isSoldOut", "_isSoldOut", "SoldOut", "soldOut"),
-                ["card"] = cardState,
-                ["node_type"] = cardNode.GetType().FullName ?? cardNode.GetType().Name,
-                ["model_type"] = card.GetType().FullName ?? card.GetType().Name,
-                ["visible"] = ReadBool(cardNode, "Visible", "visible"),
-                ["visible_in_tree"] = TryInvokeBoolMethod(cardNode, "IsVisibleInTree")
-            });
-        }
-    }
-
-    private static void AddShopItemCandidates(
-        object shopScreen,
-        ObjectGraph graph,
-        List<Dictionary<string, object?>> items,
-        HashSet<string> seenKeys,
-        string itemType,
-        string typeHint)
-    {
-        IEnumerable<object> candidates = EnumerateNodeDescendants(shopScreen)
-            .Where(candidate => IsShopItemCandidate(candidate, typeHint))
-            .Distinct(ReferenceEqualityComparer.Instance);
-
-        foreach (object candidate in candidates)
-        {
-            object itemModel = ResolveShopItemModel(candidate, typeHint) ?? candidate;
-            Dictionary<string, object?>? itemSummary = BuildItemSummary(itemModel);
-            if (itemSummary is null)
-            {
-                continue;
-            }
-
-            string name = ReadDictionaryString(itemSummary, "name") ?? GetReadableName(itemModel);
-            string id = ReadDictionaryString(itemSummary, "id") ?? name;
-            string dedupeKey = $"{itemType}:{id}:{name}";
-            if (!seenKeys.Add(dedupeKey))
-            {
-                continue;
-            }
-
-            items.Add(new Dictionary<string, object?>
-            {
-                ["shop_item_id"] = SanitizeActionId($"shop_{itemType}_{items.Count}_{name}"),
-                ["shop_item_index"] = items.Count,
-                ["item_type"] = itemType,
-                ["name"] = name,
-                ["price"] = ReadPrice(candidate, itemModel),
-                ["sold_out"] = ReadBool(candidate, "IsSoldOut", "isSoldOut", "_isSoldOut", "SoldOut", "soldOut"),
-                [itemType] = itemSummary,
-                ["node_type"] = candidate.GetType().FullName ?? candidate.GetType().Name,
-                ["model_type"] = itemModel.GetType().FullName ?? itemModel.GetType().Name,
-                ["visible"] = ReadBool(candidate, "Visible", "visible"),
-                ["visible_in_tree"] = TryInvokeBoolMethod(candidate, "IsVisibleInTree")
-            });
-        }
-    }
-
-    private static void AddShopServiceCandidates(object shopScreen, ObjectGraph graph, List<Dictionary<string, object?>> items, HashSet<string> seenKeys)
-    {
-        IEnumerable<object> candidates = EnumerateNodeDescendants(shopScreen)
-            .Concat(graph.Nodes.Select(node => node.Value).Where(value => value is not null).Cast<object>())
-            .Where(candidate => ContainsAny(candidate.GetType().FullName ?? candidate.GetType().Name, "Remove", "Purge", "Service"))
-            .Distinct(ReferenceEqualityComparer.Instance);
-
-        foreach (object candidate in candidates)
-        {
-            string typeName = candidate.GetType().FullName ?? candidate.GetType().Name;
-            string name = ReadString(candidate, "name", "_name", "displayName", "_displayName", "title", "_title") ?? GetReadableName(candidate);
-            string dedupeKey = $"service:{typeName}:{name}";
-            if (!seenKeys.Add(dedupeKey))
-            {
-                continue;
-            }
-
-            items.Add(new Dictionary<string, object?>
-            {
-                ["shop_item_id"] = SanitizeActionId($"shop_service_{items.Count}_{name}"),
-                ["shop_item_index"] = items.Count,
-                ["item_type"] = "service",
-                ["name"] = name,
-                ["price"] = ReadPrice(candidate),
-                ["node_type"] = typeName,
-                ["visible"] = ReadBool(candidate, "Visible", "visible"),
-                ["visible_in_tree"] = TryInvokeBoolMethod(candidate, "IsVisibleInTree")
-            });
-        }
-    }
-
-    private static bool IsShopItemCandidate(object candidate, string typeHint)
-    {
-        string typeName = candidate.GetType().FullName ?? candidate.GetType().Name;
-        if (ContainsAny(typeName, "List", "Dictionary", "Collection", "Manager", "Reward", "Action", "Iterator", "GrabBag"))
-        {
-            return false;
-        }
-
-        if (ContainsAny(typeName, $"NMerchant{typeHint}", $"Merchant{typeHint}", $"Shop{typeHint}"))
-        {
-            return true;
-        }
-
-        return false;
-    }
-
-    private static object? ResolveShopItemModel(object candidate, string typeHint)
-    {
-        string lowerHint = typeHint.ToLowerInvariant();
-        object? model = FindMemberValue(
-            candidate,
-            typeHint,
-            lowerHint,
-            "_" + lowerHint,
-            "Model",
-            "model",
-            "_model",
-            "Item",
-            "item",
-            "_item");
-        if (model is null)
-        {
-            return null;
-        }
-
-        string modelTypeName = model.GetType().FullName ?? model.GetType().Name;
-        return ContainsAny(modelTypeName, typeHint) ? model : null;
+        return ShopItemCandidateCollector.Collect(new ShopItemCandidateCollectorContext(
+            ShopScreen: shopScreen,
+            RuntimeInventory: runtimeInventory,
+            GraphValues: graph.Nodes.Select(node => node.Value),
+            FindMemberValue: FindMemberValue,
+            EnumerateObjects: EnumerateObjects,
+            EnumerateNodeDescendants: EnumerateNodeDescendants,
+            IsLiveVisibleControlOrNull: IsLiveVisibleControlOrNull,
+            TryInvokeBoolMethod: TryInvokeBoolMethod,
+            FindGridCardHolders: FindGridCardHolders,
+            ExtractCardFromHolder: ExtractCardFromHolder,
+            BuildCards: BuildCards,
+            BuildItemSummary: BuildItemSummary,
+            ReadCardName: ReadCardName,
+            GetReadableName: value => value is null ? null : GetReadableName(value),
+            ReadString: ReadString,
+            ReadPrice: ReadPrice,
+            ReadBool: ReadBool));
     }
 
     private static int? ReadPrice(params object?[] sources)
@@ -2574,168 +3044,6 @@ internal static class CombatStateExporter
     private static bool? IsLiveVisibleControlOrNull(object? source)
     {
         return source is null ? null : IsLiveVisibleControl(source);
-    }
-
-    private static void NormalizeShopItems(
-        List<Dictionary<string, object?>> items,
-        int? gold,
-        Dictionary<string, object?> playerState)
-    {
-        bool? hasOpenPotionSlots = ReadDictionaryBool(playerState, "has_open_potion_slots");
-        Dictionary<string, int> nextSlotByKind = new(StringComparer.OrdinalIgnoreCase);
-        for (int index = 0; index < items.Count; index++)
-        {
-            Dictionary<string, object?> item = items[index];
-            string kind = ReadDictionaryString(item, "kind")
-                ?? ReadDictionaryString(item, "item_type")
-                ?? "unknown";
-            string slotGroup = BuildShopSlotGroup(kind);
-            int slotIndex = nextSlotByKind.TryGetValue(slotGroup, out int nextIndex) ? nextIndex : 0;
-            nextSlotByKind[slotGroup] = slotIndex + 1;
-
-            int? cost = ReadDictionaryInt(item, "cost") ?? ReadDictionaryInt(item, "price");
-            bool isStocked = ReadDictionaryBool(item, "is_stocked") ?? ReadDictionaryBool(item, "sold_out") != true;
-            bool isAffordable = cost is not null && gold is not null && gold.Value >= cost.Value;
-            string modelId = BuildShopItemModelId(item, kind);
-
-            item["kind"] = kind;
-            item["model_id"] = modelId;
-            item["cost"] = cost;
-            item["is_stocked"] = isStocked;
-            item["is_affordable"] = isAffordable;
-            bool potionSlotAllowsPurchase = !kind.Equals("potion", StringComparison.OrdinalIgnoreCase)
-                || hasOpenPotionSlots != false;
-            item["is_purchase_legal_now"] = isStocked && isAffordable && potionSlotAllowsPurchase && kind != "unknown";
-            if (kind.Equals("potion", StringComparison.OrdinalIgnoreCase) && hasOpenPotionSlots == false)
-            {
-                item["purchase_blocked_reason"] = "potion_slots_full";
-            }
-            item["slot_group"] = slotGroup;
-            item["slot_index"] = slotIndex;
-            item["locator_id"] = $"{slotGroup}:{slotIndex}";
-            item["shop_item_index"] = index;
-            item["shop_item_id"] = SanitizeActionId($"{slotGroup}_{slotIndex}_{modelId}");
-        }
-    }
-
-    private static string BuildShopSlotGroup(string kind)
-    {
-        if (kind.Equals("card", StringComparison.OrdinalIgnoreCase))
-        {
-            return "card";
-        }
-
-        if (kind.Equals("relic", StringComparison.OrdinalIgnoreCase))
-        {
-            return "relic";
-        }
-
-        if (kind.Equals("potion", StringComparison.OrdinalIgnoreCase))
-        {
-            return "potion";
-        }
-
-        if (kind.Equals("service", StringComparison.OrdinalIgnoreCase))
-        {
-            return "service";
-        }
-
-        return "unknown";
-    }
-
-    private static string BuildShopItemModelId(Dictionary<string, object?> item, string kind)
-    {
-        if (kind.Equals("card", StringComparison.OrdinalIgnoreCase)
-            && item.TryGetValue("card", out object? cardValue)
-            && cardValue is Dictionary<string, object?> card)
-        {
-            return ReadDictionaryString(card, "card_id")
-                ?? ReadDictionaryString(card, "instance_id")
-                ?? ReadDictionaryString(item, "name")
-                ?? "unknown_card";
-        }
-
-        if (item.TryGetValue(kind, out object? nestedValue)
-            && nestedValue is Dictionary<string, object?> nested)
-        {
-            return ReadDictionaryString(nested, "id")
-                ?? ReadDictionaryString(nested, "name")
-                ?? ReadDictionaryString(item, "name")
-                ?? $"unknown_{kind}";
-        }
-
-        return ReadDictionaryString(item, "name") ?? $"unknown_{kind}";
-    }
-
-    private static bool IsAvailableShopRemovalService(Dictionary<string, object?> item)
-    {
-        string kind = ReadDictionaryString(item, "kind") ?? ReadDictionaryString(item, "item_type") ?? string.Empty;
-        if (!kind.Equals("service", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        string name = ReadDictionaryString(item, "name") ?? string.Empty;
-        string nodeType = ReadDictionaryString(item, "node_type") ?? string.Empty;
-        return ReadDictionaryBool(item, "sold_out") != true
-            && (ContainsAny(name, "Remove", "Removal", "Purge", "제거")
-                || ContainsAny(nodeType, "Remove", "Removal", "Purge"));
-    }
-
-    private static List<Dictionary<string, object?>> BuildShopLegalActions(List<Dictionary<string, object?>> items, bool canProceed)
-    {
-        List<Dictionary<string, object?>> actions = new();
-        foreach (Dictionary<string, object?> item in items)
-        {
-            if (ReadDictionaryBool(item, "is_purchase_legal_now") != true)
-            {
-                continue;
-            }
-
-            string kind = ReadDictionaryString(item, "kind") ?? string.Empty;
-            string shopItemId = ReadDictionaryString(item, "shop_item_id") ?? string.Empty;
-            if (string.IsNullOrWhiteSpace(shopItemId))
-            {
-                continue;
-            }
-
-            string modelId = ReadDictionaryString(item, "model_id") ?? shopItemId;
-            string name = ReadDictionaryString(item, "name") ?? modelId;
-            int? cost = ReadDictionaryInt(item, "cost");
-            string actionType = kind.Equals("service", StringComparison.OrdinalIgnoreCase)
-                ? "remove_card_at_shop"
-                : "buy_shop_item";
-
-            actions.Add(new Dictionary<string, object?>
-            {
-                ["action_id"] = SanitizeActionId($"{actionType}_{shopItemId}"),
-                ["type"] = actionType,
-                ["shop_item_id"] = shopItemId,
-                ["kind"] = kind,
-                ["model_id"] = modelId,
-                ["cost"] = cost,
-                ["slot_group"] = ReadDictionaryString(item, "slot_group"),
-                ["slot_index"] = ReadDictionaryInt(item, "slot_index"),
-                ["locator_id"] = ReadDictionaryString(item, "locator_id"),
-                ["summary"] = actionType == "remove_card_at_shop"
-                    ? $"Use shop card removal service for {cost?.ToString() ?? "unknown"} gold."
-                    : $"Buy {name} for {cost?.ToString() ?? "unknown"} gold.",
-                ["validation_note"] = "Executor must re-read the current merchant inventory and verify slot, model_id, cost, stock, and gold before applying."
-            });
-        }
-
-        if (canProceed)
-        {
-            actions.Add(new Dictionary<string, object?>
-            {
-                ["action_id"] = "proceed_shop",
-                ["type"] = "proceed_shop",
-                ["summary"] = "상점을 나가고 다음 화면으로 진행합니다.",
-                ["validation_note"] = "현재 상점 화면의 진행 버튼입니다."
-            });
-        }
-
-        return actions;
     }
 
     private static Dictionary<string, object?> BuildShopDebug(object shopScreen, ObjectGraph graph)
@@ -2778,6 +3086,9 @@ internal static class CombatStateExporter
         object? relicsSource = FindMemberValue(player, "relics")
             ?? FindMemberValue(managerCombatState, "relics")
             ?? FindMemberValue(recentCombatState, "relics");
+        Dictionary<string, object?> playerState = player is null
+            ? new Dictionary<string, object?>()
+            : BuildPlayer(player);
         Dictionary<string, object?> reward = BuildRewardScreenState(rewardScreen);
         List<Dictionary<string, object?>> rewards = ReadDictionaryList(reward, "rewards");
 
@@ -2788,7 +3099,7 @@ internal static class CombatStateExporter
             ["state_id"] = "reward_pending",
             ["exported_at_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             ["run"] = BuildRun(managerCombatState ?? recentCombatState ?? rewardScreen, graph),
-            ["player"] = player is null ? new Dictionary<string, object?>() : BuildPlayer(player),
+            ["player"] = playerState,
             ["piles"] = new Dictionary<string, object?>
             {
                 ["hand"] = new List<Dictionary<string, object?>>(),
@@ -2798,7 +3109,7 @@ internal static class CombatStateExporter
             },
             ["enemies"] = new List<Dictionary<string, object?>>(),
             ["reward"] = reward,
-            ["legal_actions"] = BuildRewardLegalActions(rewards),
+            ["legal_actions"] = BuildRewardLegalActions(rewards, playerState),
             ["relics"] = BuildRelics(relicsSource, graph),
             ["debug"] = BuildRewardDebug(rewardScreen, graph)
         };
@@ -3041,7 +3352,9 @@ internal static class CombatStateExporter
             object? cardInfo = FindMemberValue(primaryCard, "cardInfo", "_cardInfo", "info", "_info", "baseCard", "_baseCard");
             object? cardModel = FindMemberValue(primaryCard, "Model", "model", "_model", "cardModel", "_cardModel") ?? primaryCard;
             object? energyCost = FindMemberValue(cardModel, "EnergyCost", "energyCost", "_energyCost");
+            string cardId = ReadFirstString(new[] { primaryCard, cardModel, cardInfo }, "id", "_id", "cardId", "_cardId", "key", "_key") ?? fallbackName;
             string cardName = ReadCardName(primaryCard, cardModel, cardInfo) ?? fallbackName;
+            string stableId = BuildRewardStableId("card_reward", cardId, index);
             int? resolvedCost = TryInvokeInt(energyCost, "GetAmountToSpend")
                 ?? ReadFirstInt(new[] { primaryCard, cardModel, cardStats, cardInfo }, "cost", "_cost", "currentCost", "_currentCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost");
             int? baseCost = ReadInt(energyCost, "Canonical")
@@ -3049,7 +3362,11 @@ internal static class CombatStateExporter
             cards.Add(new Dictionary<string, object?>
             {
                 ["card_reward_index"] = index,
-                ["card_id"] = ReadFirstString(new[] { primaryCard, cardModel, cardInfo }, "id", "_id", "cardId", "_cardId", "key", "_key") ?? fallbackName,
+                ["reward_type"] = "card_reward",
+                ["model_id"] = cardId,
+                ["reward_stable_id"] = stableId,
+                ["card_reward_stable_id"] = stableId,
+                ["card_id"] = cardId,
                 ["name"] = cardName,
                 ["type"] = ReadFirstString(new[] { primaryCard, cardModel, cardInfo, cardStats }, "type", "_type", "cardType", "_cardType"),
                 ["cost"] = resolvedCost,
@@ -3125,7 +3442,7 @@ internal static class CombatStateExporter
         return null;
     }
 
-    private static List<Dictionary<string, object?>> BuildRewardLegalActions(List<Dictionary<string, object?>> rewards)
+    private static List<Dictionary<string, object?>> BuildRewardLegalActions(List<Dictionary<string, object?>> rewards, Dictionary<string, object?> player)
     {
         List<Dictionary<string, object?>> actions = new();
         if (rewards.Count == 0)
@@ -3139,11 +3456,11 @@ internal static class CombatStateExporter
             return actions;
         }
 
-        AddRewardLegalActions(actions, rewards);
+        AddRewardLegalActions(actions, rewards, player);
         return actions;
     }
 
-    private static void AddRewardLegalActions(List<Dictionary<string, object?>> actions, List<Dictionary<string, object?>> rewards)
+    private static void AddRewardLegalActions(List<Dictionary<string, object?>> actions, List<Dictionary<string, object?>> rewards, Dictionary<string, object?> player)
     {
         foreach (Dictionary<string, object?> reward in rewards)
         {
@@ -3154,12 +3471,21 @@ internal static class CombatStateExporter
                 foreach (Dictionary<string, object?> card in ReadDictionaryList(reward, "cards"))
                 {
                     int? cardIndex = ReadDictionaryInt(card, "card_reward_index");
-                    string cardName = ReadDictionaryString(card, "name") ?? ReadDictionaryString(card, "card_id") ?? "unknown_card";
+                    string modelId = ReadDictionaryString(card, "model_id")
+                        ?? ReadDictionaryString(card, "card_id")
+                        ?? "unknown_card";
+                    string stableId = ReadDictionaryString(card, "reward_stable_id")
+                        ?? BuildRewardStableId(rewardType, modelId, cardIndex ?? -1);
+                    string cardName = ReadDictionaryString(card, "name") ?? modelId;
                     actions.Add(new Dictionary<string, object?>
                     {
-                        ["action_id"] = SanitizeActionId($"choose_{rewardId}_card_{cardIndex?.ToString() ?? "unknown"}"),
+                        ["action_id"] = SanitizeActionId($"choose_{rewardId}_{stableId}"),
                         ["type"] = "choose_card_reward",
                         ["reward_id"] = rewardId,
+                        ["reward_type"] = rewardType,
+                        ["reward_stable_id"] = stableId,
+                        ["model_id"] = modelId,
+                        ["card_reward_stable_id"] = stableId,
                         ["card_reward_index"] = cardIndex,
                         ["card_id"] = ReadDictionaryString(card, "card_id"),
                         ["card_name"] = cardName,
@@ -3203,6 +3529,10 @@ internal static class CombatStateExporter
             }
             else if (rewardType == "potion")
             {
+                AddPotionRewardLegalActions(actions, reward, rewardId, rewardType, player);
+            }
+            else if (rewardType == "potion")
+            {
                 actions.Add(new Dictionary<string, object?>
                 {
                     ["action_id"] = SanitizeActionId($"claim_{rewardId}"),
@@ -3214,9 +3544,98 @@ internal static class CombatStateExporter
             }
             else if (rewardType == "linked_reward_set")
             {
-                AddRewardLegalActions(actions, ReadDictionaryList(reward, "rewards"));
+                AddRewardLegalActions(actions, ReadDictionaryList(reward, "rewards"), player);
             }
         }
+    }
+
+    private static void AddPotionRewardLegalActions(
+        List<Dictionary<string, object?>> actions,
+        Dictionary<string, object?> reward,
+        string rewardId,
+        string rewardType,
+        Dictionary<string, object?> player)
+    {
+        Dictionary<string, object?>? potion = ReadDictionaryObject(reward, "potion");
+        string modelId = ReadDictionaryString(potion ?? new Dictionary<string, object?>(), "potion_id")
+            ?? ReadDictionaryString(potion ?? new Dictionary<string, object?>(), "id")
+            ?? ReadDictionaryString(reward, "name")
+            ?? "unknown_potion";
+        string potionName = ReadDictionaryString(potion ?? new Dictionary<string, object?>(), "name") ?? modelId;
+        string stableId = BuildRewardStableId(rewardType, modelId, TryReadRewardIndex(rewardId) ?? -1);
+        if (ReadDictionaryBool(player, "has_open_potion_slots") != false)
+        {
+            actions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = SanitizeActionId($"claim_{rewardId}_{stableId}"),
+                ["type"] = "claim_potion_reward",
+                ["reward_id"] = rewardId,
+                ["reward_type"] = rewardType,
+                ["reward_stable_id"] = stableId,
+                ["model_id"] = modelId,
+                ["potion_id"] = modelId,
+                ["summary"] = $"{potionName} 포션 보상을 받습니다.",
+                ["validation_note"] = "현재 보상 화면과 포션 슬롯 여유를 다시 확인한 뒤 실행합니다."
+            });
+            return;
+        }
+
+        foreach (Dictionary<string, object?> potionSlot in ReadDictionaryList(player, "potion_slots"))
+        {
+            if (ReadDictionaryBool(potionSlot, "empty") == true)
+            {
+                continue;
+            }
+
+            int? discardSlotIndex = ReadDictionaryInt(potionSlot, "slot_index");
+            Dictionary<string, object?>? discardPotion = ReadDictionaryObject(potionSlot, "potion");
+            string discardPotionId = ReadDictionaryString(discardPotion ?? new Dictionary<string, object?>(), "potion_id")
+                ?? ReadDictionaryString(discardPotion ?? new Dictionary<string, object?>(), "id")
+                ?? "unknown_potion";
+            string discardPotionName = ReadDictionaryString(discardPotion ?? new Dictionary<string, object?>(), "name") ?? discardPotionId;
+            actions.Add(new Dictionary<string, object?>
+            {
+                ["action_id"] = SanitizeActionId($"claim_{rewardId}_{stableId}_discard_slot_{discardSlotIndex?.ToString() ?? "unknown"}"),
+                ["type"] = "claim_potion_reward_with_discard",
+                ["reward_id"] = rewardId,
+                ["reward_type"] = rewardType,
+                ["reward_stable_id"] = stableId,
+                ["model_id"] = modelId,
+                ["potion_id"] = modelId,
+                ["potion_name"] = potionName,
+                ["discard_potion_slot_index"] = discardSlotIndex,
+                ["discard_potion_id"] = discardPotionId,
+                ["discard_potion_name"] = discardPotionName,
+                ["summary"] = $"{discardSlotIndex?.ToString() ?? "?"}번 슬롯의 {discardPotionName} 포션을 버리고 {potionName} 포션 보상을 받습니다.",
+                ["validation_note"] = "실행 직전에 받을 포션과 버릴 포션 슬롯이 그대로인지 다시 확인합니다."
+            });
+        }
+    }
+
+    private static string BuildRewardStableId(string rewardType, string modelId, int index)
+    {
+        return SanitizeActionId($"reward_{rewardType}_{modelId}_{index}");
+    }
+
+    private static int? TryReadRewardIndex(string rewardId)
+    {
+        const string Marker = "reward_";
+        int markerIndex = rewardId.IndexOf(Marker, StringComparison.OrdinalIgnoreCase);
+        if (markerIndex < 0)
+        {
+            return null;
+        }
+
+        int start = markerIndex + Marker.Length;
+        int end = start;
+        while (end < rewardId.Length && char.IsDigit(rewardId[end]))
+        {
+            end++;
+        }
+
+        return end > start && int.TryParse(rewardId[start..end], out int index)
+            ? index
+            : null;
     }
 
     private static Dictionary<string, object?> BuildRewardDebug(object rewardScreen, ObjectGraph graph)
@@ -3320,6 +3739,7 @@ internal static class CombatStateExporter
     {
         Dictionary<string, object?> currentNode = BuildCurrentMapNode(runState);
         List<Dictionary<string, object?>> availableNextNodes = BuildAvailableMapNodes(mapScreen);
+        Dictionary<string, object?> fullGraph = BuildFullMapGraph(mapScreen, map, currentNode, availableNextNodes);
         return new Dictionary<string, object?>
         {
             ["screen_type"] = mapScreen.GetType().FullName ?? mapScreen.GetType().Name,
@@ -3334,7 +3754,8 @@ internal static class CombatStateExporter
             ["current"] = currentNode,
             ["available_next_nodes"] = availableNextNodes,
             ["available_next_node_count"] = availableNextNodes.Count,
-            ["future_expansion_note"] = "현재 구현은 즉시 선택 가능한 다음 노드만 내보낸다. 이후 전체 지도 그래프와 보스까지의 후보 경로 요약을 추가한다."
+            ["full_graph"] = fullGraph,
+            ["path_options_summary"] = BuildMapPathOptionsSummary(availableNextNodes, fullGraph)
         };
     }
 
@@ -3407,6 +3828,306 @@ internal static class CombatStateExporter
 
         bool? isEnabled = ReadBool(source, "IsEnabled", "isEnabled", "_isEnabled");
         return isEnabled == true;
+    }
+
+    private static Dictionary<string, object?> BuildFullMapGraph(
+        object mapScreen,
+        object? map,
+        Dictionary<string, object?> currentNode,
+        List<Dictionary<string, object?>> availableNextNodes)
+    {
+        List<Dictionary<string, object?>> nodes = BuildAllMapNodes(mapScreen, map);
+        HashSet<string> selectableNow = availableNextNodes
+            .Select(node => ReadDictionaryString(node, "node_id"))
+            .Where(nodeId => !string.IsNullOrWhiteSpace(nodeId))
+            .OfType<string>()
+            .ToHashSet(StringComparer.Ordinal);
+        string? currentNodeId = ReadDictionaryString(currentNode, "node_id");
+
+        foreach (Dictionary<string, object?> node in nodes)
+        {
+            string? nodeId = ReadDictionaryString(node, "node_id");
+            node["selectable_now"] = !string.IsNullOrWhiteSpace(nodeId) && selectableNow.Contains(nodeId);
+            node["is_current"] = !string.IsNullOrWhiteSpace(nodeId)
+                && !string.IsNullOrWhiteSpace(currentNodeId)
+                && nodeId.Equals(currentNodeId, StringComparison.Ordinal);
+            node["reachable_from_current"] = !string.IsNullOrWhiteSpace(nodeId)
+                && IsNodeReachableFromAnyNextNode(nodeId, availableNextNodes, nodes);
+        }
+
+        List<Dictionary<string, object?>> edges = BuildMapEdges(nodes);
+        return new Dictionary<string, object?>
+        {
+            ["nodes"] = nodes,
+            ["edges"] = edges,
+            ["node_count"] = nodes.Count,
+            ["edge_count"] = edges.Count,
+            ["row_count"] = nodes.Select(node => ReadDictionaryInt(node, "row")).Where(row => row is not null).Distinct().Count(),
+            ["column_count"] = nodes.Select(node => ReadDictionaryInt(node, "column")).Where(column => column is not null).Distinct().Count()
+        };
+    }
+
+    private static List<Dictionary<string, object?>> BuildAllMapNodes(object mapScreen, object? map)
+    {
+        List<Dictionary<string, object?>> result = new();
+        HashSet<string> seenNodeIds = new(StringComparer.Ordinal);
+        foreach (object source in EnumerateMapPointSources(mapScreen, map))
+        {
+            object? point = FindMemberValue(source, "Point", "point", "_point") ?? source;
+            Dictionary<string, object?> summary = BuildMapPointSummary(point, source);
+            string? nodeId = ReadDictionaryString(summary, "node_id");
+            if (string.IsNullOrWhiteSpace(nodeId) || nodeId == "map_unknown" || !seenNodeIds.Add(nodeId))
+            {
+                continue;
+            }
+
+            result.Add(summary);
+        }
+
+        return result
+            .OrderBy(node => ReadDictionaryInt(node, "row") ?? int.MaxValue)
+            .ThenBy(node => ReadDictionaryInt(node, "column") ?? int.MaxValue)
+            .ToList();
+    }
+
+    private static IEnumerable<object> EnumerateMapPointSources(object mapScreen, object? map)
+    {
+        object? mapPointDictionary = FindMemberValue(mapScreen, "_mapPointDictionary", "mapPointDictionary", "MapPointDictionary");
+        object? mapPointNodesSource = FindMemberValue(mapPointDictionary, "Values", "values")
+            ?? FindMemberValue(mapScreen, "_points", "Points", "points");
+        foreach (object mapPointNode in EnumerateObjects(mapPointNodesSource))
+        {
+            yield return mapPointNode;
+        }
+
+        object? allMapPoints = TryInvokeMethod(map, "GetAllMapPoints")
+            ?? FindMemberValue(map, "MapPoints", "mapPoints", "_mapPoints", "Points", "points", "_points");
+        foreach (object mapPoint in EnumerateObjects(allMapPoints))
+        {
+            yield return mapPoint;
+        }
+    }
+
+    private static List<Dictionary<string, object?>> BuildMapEdges(List<Dictionary<string, object?>> nodes)
+    {
+        HashSet<string> nodeIds = nodes
+            .Select(node => ReadDictionaryString(node, "node_id"))
+            .Where(nodeId => !string.IsNullOrWhiteSpace(nodeId))
+            .OfType<string>()
+            .ToHashSet(StringComparer.Ordinal);
+        HashSet<string> seen = new(StringComparer.Ordinal);
+        List<Dictionary<string, object?>> edges = new();
+        foreach (Dictionary<string, object?> node in nodes)
+        {
+            string? fromNodeId = ReadDictionaryString(node, "node_id");
+            if (string.IsNullOrWhiteSpace(fromNodeId))
+            {
+                continue;
+            }
+
+            foreach (string childNodeId in ReadDictionaryStringList(node, "child_node_ids"))
+            {
+                if (!nodeIds.Contains(childNodeId))
+                {
+                    continue;
+                }
+
+                string edgeId = $"{fromNodeId}->{childNodeId}";
+                if (!seen.Add(edgeId))
+                {
+                    continue;
+                }
+
+                edges.Add(new Dictionary<string, object?>
+                {
+                    ["from_node_id"] = fromNodeId,
+                    ["to_node_id"] = childNodeId
+                });
+            }
+        }
+
+        return edges;
+    }
+
+    private static bool IsNodeReachableFromAnyNextNode(string nodeId, List<Dictionary<string, object?>> availableNextNodes, List<Dictionary<string, object?>> nodes)
+    {
+        HashSet<string> startNodeIds = availableNextNodes
+            .Select(node => ReadDictionaryString(node, "node_id"))
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .OfType<string>()
+            .ToHashSet(StringComparer.Ordinal);
+        if (startNodeIds.Contains(nodeId))
+        {
+            return true;
+        }
+
+        Dictionary<string, List<string>> adjacency = BuildAdjacency(nodes);
+        Queue<string> queue = new(startNodeIds);
+        HashSet<string> visited = new(startNodeIds, StringComparer.Ordinal);
+        while (queue.Count > 0)
+        {
+            string current = queue.Dequeue();
+            foreach (string child in adjacency.GetValueOrDefault(current, new List<string>()))
+            {
+                if (!visited.Add(child))
+                {
+                    continue;
+                }
+
+                if (child.Equals(nodeId, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+
+                queue.Enqueue(child);
+            }
+        }
+
+        return false;
+    }
+
+    private static Dictionary<string, object?> BuildMapPathOptionsSummary(
+        List<Dictionary<string, object?>> availableNextNodes,
+        Dictionary<string, object?> fullGraph)
+    {
+        List<Dictionary<string, object?>> nodes = ReadDictionaryList(fullGraph, "nodes");
+        Dictionary<string, List<string>> adjacency = BuildAdjacency(nodes);
+        Dictionary<string, Dictionary<string, object?>> nodeById = nodes
+            .Select(node => (Id: ReadDictionaryString(node, "node_id"), Node: node))
+            .Where(pair => !string.IsNullOrWhiteSpace(pair.Id))
+            .ToDictionary(pair => pair.Id!, pair => pair.Node, StringComparer.Ordinal);
+
+        List<Dictionary<string, object?>> options = new();
+        foreach (Dictionary<string, object?> nextNode in availableNextNodes)
+        {
+            string? startId = ReadDictionaryString(nextNode, "node_id");
+            if (string.IsNullOrWhiteSpace(startId))
+            {
+                continue;
+            }
+
+            List<List<string>> paths = EnumerateMapPaths(startId, adjacency, 24, 64);
+            options.Add(new Dictionary<string, object?>
+            {
+                ["start_node_id"] = startId,
+                ["start_room_type"] = ReadDictionaryString(nextNode, "room_type"),
+                ["path_count_sampled"] = paths.Count,
+                ["reachable_room_counts"] = CountReachableRooms(startId, adjacency, nodeById),
+                ["sample_paths"] = paths.Take(8).Select(path => BuildPathSummary(path, nodeById)).ToList()
+            });
+        }
+
+        return new Dictionary<string, object?>
+        {
+            ["options"] = options,
+            ["note"] = "각 start_node_id는 지금 바로 선택 가능한 다음 노드이며, sample_paths는 해당 노드 이후 스테이지 끝까지 이어지는 대표 경로입니다."
+        };
+    }
+
+    private static Dictionary<string, List<string>> BuildAdjacency(List<Dictionary<string, object?>> nodes)
+    {
+        Dictionary<string, List<string>> adjacency = new(StringComparer.Ordinal);
+        foreach (Dictionary<string, object?> node in nodes)
+        {
+            string? nodeId = ReadDictionaryString(node, "node_id");
+            if (string.IsNullOrWhiteSpace(nodeId))
+            {
+                continue;
+            }
+
+            adjacency[nodeId] = ReadDictionaryStringList(node, "child_node_ids")
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+        }
+
+        return adjacency;
+    }
+
+    private static List<List<string>> EnumerateMapPaths(string startNodeId, Dictionary<string, List<string>> adjacency, int maxDepth, int maxPaths)
+    {
+        List<List<string>> paths = new();
+        void Walk(string nodeId, List<string> path)
+        {
+            if (paths.Count >= maxPaths || path.Count >= maxDepth)
+            {
+                paths.Add(path.ToList());
+                return;
+            }
+
+            List<string> children = adjacency.GetValueOrDefault(nodeId, new List<string>());
+            if (children.Count == 0)
+            {
+                paths.Add(path.ToList());
+                return;
+            }
+
+            foreach (string child in children)
+            {
+                if (path.Contains(child, StringComparer.Ordinal))
+                {
+                    continue;
+                }
+
+                path.Add(child);
+                Walk(child, path);
+                path.RemoveAt(path.Count - 1);
+                if (paths.Count >= maxPaths)
+                {
+                    return;
+                }
+            }
+        }
+
+        Walk(startNodeId, new List<string> { startNodeId });
+        return paths;
+    }
+
+    private static Dictionary<string, object?> BuildPathSummary(List<string> path, Dictionary<string, Dictionary<string, object?>> nodeById)
+    {
+        List<string> roomTypes = path
+            .Select(nodeId => nodeById.TryGetValue(nodeId, out Dictionary<string, object?>? node)
+                ? ReadDictionaryString(node, "room_type") ?? "unknown"
+                : "unknown")
+            .ToList();
+        return new Dictionary<string, object?>
+        {
+            ["node_ids"] = path,
+            ["room_types"] = roomTypes,
+            ["room_counts"] = CountRoomTypes(roomTypes),
+            ["length"] = path.Count
+        };
+    }
+
+    private static Dictionary<string, object?> CountReachableRooms(string startId, Dictionary<string, List<string>> adjacency, Dictionary<string, Dictionary<string, object?>> nodeById)
+    {
+        Queue<string> queue = new(new[] { startId });
+        HashSet<string> visited = new(StringComparer.Ordinal) { startId };
+        List<string> roomTypes = new();
+        while (queue.Count > 0)
+        {
+            string nodeId = queue.Dequeue();
+            if (nodeById.TryGetValue(nodeId, out Dictionary<string, object?>? node))
+            {
+                roomTypes.Add(ReadDictionaryString(node, "room_type") ?? "unknown");
+            }
+
+            foreach (string child in adjacency.GetValueOrDefault(nodeId, new List<string>()))
+            {
+                if (visited.Add(child))
+                {
+                    queue.Enqueue(child);
+                }
+            }
+        }
+
+        return CountRoomTypes(roomTypes);
+    }
+
+    private static Dictionary<string, object?> CountRoomTypes(IEnumerable<string> roomTypes)
+    {
+        return roomTypes
+            .GroupBy(roomType => string.IsNullOrWhiteSpace(roomType) ? "unknown" : roomType)
+            .ToDictionary(group => group.Key, group => (object?)group.Count(), StringComparer.Ordinal);
     }
 
     private static Dictionary<string, object?> BuildMapPointSummary(object? point, object? node)
@@ -3803,16 +4524,24 @@ internal static class CombatStateExporter
             return $"Enumerable<{type.FullName ?? type.Name}> count_sample={count}";
         }
 
-        string? text = ReadObjectString(value);
-        return string.IsNullOrWhiteSpace(text)
-            ? type.FullName ?? type.Name
-            : text;
+        try
+        {
+            string? text = ReadObjectString(value);
+            return string.IsNullOrWhiteSpace(text)
+                ? type.FullName ?? type.Name
+                : text;
+        }
+        catch (Exception exception)
+        {
+            string typeName = type.FullName ?? type.Name;
+            return $"{typeName} [debug_string_unavailable:{exception.GetType().Name}]";
+        }
     }
 
     private static string ComputeStateFingerprint(Dictionary<string, object?> state)
     {
         Dictionary<string, object?> comparableState = state
-            .Where(pair => pair.Key is not ("state_id" or "exported_at_ms" or "debug"))
+            .Where(pair => pair.Key is not ("state_id" or "exported_at_ms" or "debug" or "runtime_phase"))
             .ToDictionary(pair => pair.Key, pair => pair.Value);
         Dictionary<string, object?> safeComparableState = NormalizeStateForJson(comparableState, "combat_state_fingerprint");
         string json = JsonSerializer.Serialize(safeComparableState, JsonOptions);
@@ -3965,6 +4694,7 @@ internal static class CombatStateExporter
             ["hp"] = ReadFirstInt(new[] { player, recentPlayer, runtimeCreature }, "hp", "_hp", "currentHp", "_currentHp", "currentHealth", "_currentHealth", "health", "_health"),
             ["max_hp"] = ReadFirstInt(new[] { player, recentPlayer, runtimeCreature }, "maxHp", "_maxHp", "maxHealth", "_maxHealth"),
             ["block"] = ReadFirstInt(new[] { player, recentPlayer, runtimeCreature }, "block", "_block", "currentBlock", "_currentBlock", "shield", "_shield"),
+            ["combat_id"] = ReadFirstInt(new[] { runtimeCreature, player, recentPlayer }, "CombatId", "combatId", "_combatId"),
             ["energy"] = ReadFirstInt(new[] { playerCombatState, player, recentPlayer }, "energy", "_energy", "currentEnergy", "_currentEnergy"),
             ["max_energy"] = ReadFirstInt(new[] { playerCombatState, player, recentPlayer }, "maxEnergy", "_maxEnergy", "energyMax", "_energyMax"),
             ["gold"] = ReadFirstInt(new[] { player, recentPlayer }, "gold", "_gold", "currentGold", "_currentGold"),
@@ -4059,14 +4789,20 @@ internal static class CombatStateExporter
         }
 
         string? targetType = ReadFirstString(new[] { source }, "TargetType", "targetType", "_targetType", "Target", "target", "_target");
+        string targetKind = ResolvePotionTargetKind(targetType);
         bool requiresTarget = PotionRequiresTarget(targetType);
         bool? isQueued = ReadBool(source, "IsQueued", "isQueued", "_isQueued");
         bool? rawUsable = ReadBool(source, "IsUsable", "isUsable", "_isUsable", "CanUse", "canUse", "_canUse");
+        bool? passesCustomUsabilityCheck = ReadBool(source, "PassesCustomUsabilityCheck", "passesCustomUsabilityCheck", "_passesCustomUsabilityCheck");
+        string? usage = ReadFirstString(new[] { source }, "Usage", "usage", "_usage");
         summary["potion_id"] = summary["id"];
         summary["target_type"] = targetType;
+        summary["target_kind"] = targetKind;
+        summary["usage"] = usage;
         summary["requires_target"] = requiresTarget;
         summary["is_queued"] = isQueued;
-        summary["is_usable_now"] = isQueued == true ? false : rawUsable ?? true;
+        summary["passes_custom_usability_check"] = passesCustomUsabilityCheck;
+        summary["is_usable_now"] = isQueued == true ? false : (rawUsable ?? true) && (passesCustomUsabilityCheck ?? true);
         return summary;
     }
 
@@ -4077,8 +4813,52 @@ internal static class CombatStateExporter
             return false;
         }
 
-        return ContainsAny(targetType, "Enemy", "Target", "Monster", "Creature")
-            && !ContainsAny(targetType, "None", "Self", "Player", "All", "Random");
+        return ResolvePotionTargetKind(targetType) is "self" or "enemy" or "player" or "ally" or "targeted_no_creature";
+    }
+
+    private static string ResolvePotionTargetKind(string? targetType)
+    {
+        if (string.IsNullOrWhiteSpace(targetType))
+        {
+            return "none";
+        }
+
+        if (ContainsAny(targetType, "AllEnemies"))
+        {
+            return "all_enemies";
+        }
+
+        if (ContainsAny(targetType, "AnyEnemy", "Enemy", "Monster"))
+        {
+            return "enemy";
+        }
+
+        if (ContainsAny(targetType, "AnyPlayer", "Player"))
+        {
+            return "player";
+        }
+
+        if (ContainsAny(targetType, "AnyAlly", "Ally"))
+        {
+            return "ally";
+        }
+
+        if (ContainsAny(targetType, "Self"))
+        {
+            return "self";
+        }
+
+        if (ContainsAny(targetType, "TargetedNoCreature"))
+        {
+            return "targeted_no_creature";
+        }
+
+        if (ContainsAny(targetType, "None"))
+        {
+            return "none";
+        }
+
+        return ContainsAny(targetType, "Target", "Creature") ? "enemy" : "none";
     }
 
     private static Dictionary<string, object?> BuildPiles(object combatRoot, object? player, ObjectGraph graph)
@@ -4315,6 +5095,17 @@ internal static class CombatStateExporter
             string cardName = ReadCardName(card, cardModel, cardInfo) ?? fallbackName;
             StableCardIdentity stableIdentity = BuildStableCardIdentity(pileName, index, cardName, card, cardInfo, cardModel);
 
+            int? resolvedCost = TryInvokeInt(energyCost, "GetAmountToSpend")
+                ?? TryInvokeInt(energyCost, "GetResolved")
+                ?? TryInvokeInt(energyCost, "GetWithModifiers", "All")
+                ?? ReadFirstInt(new[] { card, cardModel, cardStats, cardInfo, energyCost }, "cost", "_cost", "currentCost", "_currentCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost", "calculatedEnergy", "_calculatedEnergy", "calculatedEnergyKey", "_calculatedEnergyKey");
+            int? baseCost = ReadInt(energyCost, "Canonical")
+                ?? ReadFirstInt(new[] { card, cardModel, cardStats, cardInfo, energyCost }, "baseCost", "_baseCost", "baseEnergyCost", "_baseEnergyCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost");
+            bool? exportedPlayable = ReadBool(card, "playable", "canPlay", "isPlayable");
+            bool? runtimeCanPlayNoTarget = pileName.Equals("hand", StringComparison.OrdinalIgnoreCase)
+                ? TryInvokeBoolMethod(card, "CanPlayTargeting", new object?[] { null })
+                : null;
+
             cards.Add(new Dictionary<string, object?>
             {
                 ["instance_id"] = stableIdentity.InstanceId,
@@ -4324,10 +5115,11 @@ internal static class CombatStateExporter
                 ["card_id"] = ReadFirstString(new[] { card, cardModel, cardInfo }, "id", "_id", "cardId", "_cardId", "key", "_key") ?? fallbackName,
                 ["name"] = cardName,
                 ["type"] = ReadFirstString(new[] { card, cardModel, cardInfo, cardStats }, "type", "_type", "cardType", "_cardType"),
-                ["cost"] = ReadFirstInt(new[] { card, cardModel, cardStats, cardInfo, energyCost }, "cost", "_cost", "currentCost", "_currentCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost", "calculatedEnergy", "_calculatedEnergy", "calculatedEnergyKey", "_calculatedEnergyKey"),
-                ["base_cost"] = ReadFirstInt(new[] { card, cardModel, cardStats, cardInfo, energyCost }, "baseCost", "_baseCost", "baseEnergyCost", "_baseEnergyCost", "energyCost", "_energyCost", "EnergyCost", "CanonicalEnergyCost", "canonicalEnergyCost", "_canonicalEnergyCost"),
+                ["cost"] = resolvedCost,
+                ["base_cost"] = baseCost,
                 ["upgraded"] = ReadBool(card, "upgraded", "isUpgraded"),
-                ["playable"] = ReadBool(card, "playable", "canPlay", "isPlayable"),
+                ["playable"] = exportedPlayable,
+                ["runtime_can_play_no_target"] = runtimeCanPlayNoTarget,
                 ["target_type"] = ReadFirstString(new[] { card, cardModel, cardInfo, cardStats }, "targetType", "_targetType", "target", "_target", "cardTarget", "_cardTarget"),
                 ["damage"] = damage,
                 ["block"] = block,
@@ -4736,403 +5528,6 @@ internal static class CombatStateExporter
         return ReadObjectString(source);
     }
 
-    private static List<Dictionary<string, object?>> BuildLegalActions(
-        Dictionary<string, object?> piles,
-        List<Dictionary<string, object?>> enemies,
-        Dictionary<string, object?> player)
-    {
-        List<Dictionary<string, object?>> actions = new();
-        List<Dictionary<string, object?>> hand = ReadDictionaryList(piles, "hand");
-        List<Dictionary<string, object?>> liveEnemies = enemies
-            .Where(IsEnemyTargetCandidate)
-            .ToList();
-        int? playerEnergy = ReadDictionaryInt(player, "energy");
-        List<Dictionary<string, object?>> potionSlots = ReadDictionaryList(player, "potion_slots");
-
-        foreach (Dictionary<string, object?> card in hand)
-        {
-            bool? playable = ReadDictionaryBool(card, "playable");
-            if (playable == false)
-            {
-                continue;
-            }
-
-            int? energyCost = ReadDictionaryInt(card, "cost");
-            if (playerEnergy is not null && energyCost is not null && energyCost.Value > playerEnergy.Value)
-            {
-                continue;
-            }
-
-            string cardInstanceId = ReadDictionaryString(card, "instance_id") ?? "hand_unknown";
-            int? combatCardId = ReadDictionaryInt(card, "combat_card_id");
-            string cardName = ReadDictionaryString(card, "name")
-                ?? ReadDictionaryString(card, "card_id")
-                ?? cardInstanceId;
-
-            if (IsAttackCard(card))
-            {
-                foreach (Dictionary<string, object?> enemy in liveEnemies)
-                {
-                    string? targetId = ReadDictionaryString(enemy, "id");
-                    if (string.IsNullOrWhiteSpace(targetId))
-                    {
-                        continue;
-                    }
-
-                    string enemyName = ReadDictionaryString(enemy, "name") ?? targetId;
-                    int? targetCombatId = ReadDictionaryInt(enemy, "combat_id");
-                    actions.Add(CreatePlayCardAction(
-                        $"play_{cardInstanceId}_{targetId}",
-                        card,
-                        cardInstanceId,
-                        combatCardId,
-                        true,
-                        targetId,
-                        targetCombatId,
-                        enemy,
-                        energyCost,
-                        playerEnergy,
-                        playable,
-                        $"Play {cardName} on {enemyName}.",
-                        BuildValidationNote(card, enemy, playerEnergy, energyCost, playable, true)));
-                }
-            }
-            else
-            {
-                actions.Add(CreatePlayCardAction(
-                    $"play_{cardInstanceId}_no_target",
-                    card,
-                    cardInstanceId,
-                    combatCardId,
-                    false,
-                    null,
-                    null,
-                    null,
-                    energyCost,
-                    playerEnergy,
-                    playable,
-                    $"Play {cardName} with no target.",
-                    BuildValidationNote(card, null, playerEnergy, energyCost, playable, false)));
-            }
-        }
-
-        foreach (Dictionary<string, object?> potionSlot in potionSlots)
-        {
-            if (ReadDictionaryBool(potionSlot, "empty") == true)
-            {
-                continue;
-            }
-
-            Dictionary<string, object?>? potion = ReadDictionaryObject(potionSlot, "potion");
-            if (potion is null || ReadDictionaryBool(potion, "is_usable_now") == false)
-            {
-                continue;
-            }
-
-            int? potionSlotIndex = ReadDictionaryInt(potionSlot, "slot_index");
-            if (potionSlotIndex is null)
-            {
-                continue;
-            }
-
-            string potionId = ReadDictionaryString(potion, "potion_id")
-                ?? ReadDictionaryString(potion, "id")
-                ?? $"potion_slot_{potionSlotIndex.Value}";
-            string potionName = ReadDictionaryString(potion, "name") ?? potionId;
-            string? targetType = ReadDictionaryString(potion, "target_type");
-            bool requiresTarget = ReadDictionaryBool(potion, "requires_target") ?? PotionRequiresTarget(targetType);
-
-            if (requiresTarget)
-            {
-                foreach (Dictionary<string, object?> enemy in liveEnemies)
-                {
-                    string? targetId = ReadDictionaryString(enemy, "id");
-                    if (string.IsNullOrWhiteSpace(targetId))
-                    {
-                        continue;
-                    }
-
-                    string enemyName = ReadDictionaryString(enemy, "name") ?? targetId;
-                    int? targetCombatId = ReadDictionaryInt(enemy, "combat_id");
-                    actions.Add(CreateUsePotionAction(
-                        $"use_potion_{potionSlotIndex.Value}_{potionId}_{targetId}",
-                        potionSlotIndex.Value,
-                        potionId,
-                        targetType,
-                        true,
-                        targetId,
-                        targetCombatId,
-                        enemy,
-                        $"Use {potionName} on {enemyName}."));
-                }
-            }
-            else
-            {
-                actions.Add(CreateUsePotionAction(
-                    $"use_potion_{potionSlotIndex.Value}_{potionId}_no_target",
-                    potionSlotIndex.Value,
-                    potionId,
-                    targetType,
-                    false,
-                    null,
-                    null,
-                    null,
-                    $"Use {potionName}."));
-            }
-        }
-
-        actions.Add(new Dictionary<string, object?>
-        {
-            ["action_id"] = "end_turn",
-            ["type"] = "end_turn",
-            ["card_instance_id"] = null,
-            ["target_id"] = null,
-            ["energy_cost"] = null,
-            ["requires_target"] = false,
-            ["execution"] = new Dictionary<string, object?>
-            {
-                ["schema"] = "combat_action_execution.v1",
-                ["checks"] = new Dictionary<string, object?>
-                {
-                    ["runtime_state_rechecked_before_execution"] = true
-                }
-            },
-            ["summary"] = "End the current turn.",
-            ["validation_note"] = "Always generated by exporter; no game action is executed during export."
-        });
-
-        return actions;
-    }
-
-    private static Dictionary<string, object?> CreatePlayCardAction(
-        string actionId,
-        Dictionary<string, object?> card,
-        string cardInstanceId,
-        int? combatCardId,
-        bool requiresTarget,
-        string? targetId,
-        int? targetCombatId,
-        Dictionary<string, object?>? enemy,
-        int? energyCost,
-        int? playerEnergy,
-        bool? playable,
-        string summary,
-        string validationNote)
-    {
-        return new Dictionary<string, object?>
-        {
-            ["action_id"] = SanitizeActionId(actionId),
-            ["type"] = "play_card",
-            ["card_instance_id"] = cardInstanceId,
-            ["combat_card_id"] = combatCardId,
-            ["target_id"] = targetId,
-            ["target_combat_id"] = targetCombatId,
-            ["energy_cost"] = energyCost,
-            ["requires_target"] = requiresTarget,
-            ["execution"] = BuildPlayCardExecutionMetadata(
-                card,
-                cardInstanceId,
-                combatCardId,
-                requiresTarget,
-                targetId,
-                targetCombatId,
-                enemy,
-                energyCost,
-                playerEnergy,
-                playable),
-            ["summary"] = summary,
-            ["validation_note"] = validationNote
-        };
-    }
-
-    private static Dictionary<string, object?> CreateUsePotionAction(
-        string actionId,
-        int potionSlotIndex,
-        string potionId,
-        string? targetType,
-        bool requiresTarget,
-        string? targetId,
-        int? targetCombatId,
-        Dictionary<string, object?>? enemy,
-        string summary)
-    {
-        return new Dictionary<string, object?>
-        {
-            ["action_id"] = SanitizeActionId(actionId),
-            ["type"] = "use_potion",
-            ["potion_slot_index"] = potionSlotIndex,
-            ["potion_id"] = potionId,
-            ["target_type"] = targetType,
-            ["requires_target"] = requiresTarget,
-            ["target_id"] = targetId,
-            ["target_combat_id"] = targetCombatId,
-            ["execution"] = BuildUsePotionExecutionMetadata(
-                potionSlotIndex,
-                potionId,
-                targetType,
-                requiresTarget,
-                targetId,
-                targetCombatId,
-                enemy),
-            ["summary"] = summary,
-            ["validation_note"] = "Runtime validation checks the same potion slot, potion id, target requirement, and target liveness before enqueueing UsePotionAction."
-        };
-    }
-
-    private static Dictionary<string, object?> BuildPlayCardExecutionMetadata(
-        Dictionary<string, object?> card,
-        string cardInstanceId,
-        int? combatCardId,
-        bool requiresTarget,
-        string? targetId,
-        int? targetCombatId,
-        Dictionary<string, object?>? enemy,
-        int? energyCost,
-        int? playerEnergy,
-        bool? playable)
-    {
-        return new Dictionary<string, object?>
-        {
-            ["schema"] = "combat_action_execution.v1",
-            ["card"] = new Dictionary<string, object?>
-            {
-                ["instance_id"] = cardInstanceId,
-                ["combat_card_id"] = combatCardId,
-                ["card_id"] = ReadDictionaryString(card, "card_id"),
-                ["name"] = ReadDictionaryString(card, "name"),
-                ["type"] = ReadDictionaryString(card, "type"),
-                ["cost"] = energyCost,
-                ["playable"] = playable
-            },
-            ["target"] = enemy is null
-                ? null
-                : new Dictionary<string, object?>
-                {
-                    ["id"] = targetId,
-                    ["combat_id"] = targetCombatId,
-                    ["name"] = ReadDictionaryString(enemy, "name"),
-                    ["hp"] = ReadDictionaryInt(enemy, "hp"),
-                    ["block"] = ReadDictionaryInt(enemy, "block")
-                },
-            ["checks"] = new Dictionary<string, object?>
-            {
-                ["requires_target"] = requiresTarget,
-                ["has_target"] = !string.IsNullOrWhiteSpace(targetId),
-                ["energy_cost"] = energyCost,
-                ["player_energy_at_export"] = playerEnergy,
-                ["affordable_at_export"] = playerEnergy is null || energyCost is null || energyCost.Value <= playerEnergy.Value,
-                ["runtime_state_rechecked_before_execution"] = true
-            }
-        };
-    }
-
-    private static Dictionary<string, object?> BuildUsePotionExecutionMetadata(
-        int potionSlotIndex,
-        string potionId,
-        string? targetType,
-        bool requiresTarget,
-        string? targetId,
-        int? targetCombatId,
-        Dictionary<string, object?>? enemy)
-    {
-        return new Dictionary<string, object?>
-        {
-            ["schema"] = "combat_action_execution.v1",
-            ["potion"] = new Dictionary<string, object?>
-            {
-                ["slot_index"] = potionSlotIndex,
-                ["potion_id"] = potionId,
-                ["target_type"] = targetType
-            },
-            ["target"] = enemy is null
-                ? null
-                : new Dictionary<string, object?>
-                {
-                    ["id"] = targetId,
-                    ["combat_id"] = targetCombatId,
-                    ["name"] = ReadDictionaryString(enemy, "name"),
-                    ["hp"] = ReadDictionaryInt(enemy, "hp"),
-                    ["block"] = ReadDictionaryInt(enemy, "block")
-                },
-            ["checks"] = new Dictionary<string, object?>
-            {
-                ["requires_target"] = requiresTarget,
-                ["has_target"] = !string.IsNullOrWhiteSpace(targetId),
-                ["runtime_state_rechecked_before_execution"] = true
-            }
-        };
-    }
-
-    private static string BuildValidationNote(
-        Dictionary<string, object?> card,
-        Dictionary<string, object?>? enemy,
-        int? playerEnergy,
-        int? energyCost,
-        bool? playable,
-        bool requiresTarget)
-    {
-        List<string> notes = new() { "Heuristic candidate generated from exported combat_state.v1 fields." };
-
-        if (playable is null)
-        {
-            notes.Add("Card playable flag was unavailable; runtime validation is still required.");
-        }
-
-        if (energyCost is null)
-        {
-            notes.Add("Card cost was unavailable; energy validation was not finalized.");
-        }
-        else if (playerEnergy is null)
-        {
-            notes.Add("Player energy was unavailable; energy validation was not finalized.");
-        }
-
-        if (requiresTarget && enemy is not null && ReadDictionaryInt(enemy, "hp") is null)
-        {
-            notes.Add("Enemy hp was unavailable; target is inferred from the current enemy list.");
-        }
-
-        if (!requiresTarget)
-        {
-            string? cardType = ReadDictionaryString(card, "type");
-            if (string.IsNullOrWhiteSpace(cardType))
-            {
-                notes.Add("Card type was unavailable; no-target play is conservative and must be rechecked before execution.");
-            }
-            else if (IsSkillOrPowerCard(card))
-            {
-                notes.Add("Skill/power target requirement is not fully known; no-target play is a safe candidate only.");
-            }
-            else
-            {
-                notes.Add("Non-attack card target requirement is not fully known; no-target play is a safe candidate only.");
-            }
-        }
-
-        return string.Join(" ", notes);
-    }
-
-    private static bool IsEnemyTargetCandidate(Dictionary<string, object?> enemy)
-    {
-        int? hp = ReadDictionaryInt(enemy, "hp");
-        return hp is null || hp.Value > 0;
-    }
-
-    private static bool IsAttackCard(Dictionary<string, object?> card)
-    {
-        string? cardType = ReadDictionaryString(card, "type");
-        return !string.IsNullOrWhiteSpace(cardType)
-            && cardType.Contains("attack", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsSkillOrPowerCard(Dictionary<string, object?> card)
-    {
-        string? cardType = ReadDictionaryString(card, "type");
-        return !string.IsNullOrWhiteSpace(cardType)
-            && (cardType.Contains("skill", StringComparison.OrdinalIgnoreCase)
-                || cardType.Contains("power", StringComparison.OrdinalIgnoreCase));
-    }
-
     private static string SanitizeActionId(string actionId)
     {
         char[] chars = actionId.Select(character =>
@@ -5290,6 +5685,34 @@ internal static class CombatStateExporter
         }
 
         return value as List<Dictionary<string, object?>> ?? new List<Dictionary<string, object?>>();
+    }
+
+    private static List<string> ReadDictionaryStringList(Dictionary<string, object?> source, string key)
+    {
+        if (!source.TryGetValue(key, out object? value) || value is null)
+        {
+            return new List<string>();
+        }
+
+        if (value is List<string> stringList)
+        {
+            return stringList;
+        }
+
+        if (value is IEnumerable enumerable && value is not string)
+        {
+            return enumerable
+                .Cast<object?>()
+                .Select(item => item?.ToString())
+                .Where(text => !string.IsNullOrWhiteSpace(text))
+                .Cast<string>()
+                .ToList();
+        }
+
+        string? singleValue = value.ToString();
+        return string.IsNullOrWhiteSpace(singleValue)
+            ? new List<string>()
+            : new List<string> { singleValue };
     }
 
     private static string? ReadDictionaryString(Dictionary<string, object?> source, string key)
@@ -5982,6 +6405,12 @@ internal static class CombatStateExporter
         return value is bool result ? result : null;
     }
 
+    private static bool? TryInvokeBoolMethod(object? source, string methodName, params object?[] args)
+    {
+        object? value = TryInvokeMethod(source, methodName, args);
+        return value is bool result ? result : null;
+    }
+
     private static object? TryInvokeMethod(object? source, MethodInfo method, params object?[] args)
     {
         if (source is null)
@@ -6208,11 +6637,18 @@ internal static class CombatStateExporter
             return nestedText;
         }
 
-        string? text = value.ToString();
-        string typeName = value.GetType().FullName ?? value.GetType().Name;
-        return string.Equals(text, typeName, StringComparison.Ordinal)
-            ? null
-            : text;
+        try
+        {
+            string? text = value.ToString();
+            string typeName = value.GetType().FullName ?? value.GetType().Name;
+            return string.Equals(text, typeName, StringComparison.Ordinal)
+                ? null
+                : text;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static string? ReadNestedStringValue(object value)
@@ -6478,4 +6914,10 @@ internal static class CombatStateExporter
         uint? CombatCardId,
         string Source,
         string FallbackInstanceId);
+
+    private sealed record CardSelectionSourceHint(
+        string? CardId,
+        string? CardName,
+        bool? Upgraded,
+        long ObservedAtMs);
 }
