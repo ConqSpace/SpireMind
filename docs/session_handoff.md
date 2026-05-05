@@ -1,334 +1,385 @@
 # 세션 인수인계서
 
-마지막 갱신: 2026-05-02
+마지막 갱신: 2026-05-05
 
 ## 1. 현재 목표
 
-SpireMind는 Slay the Spire 2를 AI가 직접 플레이하게 만드는 실험용 모드다.
+SpireMind는 Slay the Spire 2를 LLM이 직접 플레이할 수 있도록 게임 상태를 안정적으로 내보내고, LLM이 선택 가능한 행동만 제출하도록 만드는 어댑터 프로젝트다.
 
-현재 핵심 목표는 휴리스틱을 똑똑하게 만드는 것이 아니다. LLM이 게임 상태를 관찰하고, 가능한 행동을 선택하고, 그 행동 결과를 검증할 수 있는 어댑터를 만드는 것이다.
+이번 작업의 핵심 목표는 “잘하는 휴리스틱 AI”가 아니라 “LLM이 판단할 수 있는 충분한 상태와 합법 행동을 제공하는 어댑터”다. 위험 판단, 카드 가치 판단, 경로 판단은 LLM의 몫으로 두고, 어댑터는 다음 책임에 집중한다.
 
-중요한 명명 규칙:
+- 현재 화면과 게임 상태를 안정적으로 구분한다.
+- 불안정한 중간 상태를 LLM에 노출하지 않는다.
+- 실제 게임이 받을 수 있는 합법 행동만 `legal_actions`로 노출한다.
+- 행동 실행 후 실제 상태 변화가 관찰될 때만 성공으로 보고한다.
+- 카드 선택, 보상, 상점, 이벤트, 지도, 전투, 포션 흐름을 좌표 클릭이 아니라 내부 실행 경로로 처리한다.
 
-- 프로젝트 이름, 변수명, 문서에서 `benchmark` 또는 `벤치마크`라는 표현을 쓰지 않는다.
-- 대신 `실험`, `실행 기록`, `시나리오`, `run record`, `play session` 같은 표현을 쓴다.
-- AI 판단기 입력에도 평가 환경임을 직접 암시하는 표현을 넣지 않는다.
+## 2. 현재 깃 상태
 
-## 2. 새 세션에서 먼저 읽을 문서
-
-다음 스레드는 아래 순서로 문서를 읽으면 된다.
-
-1. `docs/session_handoff.md`
-   - 현재 상태, 남은 문제, 실행 절차를 확인한다.
-2. `docs/adapter_design_notes.md`
-   - LLM 조작 가능 어댑터의 설계 방향을 확인한다.
-3. `docs/adapter_implementation_roadmap.md`
-   - 실제 개발 순서와 남은 작업을 확인한다.
-4. `docs/ai_teammate_gap_roadmap.md`
-   - AI Teammate 레퍼런스와 우리 프로젝트의 차이를 확인한다.
-5. `docs/action_schema.md`
-   - `legal_actions`와 action payload 구조를 확인한다.
-6. `docs/action_execution_design.md`
-   - action claim, 실행, 결과 보고 흐름을 확인한다.
-7. `docs/state_schema.md`
-   - 상태 JSON의 큰 구조를 확인한다.
-8. `docs/run_memory_logging.md`
-   - 실행 기록과 이벤트 로그가 남는 방식을 확인한다.
-9. `docs/game_launch_guide.md`
-   - 게임 실행, 모드 배포, 고정 시드 시작 절차를 확인한다.
-
-상점 작업을 이어갈 때는 `data/sts2_knowledge/action_flows.json`도 함께 확인한다. 이 파일은 상점 행동 절차처럼 매번 프롬프트에 넣지 않을 문맥을 저장하는 용도다.
-
-## 3. 레퍼런스 위치
-
-AI Teammate 원본 모드:
-
-- `sts2AITeammate-default-366-1-2-5-1776564401/sts2AITeammate.dll`
-- `sts2AITeammate-default-366-1-2-5-1776564401/sts2AITeammate.json`
-- `sts2AITeammate-default-366-1-2-5-1776564401/config/ai-behavior/*.aiconfig`
-
-AI Teammate 디컴파일 결과:
-
-- `artifacts/ai_teammate_decompiled/AITeammate.Scripts`
-
-특히 다시 볼 파일:
-
-- 이벤트 관찰과 선택:
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/EventRuntimeLocator.cs`
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/EventSnapshotBuilder.cs`
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/EventPlanner.cs`
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/EventHandlerRegistry.cs`
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/*EventHandler.cs`
-- 상점:
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/ShopRuntimeLocator.cs`
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/ShopSnapshotBuilder.cs`
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/ShopInventoryResolver.cs`
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/ShopPlanner.cs`
-- 보물, 지도:
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/AiTeammateMapAndTreasurePatches.cs`
-- 모닥불:
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/AiTeammateRestSitePatches.cs`
-- 카드 선택:
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/AiTeammateCardSelectionPatches.cs`
-- 보상:
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/AiTeammateRewardPatches.cs`
-- 전투:
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/AiTeammateCombatTurnPatches.cs`
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/CombatTurnLinePlanner.cs`
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/CombatActionScorer.cs`
-- 포션:
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/PotionHeuristicEvaluator.cs`
-  - `artifacts/ai_teammate_decompiled/AITeammate.Scripts/PotionMetadataBuilder.cs`
-
-게임 원본 디컴파일 결과:
-
-- `artifacts/decompiled/sts2`
-
-방, 지도, 보물, 자동 실행 레퍼런스를 볼 때 우선 확인할 위치:
-
-- `artifacts/decompiled/sts2/MegaCrit.Sts2.Core.AutoSlay`
-- `artifacts/decompiled/sts2/MegaCrit.Sts2.Core.AutoSlay.Handlers`
-- `artifacts/decompiled/sts2/MegaCrit.Sts2.Core.Map`
-- `artifacts/decompiled/sts2/MegaCrit.Sts2.Core.Rooms`
-- `artifacts/decompiled/sts2/MegaCrit.Sts2.Core.Rewards`
-- `artifacts/decompiled/sts2/MegaCrit.Sts2.Core.Screens`
-- `artifacts/decompiled/sts2/MegaCrit.Sts2.Core.Saves.Runs`
-
-## 4. 프로젝트 폴더 구조
-
-주요 폴더:
-
-- `src/SpireMindMod`
-  - STS2 안에서 실행되는 C# 모드 코드.
-- `bridge`
-  - Node 기반 브리지 서버와 의사결정 루프.
-- `scripts`
-  - 빌드, 배포, 실행 확인, Codex 판단기 스크립트.
-- `docs`
-  - 설계 문서와 작업 로드맵.
-- `data/sts2_knowledge`
-  - LLM 또는 휴리스틱이 필요할 때 참고할 절차형 지식.
-- `artifacts/decompiled/sts2`
-  - STS2 원본 디컴파일 참고 자료.
-- `artifacts/ai_teammate_decompiled`
-  - AI Teammate 모드 디컴파일 참고 자료.
-- `sts2AITeammate-default-366-1-2-5-1776564401`
-  - 사용자가 가져온 AI Teammate 원본 모드.
-- `artifacts/verify-mods`
-  - 배포 확인용 모드 산출물.
-
-핵심 파일:
-
-- `src/SpireMindMod/CombatStateExporter.cs`
-  - 현재 게임 상태와 `legal_actions`를 JSON으로 추출한다.
-- `src/SpireMindMod/CombatActionExecutor.cs`
-  - 브리지에서 claim한 행동을 실제 게임에 적용한다.
-- `src/SpireMindMod/CombatActionBridgeClient.cs`
-  - 게임과 브리지 서버 사이의 action claim/result 통신을 담당한다.
-- `src/SpireMindMod/CombatActionRuntimeContext.cs`
-  - 실행기가 필요한 런타임 문맥을 저장한다.
-- `src/SpireMindMod/AutotestMainThreadTicker.cs`
-  - Godot 메인 스레드에서 상태 추출과 행동 실행을 호출한다.
-- `bridge/spiremind_bridge.js`
-  - 상태 수신, action 제출, action 결과 기록, 실행 로그 생성을 담당한다.
-- `bridge/spiremind_decision_loop.js`
-  - 현재 휴리스틱 의사결정 루프.
-- `scripts/codex_decider.js`
-  - Codex 판단기 연결 지점.
-- `scripts/deploy_mod.ps1`
-  - Release DLL을 게임 모드 폴더로 배포한다.
-
-## 5. 현재 실행 상태
-
-사용자가 게임을 직접 종료했다.
-
-브리지는 종료하지 않았다고 했다. 따라서 다음 세션에서는 브리지가 아직 떠 있을 수 있다. 다만 게임이 꺼졌기 때문에 `/health`가 살아 있어도 최신 게임 상태가 아닐 수 있다.
-
-마지막으로 확인된 브리지 run directory 예시:
-
-- `%APPDATA%\SlayTheSpire2\SpireMind\bridge_runs\20260502_232256_161_39080_ccc693`
-
-새 세션에서는 먼저 다음을 확인한다.
-
-```powershell
-git status --short --branch
-git diff --stat
-Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:17832/health" -TimeoutSec 2
-Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:17832/state/current" -TimeoutSec 2
-Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:17832/action/latest" -TimeoutSec 2
-```
-
-브리지가 오래 떠 있으면 새 코드가 반영되지 않았을 수 있다. 코드 변경 뒤 테스트하려면 브리지와 게임을 모두 새로 시작하는 편이 안전하다.
-
-## 6. 현재 작업 트리 상태
-
-현재 브랜치:
+브랜치:
 
 - `codex/adapter-roadmap-work`
 
-현재 커밋되지 않은 파일:
+원격:
 
+- `origin/codex/adapter-roadmap-work`에 푸시 완료
+
+최근 커밋:
+
+- `3c0d6df Remove bundled AI teammate reference dump`
+  - `sts2AITeammate-default-366-1-2-5-1776564401` 폴더를 깃 추적에서 제거했다.
+  - 로컬 파일은 남겼고, `.gitignore`에 추가해 재추적을 막았다.
+- `b095884 Implement LLM adapter legal actions`
+  - 이번 세션의 주요 어댑터 구현을 묶은 커밋이다.
+
+현재 작업 트리:
+
+- 코드/문서는 커밋 및 푸시 완료.
+- `logs/`만 미추적 상태로 남아 있다. 실행 산출물이므로 커밋하지 않는 것이 맞다.
+
+## 3. 현재 실행 상태
+
+사용자 요청에 따라 실행 중이던 프로세스를 종료했다.
+
+종료한 대상:
+
+- Slay the Spire 2 게임 프로세스
 - `bridge/spiremind_bridge.js`
-- `src/SpireMindMod/CombatActionExecutor.cs`
+- `scripts/spiremind_agent_daemon.js`
+- 남아 있던 이 프로젝트 관련 Node 프로세스
+
+현재는 게임과 브리지가 꺼져 있어야 한다. 다음 세션 시작 시 먼저 확인한다.
+
+```powershell
+Get-CimInstance Win32_Process |
+  Where-Object {
+    $_.Name -eq 'SlayTheSpire2.exe' -or
+    (($_.Name -eq 'node.exe') -and ($_.CommandLine -match 'STSAutoplay|spiremind_bridge|spiremind_agent_daemon'))
+  } |
+  Select-Object ProcessId,Name,CommandLine
+```
+
+## 4. 이번 세션에서 구현한 핵심 내용
+
+### 전투 상태와 합법 행동
+
+주요 파일:
+
 - `src/SpireMindMod/CombatStateExporter.cs`
+- `src/SpireMindMod/CombatLegalActionBuilder.cs`
+- `src/SpireMindMod/CombatSnapshotBuilder.cs`
+- `src/SpireMindMod/RuntimePhaseResolver.cs`
 
-마지막 diff 규모:
+구현 내용:
 
-- `bridge/spiremind_bridge.js`: action 결과와 다음 상태 연결, 상태 변화 기록 확장.
-- `src/SpireMindMod/CombatActionExecutor.cs`: 지도 이동 비동기 완료 판정, 전투 행동 결과 검증.
-- `src/SpireMindMod/CombatStateExporter.cs`: 전투와 이벤트 action execution 메타데이터, event fingerprint 추가.
+- 전투 상태 스냅샷 생성을 분리했다.
+- 카드 비용은 표시값이 아니라 런타임에서 실제 변경된 비용을 읽도록 보강했다.
+- `runtime_can_play_no_target`를 추가해 실제 `CanPlayTargeting(null)` 기준으로 무대상 카드 사용 가능 여부를 반영했다.
+- `연무`처럼 “이번 턴 스킬 1장만 사용 가능” 상태에서 손패 카드가 보이더라도 실제로 못 쓰는 카드는 합법 행동에서 제외했다.
+- 전투 중인데 화면 루트가 지도/보상/이벤트처럼 보이는 불안정한 중간 export를 차단했다.
+- 전투 진입 직후 손패가 빈 배열이거나 `end_turn`만 보이는 중간 상태를 LLM에 노출하지 않도록 막았다.
 
-주의:
+### 행동 실행과 결과 검증
 
-- 이 변경들은 되돌리지 않는다.
-- 다음 세션에서 먼저 빌드와 문법 검사를 통과시킨 뒤 커밋한다.
+주요 파일:
 
-## 7. 이번 세션에서 완료한 작업
+- `src/SpireMindMod/CombatActionExecutor.cs`
+- `src/SpireMindMod/CombatActionRuntimeContext.cs`
+- `src/SpireMindMod/CombatActionBridgeClient.cs`
+- `bridge/spiremind_bridge.js`
 
-상점:
+구현 내용:
 
-- 상점에서 카드, 유물, 포션, 카드 제거 행동을 LLM이 판단할 수 있도록 관찰 및 행동 지원을 확장했다.
-- `cancel_card_selection`을 추가했다.
-- 포션 슬롯 제한 검증을 추가했다.
-- 상점 행동 절차 메타데이터 JSON을 추가했다.
-- 상점 방문 중 행동 기록을 추가했다.
-- 유물과 포션 설명 추출을 안정화했다.
-- 상점 유물 아이콘 문제는 “지도 노드 아이콘”이 아니라 “상점 판매 유물 아이콘이 상태에서 비어 보이는 문제”로 정정했다.
+- `play_card`, `use_potion`, `end_turn`, 보상 수령, 지도 이동, 이벤트 선택, 상점 구매, 카드 선택 등을 claim/result 구조로 처리한다.
+- 행동 입력이 들어갔다는 사실만으로 성공 처리하지 않는다.
+- 손패 수, 에너지, 방어도, 대상 체력, 포션 슬롯, 골드, 화면 전환 등 실제 변화가 관찰되어야 `applied`로 본다.
+- 실패, 미지원, 무효, 오래된 상태는 같은 상태에서 다시 판단할 수 있도록 데몬 쪽 재시도 정책을 보강했다.
+- `dismiss_game_over`, `continue_run`, `start_new_run` 등 메인 메뉴/게임오버 행동도 지원 목록에 포함했다.
 
-보물:
+### 카드 후속 선택
 
-- 보물상자 열기 action을 추가했다.
-- 보물 유물 획득과 진행 action을 추가했다.
-- 관련 커밋:
-  - `aa4954d Add treasure chest open action`
-  - `3d968dd Handle treasure relic pickup and proceed`
+주요 파일:
 
-지도:
+- `src/SpireMindMod/AdapterCardSelectionBridge.cs`
+- `src/SpireMindMod/CardSelectCmdHarmonyPatch.cs`
+- `data/sts2_knowledge/card_selection_flows.json`
+- `docs/card_selection_bridge_design.md`
 
-- 지도 노드 클릭 뒤 `Thread.Sleep`으로 기다리던 구조를 제거했다.
-- `RoomEntered` 이벤트와 상태 전환을 비동기로 관찰해 완료를 판정하도록 바꿨다.
-- 목적은 “실제로 이동했는데 action 결과만 failed로 찍히는 문제”를 줄이는 것이다.
+구현 내용:
 
-전투:
+- `전투장비`, `박치기`, `지옥검`, `짓밟기` 등 후속 조작 또는 비용 변화가 있는 카드 흐름을 조사했다.
+- UI 카드 플레이와 같은 내부 실행 경로를 쓰는 방향으로 설계를 바꿨다.
+- 카드가 후속 카드 선택을 열면 `adapter_card_selection` phase로 export한다.
+- LLM은 선택 가능한 카드 후보를 보고 `choose_card_selection`을 제출한다.
+- 선택 완료 후 원래 `play_card`는 중간 대기 상태로 남지 않고 정상적으로 완료 처리된다.
 
-- `legal_actions[].execution` 메타데이터를 추가했다.
-- `play_card`, `use_potion`, `end_turn`에 실행 전 검증값을 붙였다.
-- 전투 행동은 입력 성공만으로 `applied` 처리하지 않는다.
-- 손패 수, 에너지, 대상 체력, 포션 상태처럼 실제 상태 변화가 관찰될 때 `applied`로 처리한다.
-- 상태 변화가 제한 시간 안에 없으면 `failed`로 처리한다.
+### 포션
 
-이벤트:
+주요 파일:
 
-- 이벤트 전체 fingerprint와 옵션별 fingerprint를 추가했다.
-- 이벤트 legal action에 `event_action_execution.v1` 메타데이터를 붙였다.
-- 옵션 index, 잠김 여부, 실행 전 재검증 정보를 포함했다.
+- `src/SpireMindMod/CombatActionExecutor.cs`
+- `docs/potion_reference_logic_review.md`
 
-브리지:
+구현 내용:
 
-- action 제출 시 `pre_action_state_summary`를 저장한다.
-- action 결과가 보고된 뒤 다음 상태를 받으면 `post_result_state_summary`와 `state_delta`를 계산한다.
-- `action_state_observed` 이벤트를 `events.jsonl`에 기록한다.
+- 포션은 인벤토리에 있을 때만 `legal_actions`로 노출한다.
+- 포션 슬롯이 가득 찬 보상에서는 “받을 포션 / 버릴 포션” 흐름을 합법 행동으로 노출한다.
+- 포션 사용은 게임 내부 포션 사용 경로를 기준으로 보강했다.
+- 비용 감소 또는 카드 선택이 이어지는 포션은 후속 선택 흐름과 연결되도록 처리했다.
 
-## 8. 검증한 내용
+### 보상
 
-통과한 명령:
+주요 파일:
+
+- `src/SpireMindMod/CombatStateExporter.cs`
+- `src/SpireMindMod/CombatActionExecutor.cs`
+
+구현 내용:
+
+- 카드 보상은 `reward_type + model_id + index` 기준으로 안정 ID를 보강했다.
+- 골드, 유물, 포션, 카드 보상 선택 및 넘기기를 각각 합법 행동으로 노출한다.
+- 게임오버 이후 보상/메뉴 전환도 `dismiss_game_over`로 처리한다.
+
+### 상점
+
+주요 파일:
+
+- `src/SpireMindMod/ShopRuntimeLocator.cs`
+- `src/SpireMindMod/ShopSnapshotBuilder.cs`
+- `src/SpireMindMod/ShopInventorySnapshotBuilder.cs`
+- `src/SpireMindMod/ShopItemCandidateCollector.cs`
+- `src/SpireMindMod/ShopLegalActionBuilder.cs`
+
+구현 내용:
+
+- 상점 화면에서 구매 가능한 카드, 유물, 포션, 카드 제거 행동을 export한다.
+- 보유 골드와 실제 구매 가능 여부를 합법 행동에 반영한다.
+- 상점 나가기 흐름도 지원한다.
+
+### 이벤트
+
+주요 파일:
+
+- `src/SpireMindMod/EventOutcomeInterpreter.cs`
+- `src/SpireMindMod/EventOutcomeInterpreterClearEvents.cs`
+- `src/SpireMindMod/EventOutcomeInterpreterComplexEvents.cs`
+- `src/SpireMindMod/EventOutcomeInterpreterVariedEvents.cs`
+
+구현 내용:
+
+- 이벤트 선택지에 안정 ID, fingerprint, 알려진 결과 요약을 붙인다.
+- 위험 여부는 LLM이 판단하도록 두고, 어댑터는 선택지와 알려진 변화만 제공한다.
+- 선택 직후 버튼이 비활성화되지만 전투 전환이 끝나지 않은 이벤트는 `continue_chosen_event_option` 형태로 다시 진행할 수 있게 했다.
+- 실제 확인된 문제: `난타전(EVENT.PUNCH_OFF)`에서 선택지가 `was_chosen=true`, `is_enabled=false`인 상태로 멈췄다. 이를 처리하기 위해 이미 선택된 이벤트 선택지도 전환 계속 행동으로 노출했다.
+
+### 지도
+
+주요 파일:
+
+- `src/SpireMindMod/CombatStateExporter.cs`
+- `src/SpireMindMod/CombatActionExecutor.cs`
+
+구현 내용:
+
+- LLM이 “앞의 몇 칸”만 보는 것이 아니라 해당 스테이지의 전체 지도 연결을 볼 수 있도록 지도 스냅샷을 보강했다.
+- 지도 노드에는 row/column, 자식 연결, 현재 선택 가능 여부가 포함된다.
+
+### 지속 실행 데몬
+
+주요 파일:
+
+- `scripts/spiremind_agent_daemon.js`
+- `docs/persistent_agent_daemon.md`
+- `docs/llm_test_guide.md`
+
+구현 내용:
+
+- 매번 Codex를 새로 띄우는 방식 대신, 앱서버 방식으로 LLM 판단 루프를 계속 돌릴 수 있게 했다.
+- 단순 행동 자동화 정책은 넣지 않았다. 현재 실행은 전부 LLM 판단으로 기록된다.
+- 런 종료 후 사후 리포트를 생성하도록 했다.
+- `run-count`, `max-decisions`, `timeout-ms`, `result-timeout-ms`, `model`, `effort`, `run-log-dir` 옵션을 사용한다.
+
+## 5. 검증 결과
+
+확인한 명령:
 
 ```powershell
-dotnet build .\src\SpireMindMod\SpireMindMod.csproj -c Release
-node --check .\bridge\spiremind_bridge.js
+dotnet build .\src\SpireMindMod\SpireMindMod.csproj
 ```
 
-실제 런에서 확인한 내용:
+결과:
 
-- 카드 사용 action은 상태 변화가 감지되어 `applied`로 기록됐다.
-- 관찰된 변화:
-  - 플레이어 에너지 변화
-  - 손패 수 감소
-  - 선택한 카드가 손패에서 사라짐
-  - 대상 적 체력 변화
-- 포션 사용 action은 큐 입력은 되었지만 상태 변화가 없어 `failed`로 기록됐다.
+- 경고 0개
+- 오류 0개
 
-중요한 해석:
+실전 실행에서 확인한 내용:
 
-- 포션 실패는 새 검증 로직이 의도대로 작동한 결과다.
-- 하지만 포션 실행 경로 자체는 아직 불완전하다. AI Teammate와 STS2 원본 레퍼런스를 다시 확인해야 한다.
+- 메인 메뉴 `continue_run` 정상 처리.
+- 보상 수령, 카드 선택, 포션 수령, 보상 넘기기 정상 처리.
+- 지도 이동과 이벤트 진입 정상 처리.
+- `난타전` 이벤트 전환 문제를 발견하고 수정.
+- 전투 중 카드 사용, 스킬 제한, 후속 카드 선택, 게임오버 처리 정상 동작 확인.
+- LLM 세션에서 15층까지 도달한 런이 있었다.
+- 1차/2차 사후 리포트가 생성됐다.
 
-## 9. 남은 문제와 우선순위
+중요한 관찰:
 
-1. 포션 실행 경로 재조사
-   - 현재 `use_potion`은 입력만 들어가고 실제 상태 변화가 없었다.
-   - `UsePotionAction`, `BeforeUse`, action queue, 대상 지정 흐름을 레퍼런스에서 다시 확인해야 한다.
+- 최근 사망 원인은 어댑터 문제가 아니라 LLM 전략 문제로 보인다.
+- 리포트상 `legal_actions` 위반이나 실행 실패는 핵심 원인이 아니었다.
+- LLM은 체력이 낮은 상황에서도 방어/공격 전환 판단이 미흡했다.
+- 단순히 많은 런을 돌리는 방식은 비교 기준이 흔들린다.
 
-2. 이벤트 실제 화면 검증
-   - fingerprint와 execution 메타데이터는 빌드만 확인했다.
-   - 실제 `?` 방에서 옵션 선택, 후속 카드 선택, 결과 기록까지 검증해야 한다.
+## 6. 다음 검증 설계 방향
 
-3. 지도 이동 재검증
-   - 비동기 완료 판정으로 수정했지만, 다음 노드 이동에서 한 번 더 실측해야 한다.
+사용자 판단:
 
-4. 상점 판매 유물 아이콘/설명 재확인
-   - 유물 상태가 안정적으로 JSON에 나오는지 확인한다.
-   - 아이콘 자체가 필요하면 atlas 또는 texture key를 어떻게 표현할지 별도 판단한다.
+- 검증을 제대로 하려면 시드를 고정하고 플레이해야 한다.
+- 다음 검증 설계는 사용자가 따로 진행한다.
 
-5. 현재 dirty 변경 커밋
-   - 빌드와 문법 검사를 통과한 뒤 커밋한다.
+다음 세션에서 바로 벤치 실행을 이어가지 말 것.
 
-## 10. 배포와 재시작 절차
+권장 기준:
 
-빌드:
+- 같은 시드
+- 같은 캐릭터
+- 같은 모델
+- 같은 prompt/decision 정책
+- 같은 모드 배포본
+- 같은 최대 판단 횟수 또는 같은 종료 조건
+
+이 기준이 없으면 “LLM이 나아졌는지”와 “운이 좋았는지”를 분리하기 어렵다.
+
+## 7. 레퍼런스와 주의 사항
+
+깃에서 제거한 것:
+
+- `sts2AITeammate-default-366-1-2-5-1776564401/`
+
+이 폴더는 로컬에는 남아 있지만 깃 추적에서 제거했고 `.gitignore`에 추가했다. 다시 커밋하지 않는다.
+
+깃에 남긴 레퍼런스 문서/데이터:
+
+- `data/sts2_knowledge/card_selection_flows.json`
+- `docs/ironclad_card_effect_reference.md`
+- `docs/ironclad_card_execution_classification.md`
+- `docs/ironclad_followup_reference_implementation.md`
+- `docs/potion_reference_logic_review.md`
+
+참고용 디컴파일 산출물:
+
+- `artifacts/decompiled/sts2`
+- `artifacts/ai_teammate_decompiled`
+
+이 산출물들은 다음 조사 때 참고하되, 원본 모드 덤프 폴더를 다시 추적하지 않도록 주의한다.
+
+## 8. 다음 세션 시작 절차
+
+1. 상태 확인
 
 ```powershell
-dotnet build .\src\SpireMindMod\SpireMindMod.csproj -c Release
-node --check .\bridge\spiremind_bridge.js
+git status --short --branch
+git log --oneline -5
 ```
 
-배포:
+2. 실행 프로세스 확인
 
 ```powershell
-.\scripts\deploy_mod.ps1 -ModsDir "I:\SteamLibrary\steamapps\common\Slay the Spire 2\mods"
+Get-CimInstance Win32_Process |
+  Where-Object {
+    $_.Name -eq 'SlayTheSpire2.exe' -or
+    (($_.Name -eq 'node.exe') -and ($_.CommandLine -match 'STSAutoplay|spiremind_bridge|spiremind_agent_daemon'))
+  } |
+  Select-Object ProcessId,Name,CommandLine
 ```
 
-브리지 실행:
+3. 빌드 확인
 
 ```powershell
-node .\bridge\spiremind_bridge.js --http-host 127.0.0.1 --http-port 17832
+dotnet build .\src\SpireMindMod\SpireMindMod.csproj
 ```
 
-게임 실행:
+4. 배포
+
+```powershell
+.\scripts\deploy_mod.ps1 -Configuration Debug -ModsDir "I:\SteamLibrary\steamapps\common\Slay the Spire 2\mods" -AlsoDeployAppData
+```
+
+5. 브리지 실행
+
+```powershell
+Start-Process -FilePath "node" -ArgumentList @("bridge\spiremind_bridge.js") -WorkingDirectory "F:\Antigravity\STSAutoplay" -WindowStyle Hidden
+```
+
+6. 게임 실행
+
+반드시 Steam 경로로 실행한다. 직접 exe를 실행하면 Steam 초기화 오류가 난다.
 
 ```powershell
 Start-Process "steam://rungameid/2868840"
 ```
 
-주의:
+## 9. 자주 발생한 문제
 
-- C# 모드 변경은 게임을 재시작해야 반영된다.
-- Node 브리지 변경은 브리지 프로세스를 재시작해야 반영된다.
-- 지금은 게임은 꺼졌고 브리지는 켜져 있을 수 있다.
+### 직접 exe 실행 문제
 
-## 11. 새 세션 첫 지시문
+증상:
 
-새 세션에는 아래처럼 요청하면 된다.
+- Steam 초기화 실패
+- `No appID found`
+
+대응:
+
+- `Start-Process "steam://rungameid/2868840"` 사용.
+
+### 전투 화면인데 `combat_play_phase=false`
+
+의미:
+
+- 화면은 전투처럼 보이지만 게임 런타임이 아직 플레이 가능한 전투 턴으로 확정되지 않았다는 뜻일 수 있다.
+- 중간 export를 그대로 LLM에 주면 손패가 비거나 `end_turn`만 보이는 문제가 생긴다.
+
+현재 대응:
+
+- `RuntimePhaseResolver`와 불안정 export 차단 로직으로 보완했다.
+
+### 카드가 보이지만 실제로 못 쓰는 상황
+
+예시:
+
+- `연무`: 한 턴에 스킬 1장만 사용 가능.
+
+현재 대응:
+
+- `runtime_can_play_no_target`를 기준으로 합법 행동에서 제외한다.
+
+### 이벤트 선택 후 멈춤
+
+예시:
+
+- `난타전(EVENT.PUNCH_OFF)`.
+
+현재 대응:
+
+- 이미 선택된 비활성 선택지도 전환 계속 행동으로 노출한다.
+
+## 10. 다음 작업 후보
+
+사용자가 벤치마크 설계를 따로 하겠다고 했으므로, 다음 작업은 설계가 정해진 뒤 진행한다.
+
+그 전까지 우선순위가 높은 후보:
+
+1. 고정 시드 실행 프로토콜 설계 반영
+2. 앱서버 데몬의 run record 구조 정리
+3. 사후 리포트 인코딩 깨짐 원인 수정
+4. LLM 판단 로그와 상태 스냅샷을 비교하기 쉬운 요약 생성
+5. 포션/후속 카드 선택이 포함된 고정 시드 회귀 테스트 구성
+
+## 11. 다음 세션 첫 메시지 예시
 
 ```text
 F:\Antigravity\STSAutoplay에서 이어서 작업해줘.
-먼저 docs/session_handoff.md를 읽고, git status와 최근 diff를 확인해.
-게임은 꺼져 있고 브리지는 아직 떠 있을 수 있어.
-목표는 휴리스틱 강화가 아니라 LLM이 조작 가능한 어댑터를 완성하는 거야.
-현재 dirty 파일은 bridge/spiremind_bridge.js, src/SpireMindMod/CombatActionExecutor.cs, src/SpireMindMod/CombatStateExporter.cs야.
-우선 빌드와 node 문법 검사를 통과시킨 뒤 커밋하고, 그 다음 포션 실행 경로와 이벤트 실제 화면 검증을 이어가.
-프로젝트와 문서, 변수명에 benchmark/벤치마크라는 표현은 쓰지 마.
-```
-
-## 12. 빠른 확인 명령
-
-```powershell
-git status --short --branch
-git diff --stat
-git diff -- bridge/spiremind_bridge.js src/SpireMindMod/CombatActionExecutor.cs src/SpireMindMod/CombatStateExporter.cs
-dotnet build .\src\SpireMindMod\SpireMindMod.csproj -c Release
-node --check .\bridge\spiremind_bridge.js
-Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:17832/health" -TimeoutSec 2
-Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:17832/state/current" -TimeoutSec 2
-Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:17832/action/latest" -TimeoutSec 2
+먼저 docs/session_handoff.md를 읽고 git status를 확인해.
+게임과 브리지는 현재 꺼져 있어야 해.
+최근 커밋은 3c0d6df이고, sts2AITeammate 원본 덤프 폴더는 깃에서 제거했어.
+다음 검증은 시드 고정 방식으로 설계해야 하니, 무작정 런을 돌리지 말고 먼저 실행 프로토콜을 맞춰.
 ```
