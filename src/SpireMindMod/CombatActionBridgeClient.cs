@@ -34,7 +34,36 @@ internal static class CombatActionBridgeClient
             ExecutorId = "sts2-mod-main",
             ObservedStateId = postedState.StateId,
             ObservedStateVersion = postedState.StateVersion,
-            SupportedActionTypes = new[] { "end_turn" }
+            SupportedActionTypes = new[]
+            {
+                "end_turn",
+                "play_card",
+                "use_potion",
+                "claim_gold_reward",
+                "claim_relic_reward",
+                "claim_potion_reward",
+                "claim_potion_reward_with_discard",
+                "choose_card_reward",
+                "skip_card_reward",
+                "proceed_reward_screen",
+                "choose_map_node",
+                "choose_event_option",
+                "choose_rest_site_option",
+                "proceed_rest_site",
+                "proceed_shop",
+                "open_treasure_chest",
+                "claim_treasure_relic",
+                "choose_treasure_relic",
+                "proceed_treasure",
+                "buy_shop_item",
+                "remove_card_at_shop",
+                "choose_card_selection",
+                "confirm_card_selection",
+                "cancel_card_selection",
+                "continue_run",
+                "start_new_run",
+                "dismiss_game_over"
+            }
         };
 
         return await PostJsonAsync<ActionClaimRequest, ActionClaimResponse>(

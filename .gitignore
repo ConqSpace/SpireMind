@@ -2,6 +2,8 @@
 bin/
 obj/
 artifacts/
+benchmarks/**/runs/
+logs/
 
 # 로컬 사용자 설정
 *.Local.props
@@ -13,3 +15,5 @@ artifacts/
 *.deps.json
 *.runtimeconfig.json
 
+# Local reference mod dumps
+sts2AITeammate-default-366-1-2-5-1776564401/

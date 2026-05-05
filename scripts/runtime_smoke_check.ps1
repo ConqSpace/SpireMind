@@ -18,6 +18,12 @@ one card, and ends the turn. It never clicks, moves the mouse, or sends keys.
 
 .EXAMPLE
 .\scripts\runtime_smoke_check.ps1 -Build -Deploy -LaunchGame -WhatIf
+
+.EXAMPLE
+.\scripts\runtime_smoke_check.ps1 -Build -Deploy -StartBridge -LaunchGame -StartSeededRun -Seed "7MJCUHEB5Q" -ModsDir "I:\SteamLibrary\steamapps\common\Slay the Spire 2\mods"
+
+.EXAMPLE
+.\scripts\runtime_smoke_check.ps1 -StartBridge -StartSeededRun -ForceAbandonRun -Seed "7MJCUHEB5Q"
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
@@ -32,6 +38,15 @@ param(
     [string]$ModsDir = "",
     [string]$PckPath = "",
     [string]$Configuration = "Release",
+    [switch]$StartBridge,
+    [string]$BridgeHost = "127.0.0.1",
+    [int]$BridgePort = 17832,
+    [switch]$StartSeededRun,
+    [switch]$ForceAbandonRun,
+    [string]$Seed = "7MJCUHEB5Q",
+    [string]$CharacterId = "Ironclad",
+    [int]$LaunchWaitSeconds = 25,
+    [int]$CommandWaitSeconds = 180,
     [int]$CheckSeconds = 120,
     [int]$PollSeconds = 5,
     [int]$RecentSeconds = 30
@@ -49,11 +64,20 @@ function Show-SmokeHelp {
     Write-Host "  -LaunchMode  Steam or Exe. Default: Steam"
     Write-Host "               Steam uses steam://rungameid/2868840"
     Write-Host "               Exe starts the executable from -Sts2ExePath or -Sts2Path"
+    Write-Host "  -StartBridge Start the local SpireMind bridge if it is not already healthy"
+    Write-Host "  -StartSeededRun"
+    Write-Host "               Write a start_new_run command for a custom seeded run"
+    Write-Host "  -ForceAbandonRun"
+    Write-Host "               Let start_new_run abandon the in-progress run before starting the seed"
+    Write-Host "  -Seed        Seed used by -StartSeededRun. Default: 7MJCUHEB5Q"
+    Write-Host "  -CharacterId Character used by -StartSeededRun. Default: Ironclad"
     Write-Host "  -WhatIf      Show build/deploy/launch actions without running them"
     Write-Host ""
     Write-Host "Examples:"
     Write-Host '  .\scripts\runtime_smoke_check.ps1 -Build -Deploy -LaunchGame -ModsDir "I:\SteamLibrary\steamapps\common\Slay the Spire 2\mods"'
     Write-Host '  .\scripts\runtime_smoke_check.ps1 -LaunchGame -LaunchMode Exe -Sts2ExePath "I:\SteamLibrary\steamapps\common\Slay the Spire 2\SlayTheSpire2.exe"'
+    Write-Host '  .\scripts\runtime_smoke_check.ps1 -Build -Deploy -StartBridge -LaunchGame -StartSeededRun -Seed "7MJCUHEB5Q" -ModsDir "I:\SteamLibrary\steamapps\common\Slay the Spire 2\mods"'
+    Write-Host '  .\scripts\runtime_smoke_check.ps1 -StartBridge -StartSeededRun -ForceAbandonRun -Seed "7MJCUHEB5Q"'
     Write-Host '  .\scripts\runtime_smoke_check.ps1 -CheckSeconds 90 -PollSeconds 5'
 }
 
@@ -129,6 +153,151 @@ function Get-CollectionCount {
     return 1
 }
 
+function Get-SpireMindDataDir {
+    return (Join-Path $env:APPDATA "SlayTheSpire2\SpireMind")
+}
+
+function Clear-AutotestCommandFiles {
+    $dataDir = Get-SpireMindDataDir
+    $commandPath = Join-Path $dataDir "autotest_command.json"
+    $resultPath = Join-Path $dataDir "autotest_result.json"
+
+    Remove-Item -LiteralPath $commandPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
+    Write-Host "[SpireMind] Cleared stale autotest command files."
+}
+
+function Invoke-BridgeHealth {
+    param([string]$BridgeUrl)
+
+    try {
+        return Invoke-RestMethod -Method Get -Uri "$BridgeUrl/health" -TimeoutSec 2
+    }
+    catch {
+        return $null
+    }
+}
+
+function Start-SpireMindBridge {
+    param(
+        [string]$RepoRoot,
+        [string]$HostName,
+        [int]$Port
+    )
+
+    $bridgeUrl = "http://${HostName}:$Port"
+    $health = Invoke-BridgeHealth -BridgeUrl $bridgeUrl
+    if ($null -ne $health -and $health.ok -eq $true) {
+        Write-Host "[SpireMind] Bridge is already healthy: $bridgeUrl"
+        return
+    }
+
+    $bridgeScriptPath = Join-Path $RepoRoot "bridge\spiremind_bridge.js"
+    $bridgeArguments = @(
+        $bridgeScriptPath,
+        "--http-host",
+        $HostName,
+        "--http-port",
+        [string]$Port
+    )
+
+    if ($PSCmdlet.ShouldProcess($bridgeUrl, "Start SpireMind bridge")) {
+        Start-Process `
+            -FilePath "node" `
+            -ArgumentList $bridgeArguments `
+            -WorkingDirectory $RepoRoot `
+            -WindowStyle Hidden | Out-Null
+
+        $deadline = (Get-Date).AddSeconds(10)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+            $health = Invoke-BridgeHealth -BridgeUrl $bridgeUrl
+            if ($null -ne $health -and $health.ok -eq $true) {
+                Write-Host "[SpireMind] Bridge started: $bridgeUrl"
+                return
+            }
+        }
+
+        Write-Warning "[SpireMind] Bridge did not report healthy within 10 seconds: $bridgeUrl"
+    }
+}
+
+function New-AutotestCommandId {
+    param([string]$Prefix)
+
+    return "{0}-{1:yyyyMMdd-HHmmss}-{2}" -f $Prefix, (Get-Date), ([guid]::NewGuid().ToString("N").Substring(0, 8))
+}
+
+function Write-StartSeededRunCommand {
+    param(
+        [string]$SeedValue,
+        [string]$Character,
+        [int]$TimeoutSeconds,
+        [bool]$AbandonCurrentRun
+    )
+
+    $dataDir = Get-SpireMindDataDir
+    New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+
+    $commandPath = Join-Path $dataDir "autotest_command.json"
+    $resultPath = Join-Path $dataDir "autotest_result.json"
+    $commandId = New-AutotestCommandId -Prefix "cmd-start-seeded"
+    $command = [ordered]@{
+        id = $commandId
+        action = "start_new_run"
+        params = [ordered]@{
+            seed = $SeedValue
+            character_id = $Character
+            timeout_ms = [Math]::Max(1, $TimeoutSeconds) * 1000
+            ready_timeout_ms = [Math]::Max(1, $TimeoutSeconds) * 1000
+            force_abandon = $AbandonCurrentRun
+        }
+    }
+
+    if ($PSCmdlet.ShouldProcess($commandPath, "Write start_new_run command")) {
+        $command | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $commandPath -Encoding UTF8
+        Write-Host "[SpireMind] Wrote autotest command: $commandPath"
+        Write-Host "[SpireMind] Command id: $commandId"
+    }
+
+    return [pscustomobject]@{
+        Id = $commandId
+        CommandPath = $commandPath
+        ResultPath = $resultPath
+    }
+}
+
+function Wait-AutotestCommandResult {
+    param(
+        [string]$CommandId,
+        [string]$ResultPath,
+        [int]$TimeoutSeconds,
+        [int]$PollSeconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path $ResultPath) {
+            try {
+                $result = Get-Content -Raw -Encoding UTF8 -LiteralPath $ResultPath | ConvertFrom-Json
+                if ($result.id -eq $CommandId) {
+                    Write-Host ("[SpireMind] Autotest result: {0} - {1}" -f $result.status, $result.message)
+                    if ($result.status -in @("applied", "failed", "rejected")) {
+                        return $result
+                    }
+                }
+            }
+            catch {
+                Write-Warning "[SpireMind] Could not read autotest result yet: $($_.Exception.Message)"
+            }
+        }
+
+        Start-Sleep -Seconds ([Math]::Max(1, $PollSeconds))
+    }
+
+    throw "Timed out waiting for autotest command result: $CommandId"
+}
+
 function New-SmokeResult {
     param(
         [string]$Name,
@@ -147,7 +316,8 @@ function Get-CombatStateSnapshot {
     param(
         [string]$CombatStatePath,
         [string]$GodotLogPath,
-        [int]$FreshSeconds
+        [int]$FreshSeconds,
+        [switch]$AllowNonCombatState
     )
 
     $results = New-Object System.Collections.Generic.List[object]
@@ -192,6 +362,7 @@ function Get-CombatStateSnapshot {
         $results.Add((New-SmokeResult "relic count" "WARN" $detail))
     }
     else {
+        $phase = Get-JsonValue $json @("phase")
         $piles = Get-JsonValue $json @("piles")
         $handCount = Get-CollectionCount (Get-JsonValue $piles @("hand"))
         $drawCount = Get-CollectionCount (Get-JsonValue $piles @("draw_pile", "draw"))
@@ -201,6 +372,9 @@ function Get-CombatStateSnapshot {
 
         if ($totalCards -gt 0) {
             $results.Add((New-SmokeResult "card pile total" "PASS" "hand=$handCount, draw=$drawCount, discard=$discardCount, exhaust=$exhaustCount"))
+        }
+        elseif ($AllowNonCombatState -and $phase -ne "combat") {
+            $results.Add((New-SmokeResult "card pile total" "WARN" "phase=$phase; card piles can be empty before combat"))
         }
         else {
             $results.Add((New-SmokeResult "card pile total" "FAIL" "hand/draw/discard/exhaust total is 0"))
@@ -300,10 +474,12 @@ $deployScriptPath = Join-Path $repoRoot "scripts\deploy_mod.ps1"
 $godotLogPath = Join-Path $env:APPDATA "SlayTheSpire2\logs\godot.log"
 $combatStatePath = Join-Path $env:APPDATA "SlayTheSpire2\SpireMind\combat_state.json"
 $steamLaunchUri = "steam://rungameid/2868840"
+$bridgeUrl = "http://${BridgeHost}:$BridgePort"
 
 Write-Host "[SpireMind] Starting R2 runtime semi-manual smoke check."
 Write-Host "[SpireMind] Default STS2 path candidate: $Sts2Path"
 Write-Host "[SpireMind] Launch mode: $LaunchMode"
+Write-Host "[SpireMind] Bridge URL: $bridgeUrl"
 Write-Host "[SpireMind] Watching godot.log: $godotLogPath"
 Write-Host "[SpireMind] Watching combat_state.json: $combatStatePath"
 Write-Host ""
@@ -338,6 +514,14 @@ if ($Deploy) {
     }
 }
 
+if ($StartBridge) {
+    Start-SpireMindBridge -RepoRoot $repoRoot -HostName $BridgeHost -Port $BridgePort
+}
+
+if ($StartSeededRun) {
+    Clear-AutotestCommandFiles
+}
+
 if ($LaunchGame) {
     if ($LaunchMode -eq "Steam") {
         if ($PSCmdlet.ShouldProcess($steamLaunchUri, "Launch STS2 through Steam URL")) {
@@ -358,15 +542,44 @@ if ($WhatIfPreference) {
     return
 }
 
-Write-Host "Manual step: enter combat in the game, play one card, then end the turn."
-Write-Host "This script does not click, move the mouse, or send keyboard input."
+if ($StartSeededRun) {
+    if ($LaunchGame -and $LaunchWaitSeconds -gt 0) {
+        Write-Host "[SpireMind] Waiting $LaunchWaitSeconds seconds for the game to reach the main menu."
+        Start-Sleep -Seconds $LaunchWaitSeconds
+    }
+
+    $commandInfo = Write-StartSeededRunCommand `
+        -SeedValue $Seed `
+        -Character $CharacterId `
+        -TimeoutSeconds $CommandWaitSeconds `
+        -AbandonCurrentRun $ForceAbandonRun.IsPresent
+    $commandResult = Wait-AutotestCommandResult `
+        -CommandId $commandInfo.Id `
+        -ResultPath $commandInfo.ResultPath `
+        -TimeoutSeconds $CommandWaitSeconds `
+        -PollSeconds $PollSeconds
+
+    if ($commandResult.status -ne "applied") {
+        throw "start_new_run command was not applied. status=$($commandResult.status), message=$($commandResult.message)"
+    }
+
+    Write-Host "[SpireMind] Seeded run command applied. Seed=$Seed, Character=$CharacterId"
+}
+else {
+    Write-Host "Manual step: enter combat in the game, play one card, then end the turn."
+    Write-Host "This script does not click, move the mouse, or send keyboard input."
+}
 Write-Host ""
 
 $deadline = (Get-Date).AddSeconds($CheckSeconds)
 $lastResults = @()
 
 while ((Get-Date) -lt $deadline) {
-    $lastResults = @(Get-CombatStateSnapshot -CombatStatePath $combatStatePath -GodotLogPath $godotLogPath -FreshSeconds $RecentSeconds)
+    $lastResults = @(Get-CombatStateSnapshot `
+        -CombatStatePath $combatStatePath `
+        -GodotLogPath $godotLogPath `
+        -FreshSeconds $RecentSeconds `
+        -AllowNonCombatState:$StartSeededRun)
     $failCount = @($lastResults | Where-Object { $_.Status -eq "FAIL" }).Count
     $warnCount = @($lastResults | Where-Object { $_.Status -eq "WARN" }).Count
     $passCount = @($lastResults | Where-Object { $_.Status -eq "PASS" }).Count

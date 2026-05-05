@@ -9,6 +9,10 @@ namespace SpireMindMod;
 [HarmonyPatch]
 internal static class CombatStateHarmonyPatch
 {
+    private const string NGameTypeName = "MegaCrit.Sts2.Core.Nodes.NGame";
+    private const string EnterTreeMethodName = "_EnterTree";
+    private const string ReadyMethodName = "_Ready";
+
     private static readonly SpireMindLogger Logger = new("SpireMind.R2.Patch");
     private static bool hasLoggedTargets;
 
@@ -18,21 +22,6 @@ internal static class CombatStateHarmonyPatch
 
         List<MethodBase> targets = new();
         targets.AddRange(GetDirectSts2TargetMethods());
-
-        foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
-        {
-            Type[] types = GetTypesSafely(assembly);
-            foreach (Type type in types)
-            {
-                if (!IsCombatRoomType(type))
-                {
-                    continue;
-                }
-
-                targets.AddRange(GetPatchableConstructors(type));
-                targets.AddRange(GetPatchableUpdateMethods(type));
-            }
-        }
 
         targets = targets.Distinct().ToList();
 
@@ -51,6 +40,12 @@ internal static class CombatStateHarmonyPatch
 
     public static void Postfix(object __instance)
     {
+        if (IsNGameInstance(__instance))
+        {
+            AutotestMainThreadTickerInstaller.EnsureInstalled(__instance, "CombatStateHarmonyPatch.Postfix");
+            return;
+        }
+
         CombatStateExporter.Observe(__instance);
     }
 
@@ -63,11 +58,43 @@ internal static class CombatStateHarmonyPatch
         AddMethod(targets, "MegaCrit.Sts2.Core.Combat.CombatState", "RemoveCreature");
         AddPropertySetter(targets, "MegaCrit.Sts2.Core.Combat.CombatState", "CurrentSide");
         AddPropertySetter(targets, "MegaCrit.Sts2.Core.Combat.CombatState", "RoundNumber");
-        AddPropertySetter(targets, "MegaCrit.Sts2.Core.Combat.PlayerCombatState", "Energy");
-        AddEnergySetterCandidates(targets, "MegaCrit.Sts2.Core.Combat.PlayerCombatState");
+        // PlayerCombatState 에너지 setter는 전투 진입 시점 패치 대상을 늘려 안정성 위험을 키웁니다.
+        // CardPile 변경 관찰만으로도 상태 갱신은 이어지므로, 크래시 방지를 우선해 직접 패치는 비활성화합니다.
         AddMethod(targets, "MegaCrit.Sts2.Core.Entities.Cards.CardPile", "InvokeContentsChanged");
+        AddDeclaredMethod(targets, NGameTypeName, EnterTreeMethodName);
+        AddDeclaredMethod(targets, NGameTypeName, ReadyMethodName);
 
         return targets;
+    }
+
+    private static bool IsNGameInstance(object instance)
+    {
+        return instance.GetType().FullName?.Equals(NGameTypeName, StringComparison.Ordinal) == true;
+    }
+
+    private static void AddDeclaredMethod(List<MethodBase> targets, string typeName, string methodName)
+    {
+        Type? type = AccessTools.TypeByName(typeName);
+        if (type is null)
+        {
+            Logger.Warning($"autotest ticker install failed: {typeName} 타입을 찾지 못했습니다.");
+            return;
+        }
+
+        MethodInfo? method = AccessTools.DeclaredMethod(type, methodName, Type.EmptyTypes);
+        if (method is null)
+        {
+            Logger.Warning($"autotest ticker install failed: {typeName}.{methodName} 메서드를 찾지 못했습니다.");
+            return;
+        }
+
+        if (method.IsAbstract || method.ContainsGenericParameters)
+        {
+            Logger.Warning($"autotest ticker install failed: {typeName}.{methodName} 메서드는 패치할 수 없는 형태입니다.");
+            return;
+        }
+
+        targets.Add(method);
     }
 
     private static void AddMethod(List<MethodBase> targets, string typeName, string methodName)

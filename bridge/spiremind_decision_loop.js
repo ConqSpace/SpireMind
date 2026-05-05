@@ -1,0 +1,2504 @@
+#!/usr/bin/env node
+"use strict";
+
+const { spawn } = require("child_process");
+const fs = require("fs");
+const http = require("http");
+const https = require("https");
+const path = require("path");
+
+const DEFAULT_BRIDGE_URL = "http://127.0.0.1:17832";
+const DEFAULT_POLL_MS = 250;
+const DEFAULT_TIMEOUT_MS = 30000;
+const DEFAULT_MAX_STALE_RETRIES = 5;
+
+function parseArgs(argv) {
+  const options = {
+    bridgeUrl: process.env.SPIREMIND_BRIDGE_URL || DEFAULT_BRIDGE_URL,
+    mode: process.env.SPIREMIND_DECIDER_MODE || "heuristic",
+    command: process.env.SPIREMIND_DECIDER_COMMAND || "",
+    commandArgs: [],
+    once: false,
+    untilCombatEnd: false,
+    dryRun: false,
+    waitResult: false,
+    maxDecisions: 1,
+    maxDecisionsWasSet: false,
+    maxActionsPerTurn: 3,
+    maxStaleRetries: DEFAULT_MAX_STALE_RETRIES,
+    recentHistoryLimit: parsePositiveInt(process.env.SPIREMIND_RECENT_HISTORY_LIMIT, 8),
+    pollMs: DEFAULT_POLL_MS,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+    resultTimeoutMs: 60000,
+    runLogDir: process.env.SPIREMIND_RUN_LOG_DIR || "",
+    actionMetadataPath: process.env.SPIREMIND_ACTION_METADATA_PATH
+      || path.resolve(__dirname, "..", "data", "sts2_knowledge", "action_flows.json"),
+    scenarioId: process.env.SPIREMIND_SCENARIO_ID || "",
+    playSessionId: process.env.SPIREMIND_PLAY_SESSION_ID || "",
+    help: false
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--help" || token === "-h") {
+      options.help = true;
+      continue;
+    }
+
+    if (token === "--bridge-url" && index + 1 < argv.length) {
+      options.bridgeUrl = argv[index + 1];
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--bridge-url=")) {
+      options.bridgeUrl = token.slice("--bridge-url=".length);
+      continue;
+    }
+
+    if (token === "--mode" && index + 1 < argv.length) {
+      options.mode = argv[index + 1];
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--mode=")) {
+      options.mode = token.slice("--mode=".length);
+      continue;
+    }
+
+    if (token === "--command" && index + 1 < argv.length) {
+      options.command = argv[index + 1];
+      index += 1;
+      continue;
+    }
+
+    if (token === "--command-arg" && index + 1 < argv.length) {
+      options.commandArgs.push(argv[index + 1]);
+      index += 1;
+      continue;
+    }
+
+    if (token === "--once") {
+      options.once = true;
+      options.maxDecisions = 1;
+      options.maxDecisionsWasSet = true;
+      continue;
+    }
+
+    if (token === "--until-combat-end") {
+      options.untilCombatEnd = true;
+      if (!options.maxDecisionsWasSet) {
+        options.maxDecisions = 50;
+      }
+      continue;
+    }
+
+    if (token === "--dry-run") {
+      options.dryRun = true;
+      continue;
+    }
+
+    if (token === "--wait-result") {
+      options.waitResult = true;
+      continue;
+    }
+
+    if (token === "--max-stale-retries" && index + 1 < argv.length) {
+      options.maxStaleRetries = parsePositiveInt(argv[index + 1], options.maxStaleRetries);
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--max-stale-retries=")) {
+      options.maxStaleRetries = parsePositiveInt(token.slice("--max-stale-retries=".length), options.maxStaleRetries);
+      continue;
+    }
+
+    if (token === "--run-log-dir" && index + 1 < argv.length) {
+      options.runLogDir = argv[index + 1];
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--run-log-dir=")) {
+      options.runLogDir = token.slice("--run-log-dir=".length);
+      continue;
+    }
+
+    if (token === "--action-metadata-path" && index + 1 < argv.length) {
+      options.actionMetadataPath = argv[index + 1];
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--action-metadata-path=")) {
+      options.actionMetadataPath = token.slice("--action-metadata-path=".length);
+      continue;
+    }
+
+    if (token === "--scenario-id" && index + 1 < argv.length) {
+      options.scenarioId = argv[index + 1];
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--scenario-id=")) {
+      options.scenarioId = token.slice("--scenario-id=".length);
+      continue;
+    }
+
+    if (token === "--play-session-id" && index + 1 < argv.length) {
+      options.playSessionId = argv[index + 1];
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--play-session-id=")) {
+      options.playSessionId = token.slice("--play-session-id=".length);
+      continue;
+    }
+
+    if (token === "--max-decisions" && index + 1 < argv.length) {
+      options.maxDecisions = parsePositiveInt(argv[index + 1], options.maxDecisions);
+      options.maxDecisionsWasSet = true;
+      index += 1;
+      continue;
+    }
+
+    if (token === "--max-actions-per-turn" && index + 1 < argv.length) {
+      options.maxActionsPerTurn = parsePositiveInt(argv[index + 1], options.maxActionsPerTurn);
+      index += 1;
+      continue;
+    }
+
+    if (token === "--recent-history-limit" && index + 1 < argv.length) {
+      options.recentHistoryLimit = parsePositiveInt(argv[index + 1], options.recentHistoryLimit);
+      index += 1;
+      continue;
+    }
+
+    if (token === "--poll-ms" && index + 1 < argv.length) {
+      options.pollMs = parsePositiveInt(argv[index + 1], options.pollMs);
+      index += 1;
+      continue;
+    }
+
+    if (token === "--timeout-ms" && index + 1 < argv.length) {
+      options.timeoutMs = parsePositiveInt(argv[index + 1], options.timeoutMs);
+      index += 1;
+      continue;
+    }
+
+    if (token === "--result-timeout-ms" && index + 1 < argv.length) {
+      options.resultTimeoutMs = parsePositiveInt(argv[index + 1], options.resultTimeoutMs);
+      index += 1;
+    }
+  }
+
+  return options;
+}
+
+function parsePositiveInt(value, fallbackValue) {
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackValue;
+}
+
+function showHelp() {
+  process.stdout.write([
+    "SpireMind decision loop",
+    "",
+    "Usage:",
+    "  node bridge/spiremind_decision_loop.js --mode heuristic --once",
+    "  node bridge/spiremind_decision_loop.js --mode command --command <program> --command-arg <arg>",
+    "  node bridge/spiremind_decision_loop.js --mode heuristic --once --wait-result --run-log-dir <dir>",
+    "",
+    "Modes:",
+    "  heuristic  현재 상태에서 사용 가능한 공격 카드 묶음과 end_turn을 제출한다.",
+    "  command    외부 명령에 JSON 프롬프트를 stdin으로 보내고 JSON 결정을 stdout에서 읽는다.",
+    "",
+    "Run record options:",
+    "  --run-log-dir <dir>   decisions.jsonl, metrics.json, decider_config.json을 기록한다.",
+    "  --action-metadata-path <file> command 모드에 전달할 행동 절차 메타데이터 JSON 경로.",
+    "  --wait-result         제출한 계획이 completed 또는 failed가 될 때까지 기다린다.",
+    "  --until-combat-end    전투 턴을 반복 판단하고, 전투 종료나 비전투 상태를 감지하면 멈춘다.",
+    "  --recent-history-limit <n> command 모드 판단기에 전달할 최근 기록 수. 기본값 8.",
+    "  --scenario-id <id>    내부 기록용 시나리오 식별자다. 외부 판단기에는 보내지 않는다.",
+    "  --play-session-id <id> 외부 판단기에 보내도 되는 플레이 세션 식별자다.",
+    "",
+    "Command mode output contract:",
+    "  { \"selected_action_id\": \"end_turn\", \"reason\": \"...\" }",
+    ""
+  ].join("\n"));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function appendPath(baseUrlString, pathname) {
+  return new URL(pathname, baseUrlString).toString();
+}
+
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function isPlainObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function httpRequestJson(method, targetUrlString, body, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const targetUrl = new URL(targetUrlString);
+    const transport = targetUrl.protocol === "https:" ? https : http;
+    const bodyText = body === undefined ? "" : JSON.stringify(body);
+    const request = transport.request(
+      targetUrl,
+      {
+        method,
+        headers: {
+          Accept: "application/json",
+          ...(body === undefined
+            ? {}
+            : {
+                "Content-Type": "application/json; charset=utf-8",
+                "Content-Length": Buffer.byteLength(bodyText, "utf8")
+              })
+        }
+      },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => {
+          const rawBody = Buffer.concat(chunks).toString("utf8");
+          const parsed = rawBody.trim() === "" ? null : safeJsonParse(rawBody);
+          if (rawBody.trim() !== "" && parsed === null) {
+            reject(new Error(`브리지 응답이 JSON이 아닙니다: ${rawBody}`));
+            return;
+          }
+
+          resolve({
+            statusCode: typeof response.statusCode === "number" ? response.statusCode : 0,
+            body: parsed
+          });
+        });
+      }
+    );
+
+    request.setTimeout(timeoutMs, () => {
+      request.destroy(new Error(`브리지 요청이 ${timeoutMs}ms 안에 끝나지 않았습니다.`));
+    });
+    request.on("error", (error) => reject(error));
+
+    if (body !== undefined) {
+      request.write(bodyText);
+    }
+
+    request.end();
+  });
+}
+
+async function getCurrentState(bridgeUrl, timeoutMs) {
+  const response = await httpRequestJson("GET", appendPath(bridgeUrl, "/state/current"), undefined, timeoutMs);
+  if (response.statusCode !== 200 || !isPlainObject(response.body)) {
+    throw new Error(`브리지 상태 조회 실패: HTTP ${response.statusCode}`);
+  }
+
+  return response.body;
+}
+
+async function getLatestAction(bridgeUrl, timeoutMs) {
+  const response = await httpRequestJson("GET", appendPath(bridgeUrl, "/action/latest"), undefined, timeoutMs);
+  if (response.statusCode !== 200 || !isPlainObject(response.body)) {
+    throw new Error(`브리지 행동 조회 실패: HTTP ${response.statusCode}`);
+  }
+
+  return response.body;
+}
+
+async function submitDecision(bridgeUrl, decision, stateVersion, source, timeoutMs) {
+  const body = {
+    ...decision,
+    source,
+    expected_state_version: stateVersion
+  };
+  const response = await httpRequestJson("POST", appendPath(bridgeUrl, "/action/submit"), body, timeoutMs);
+  if (response.statusCode < 200 || response.statusCode >= 300 || !isPlainObject(response.body)) {
+    throw new Error(`행동 제출 실패: HTTP ${response.statusCode}`);
+  }
+
+  return response.body;
+}
+
+function ensureRunLogDir(runLogDir) {
+  if (typeof runLogDir !== "string" || runLogDir.trim() === "") {
+    return null;
+  }
+
+  const resolved = path.resolve(runLogDir);
+  fs.mkdirSync(resolved, { recursive: true });
+  return resolved;
+}
+
+function writeJsonFile(filePath, value) {
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function readJsonFile(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+
+  return safeJsonParse(fs.readFileSync(filePath, "utf8"));
+}
+
+function appendJsonLine(filePath, value) {
+  fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`, "utf8");
+}
+
+function readJsonLines(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return [];
+  }
+
+  return fs.readFileSync(filePath, "utf8")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== "")
+    .map((line) => safeJsonParse(line))
+    .filter(isPlainObject);
+}
+
+function nowIsoString() {
+  return new Date().toISOString();
+}
+
+function createDecisionId() {
+  return `decision_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function createRecordId(prefix) {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function summarizeState(snapshot) {
+  const state = isPlainObject(snapshot.state) ? snapshot.state : {};
+  const player = isPlainObject(state.player) ? state.player : {};
+  const piles = isPlainObject(state.piles) ? state.piles : {};
+  const hand = Array.isArray(piles.hand) ? piles.hand.filter(isPlainObject) : [];
+  const enemies = Array.isArray(state.enemies) ? state.enemies.filter(isPlainObject) : [];
+  const legalActions = Array.isArray(state.legal_actions) ? state.legal_actions.filter(isPlainObject) : [];
+  const gameOver = isPlainObject(state.game_over) ? state.game_over : null;
+  const roomContext = isPlainObject(state.room_context) ? state.room_context : {};
+  const currentRoom = isPlainObject(roomContext.current_room) ? roomContext.current_room : {};
+  const currentMapPoint = isPlainObject(roomContext.current_map_point) ? roomContext.current_map_point : {};
+  const map = isPlainObject(state.map) ? state.map : {};
+
+  return {
+    state_version: readNumber(snapshot.state_version),
+    state_id: typeof snapshot.state_id === "string" ? snapshot.state_id : state.state_id || null,
+    phase: typeof state.phase === "string" ? state.phase : null,
+    room_context: {
+      room_kind: typeof currentRoom.kind === "string" ? currentRoom.kind : null,
+      room_type: typeof currentRoom.type_name === "string" ? currentRoom.type_name : null,
+      room_name: typeof currentRoom.name === "string" ? currentRoom.name : null,
+      screen_type: typeof roomContext.current_screen_type === "string" ? roomContext.current_screen_type : null,
+      screen_name: typeof roomContext.current_screen_name === "string" ? roomContext.current_screen_name : null,
+      map_point_kind: typeof currentMapPoint.kind === "string" ? currentMapPoint.kind : null,
+      map_row: readNumber(currentMapPoint.row),
+      map_column: readNumber(currentMapPoint.column),
+      run_in_progress: roomContext.run_in_progress === true ? true : (roomContext.run_in_progress === false ? false : null),
+      combat_in_progress: roomContext.combat_in_progress === true ? true : (roomContext.combat_in_progress === false ? false : null)
+    },
+    terminal: gameOver
+      ? {
+          result: typeof gameOver.result === "string" ? gameOver.result : null,
+          is_victory: gameOver.is_victory === true ? true : (gameOver.is_victory === false ? false : null),
+          score: readNumber(gameOver.score),
+          floor: readNumber(gameOver.floor)
+        }
+      : null,
+    player: {
+      hp: readNumber(player.hp),
+      max_hp: readNumber(player.max_hp),
+      block: readNumber(player.block),
+      energy: readNumber(player.energy)
+    },
+    hand: hand.map((card) => ({
+      combat_card_id: readNumber(card.combat_card_id),
+      name: typeof card.name === "string" ? card.name : null,
+      cost: readNumber(card.cost),
+      playable: card.playable === true,
+      type: typeof card.type === "string" ? card.type : null
+    })),
+    enemies: enemies.map((enemy) => ({
+      combat_id: readNumber(enemy.combat_id),
+      name: typeof enemy.name === "string" ? enemy.name : null,
+      hp: readNumber(enemy.hp),
+      max_hp: readNumber(enemy.max_hp),
+      block: readNumber(enemy.block),
+      intent: isPlainObject(enemy.intent)
+        ? {
+            type: typeof enemy.intent.type === "string" ? enemy.intent.type : null,
+            total_damage: readNumber(enemy.intent.total_damage)
+          }
+        : null
+    })),
+    legal_action_count: legalActions.length,
+    legal_action_ids: legalActions
+      .map((action) => (typeof action.action_id === "string" ? action.action_id : null))
+      .filter((actionId) => actionId !== null),
+    map: summarizeMapPlanning(map)
+  };
+}
+
+function countLiveEnemies(stateSummary) {
+  if (!isPlainObject(stateSummary) || !Array.isArray(stateSummary.enemies)) {
+    return 0;
+  }
+
+  return stateSummary.enemies.filter((enemy) => {
+    const hp = readNumber(enemy.hp);
+    const combatId = readNumber(enemy.combat_id);
+    return hp !== null ? hp > 0 : combatId !== null;
+  }).length;
+}
+
+function sumKnownEnemyHp(enemies) {
+  if (!Array.isArray(enemies)) {
+    return null;
+  }
+
+  let total = 0;
+  let foundKnownHp = false;
+  for (const enemy of enemies) {
+    if (!isPlainObject(enemy)) {
+      continue;
+    }
+
+    const hp = readNumber(enemy.hp);
+    if (hp !== null) {
+      total += Math.max(0, hp);
+      foundKnownHp = true;
+    }
+  }
+
+  return foundKnownHp ? total : null;
+}
+
+function createEnemyStateKey(enemy, index) {
+  if (!isPlainObject(enemy)) {
+    return `index:${index}`;
+  }
+
+  const combatId = readNumber(enemy.combat_id);
+  if (combatId !== null) {
+    return `combat:${combatId}`;
+  }
+
+  const name = typeof enemy.name === "string" && enemy.name.trim() !== ""
+    ? enemy.name.trim()
+    : "unknown";
+  return `name:${name}:${index}`;
+}
+
+function summarizeEnemyHpChanges(beforeEnemies, afterEnemies) {
+  const afterByKey = new Map();
+  const normalizedAfterEnemies = Array.isArray(afterEnemies) ? afterEnemies : [];
+  normalizedAfterEnemies.forEach((enemy, index) => {
+    afterByKey.set(createEnemyStateKey(enemy, index), enemy);
+  });
+
+  const changes = [];
+  const normalizedBeforeEnemies = Array.isArray(beforeEnemies) ? beforeEnemies : [];
+  normalizedBeforeEnemies.forEach((beforeEnemy, index) => {
+    if (!isPlainObject(beforeEnemy)) {
+      return;
+    }
+
+    const beforeCombatId = readNumber(beforeEnemy.combat_id);
+    const afterEnemy = afterByKey.get(createEnemyStateKey(beforeEnemy, index)) || null;
+    const afterCombatId = afterEnemy ? readNumber(afterEnemy.combat_id) : null;
+    const beforeHp = readNumber(beforeEnemy.hp);
+    const rawAfterHp = afterEnemy ? readNumber(afterEnemy.hp) : null;
+    if (beforeCombatId === null && afterCombatId === null && beforeHp === null && rawAfterHp === null) {
+      return;
+    }
+
+    const afterHp = afterEnemy ? rawAfterHp : (beforeHp !== null ? 0 : null);
+    const hpLost = beforeHp !== null && afterHp !== null
+      ? Math.max(0, beforeHp - afterHp)
+      : null;
+
+    changes.push({
+      combat_id: beforeCombatId,
+      name: typeof beforeEnemy.name === "string" ? beforeEnemy.name : null,
+      hp_before: beforeHp,
+      hp_after: afterHp,
+      hp_lost: hpLost,
+      defeated: beforeHp !== null && beforeHp > 0 && afterHp !== null && afterHp <= 0
+    });
+  });
+
+  return changes;
+}
+
+function buildStateDelta(beforeSummary, afterSummary) {
+  if (!isPlainObject(beforeSummary) || !isPlainObject(afterSummary)) {
+    return null;
+  }
+
+  const playerHpBefore = readNumber(beforeSummary.player && beforeSummary.player.hp);
+  const playerHpAfter = readNumber(afterSummary.player && afterSummary.player.hp);
+  const playerBlockBefore = readNumber(beforeSummary.player && beforeSummary.player.block);
+  const playerBlockAfter = readNumber(afterSummary.player && afterSummary.player.block);
+  const playerEnergyBefore = readNumber(beforeSummary.player && beforeSummary.player.energy);
+  const playerEnergyAfter = readNumber(afterSummary.player && afterSummary.player.energy);
+  const totalEnemyHpBefore = sumKnownEnemyHp(beforeSummary.enemies);
+  const totalEnemyHpAfter = sumKnownEnemyHp(afterSummary.enemies);
+  const enemyHpChanges = summarizeEnemyHpChanges(beforeSummary.enemies, afterSummary.enemies);
+
+  return {
+    state_version_before: beforeSummary.state_version,
+    state_version_after: afterSummary.state_version,
+    state_id_before: beforeSummary.state_id,
+    state_id_after: afterSummary.state_id,
+    phase_before: beforeSummary.phase,
+    phase_after: afterSummary.phase,
+    player: {
+      hp_before: playerHpBefore,
+      hp_after: playerHpAfter,
+      hp_lost: playerHpBefore !== null && playerHpAfter !== null
+        ? Math.max(0, playerHpBefore - playerHpAfter)
+        : null,
+      block_before: playerBlockBefore,
+      block_after: playerBlockAfter,
+      block_delta: playerBlockBefore !== null && playerBlockAfter !== null
+        ? playerBlockAfter - playerBlockBefore
+        : null,
+      energy_before: playerEnergyBefore,
+      energy_after: playerEnergyAfter,
+      energy_spent: playerEnergyBefore !== null && playerEnergyAfter !== null
+        ? Math.max(0, playerEnergyBefore - playerEnergyAfter)
+        : null
+    },
+    hand_count_before: Array.isArray(beforeSummary.hand) ? beforeSummary.hand.length : null,
+    hand_count_after: Array.isArray(afterSummary.hand) ? afterSummary.hand.length : null,
+    live_enemy_count_before: countLiveEnemies(beforeSummary),
+    live_enemy_count_after: countLiveEnemies(afterSummary),
+    total_enemy_hp_before: totalEnemyHpBefore,
+    total_enemy_hp_after: totalEnemyHpAfter,
+    enemy_hp_lost: totalEnemyHpBefore !== null && totalEnemyHpAfter !== null
+      ? Math.max(0, totalEnemyHpBefore - totalEnemyHpAfter)
+      : null,
+    enemies: enemyHpChanges
+  };
+}
+
+function classifyCombatReadiness(snapshot) {
+  const stateSummary = summarizeState(snapshot);
+  const phase = typeof stateSummary.phase === "string" ? stateSummary.phase.trim() : "";
+  const playerHp = readNumber(stateSummary.player.hp);
+  const liveEnemyCount = countLiveEnemies(stateSummary);
+  const hasLegalActions = stateSummary.legal_action_count > 0;
+
+  if (!isPlainObject(snapshot.state)) {
+    return {
+      stateSummary,
+      readyForDecision: false,
+      shouldStop: false,
+      reason: "state_missing"
+    };
+  }
+
+  if (phase === "game_over" || phase === "run_finished") {
+    const terminalResult = stateSummary.terminal && typeof stateSummary.terminal.result === "string"
+      ? stateSummary.terminal.result
+      : phase;
+    return {
+      stateSummary,
+      readyForDecision: false,
+      shouldStop: true,
+      reason: `terminal:${terminalResult}`
+    };
+  }
+
+  if (playerHp !== null && playerHp <= 0) {
+    return {
+      stateSummary,
+      readyForDecision: false,
+      shouldStop: true,
+      reason: "player_defeated"
+    };
+  }
+
+  if (phase !== "" && phase !== "combat_turn") {
+    return {
+      stateSummary,
+      readyForDecision: false,
+      shouldStop: !phase.startsWith("combat"),
+      reason: phase.startsWith("combat") ? `waiting_${phase}` : `non_combat_phase:${phase}`
+    };
+  }
+
+  if (liveEnemyCount <= 0) {
+    return {
+      stateSummary,
+      readyForDecision: false,
+      shouldStop: true,
+      reason: "no_live_enemies"
+    };
+  }
+
+  if (!hasLegalActions) {
+    return {
+      stateSummary,
+      readyForDecision: false,
+      shouldStop: false,
+      reason: "legal_actions_missing"
+    };
+  }
+
+  return {
+    stateSummary,
+    readyForDecision: true,
+    shouldStop: false,
+    reason: "combat_turn_ready"
+  };
+}
+
+function readMetrics(metricsPath) {
+  if (!fs.existsSync(metricsPath)) {
+    return {
+      decisions: 0,
+      submitted_decisions: 0,
+      dry_run_decisions: 0,
+      plans_completed: 0,
+      plans_failed: 0,
+      actions_applied: 0,
+      stale_retries: 0,
+      invalid_actions: 0,
+      submit_failures: 0,
+      result_timeouts: 0,
+      stale_before_submit: 0,
+      observed_combats: 0,
+      combat_turn_decisions: 0,
+      end_turns_applied: 0,
+      combat_stop_events: 0,
+      total_decision_ms: 0,
+      average_decision_ms: 0,
+      last_updated_at: null
+    };
+  }
+
+  const parsed = safeJsonParse(fs.readFileSync(metricsPath, "utf8"));
+  return isPlainObject(parsed) ? parsed : {};
+}
+
+function countObjectValues(value) {
+  if (!isPlainObject(value)) {
+    return 0;
+  }
+
+  return Object.values(value).reduce((sum, item) => {
+    const numberValue = readNumber(item);
+    return sum + (numberValue === null ? 0 : numberValue);
+  }, 0);
+}
+
+function updateMetrics(runLogDir, record) {
+  if (!runLogDir) {
+    return null;
+  }
+
+  const metricsPath = path.join(runLogDir, "metrics.json");
+  const metrics = {
+    decisions: 0,
+    submitted_decisions: 0,
+    dry_run_decisions: 0,
+    plans_completed: 0,
+    plans_failed: 0,
+    actions_applied: 0,
+    stale_retries: 0,
+    invalid_actions: 0,
+    submit_failures: 0,
+    result_timeouts: 0,
+    stale_before_submit: 0,
+    total_decision_ms: 0,
+    average_decision_ms: 0,
+    combat_stop_events: 0,
+    last_updated_at: null,
+    ...readMetrics(metricsPath)
+  };
+
+  metrics.decisions += 1;
+  metrics.total_decision_ms += readNumber(record.decision_ms) ?? 0;
+  metrics.average_decision_ms = metrics.decisions > 0
+    ? Math.round(metrics.total_decision_ms / metrics.decisions)
+    : 0;
+
+  if (record.status === "dry_run") {
+    metrics.dry_run_decisions += 1;
+  }
+
+  if (record.status === "submitted" || record.status === "completed" || record.status === "failed" || record.status === "applied") {
+    metrics.submitted_decisions += 1;
+  }
+
+  if (record.combat_observed === true) {
+    metrics.observed_combats += 1;
+  }
+
+  if (isPlainObject(record.state_summary) && record.state_summary.phase === "combat_turn") {
+    metrics.combat_turn_decisions += 1;
+  }
+
+  const finalPlan = isPlainObject(record.final_action_plan)
+    ? record.final_action_plan
+    : (isPlainObject(record.action_plan) ? record.action_plan : null);
+  if (finalPlan) {
+    if (finalPlan.status === "completed") {
+      metrics.plans_completed += 1;
+    } else if (finalPlan.status === "failed") {
+      metrics.plans_failed += 1;
+    }
+
+    metrics.actions_applied += Array.isArray(finalPlan.completed) ? finalPlan.completed.length : 0;
+    metrics.stale_retries += countObjectValues(finalPlan.stale_retries);
+  }
+
+  const latestAction = isPlainObject(record.latest_action) ? record.latest_action : null;
+  if (latestAction && latestAction.valid === false) {
+    metrics.invalid_actions += 1;
+  }
+
+  if (record.status === "result_timeout") {
+    metrics.result_timeouts = (readNumber(metrics.result_timeouts) ?? 0) + 1;
+  }
+
+  if (record.status === "submit_failed") {
+    metrics.submit_failures = (readNumber(metrics.submit_failures) ?? 0) + 1;
+  }
+
+  if (record.status === "decision_stale_before_submit") {
+    metrics.stale_before_submit = (readNumber(metrics.stale_before_submit) ?? 0) + 1;
+  }
+
+  const finalLatestAction = isPlainObject(record.final_latest_action) ? record.final_latest_action : null;
+  if (!finalPlan && finalLatestAction && finalLatestAction.result === "applied") {
+    metrics.actions_applied += 1;
+  }
+
+  if (finalLatestAction
+    && finalLatestAction.result === "applied"
+    && finalLatestAction.selected_action_id === "end_turn") {
+    metrics.end_turns_applied += 1;
+  }
+
+  metrics.last_updated_at = nowIsoString();
+  writeJsonFile(metricsPath, metrics);
+  return metrics;
+}
+
+function updateCombatStopMetrics(runLogDir) {
+  if (!runLogDir) {
+    return null;
+  }
+
+  const metricsPath = path.join(runLogDir, "metrics.json");
+  const metrics = {
+    decisions: 0,
+    submitted_decisions: 0,
+    dry_run_decisions: 0,
+    plans_completed: 0,
+    plans_failed: 0,
+    actions_applied: 0,
+    stale_retries: 0,
+    invalid_actions: 0,
+    submit_failures: 0,
+    result_timeouts: 0,
+    stale_before_submit: 0,
+    total_decision_ms: 0,
+    average_decision_ms: 0,
+    combat_stop_events: 0,
+    last_updated_at: null,
+    ...readMetrics(metricsPath)
+  };
+
+  metrics.combat_stop_events = (readNumber(metrics.combat_stop_events) ?? 0) + 1;
+  metrics.last_updated_at = nowIsoString();
+  writeJsonFile(metricsPath, metrics);
+  return metrics;
+}
+
+function createEmptyMemorySummary(options) {
+  return {
+    play_session_id: options.playSessionId,
+    updated_at: nowIsoString(),
+    source: {
+      decisions_seen: 0,
+      combat_events_seen: 0
+    },
+    combat: {
+      decisions_recorded: 0,
+      actions_applied: 0,
+      end_turns_applied: 0,
+      stale_retries: 0,
+      result_timeouts: 0,
+      submit_failures: 0,
+      player_hp_lost: 0,
+      enemy_hp_lost: 0,
+      last_status: null
+    },
+    recent_notes: [],
+    risk_notes: []
+  };
+}
+
+function addUniqueNote(notes, note, limit) {
+  if (typeof note !== "string" || note.trim() === "") {
+    return;
+  }
+
+  const trimmed = note.trim();
+  const existingIndex = notes.indexOf(trimmed);
+  if (existingIndex >= 0) {
+    notes.splice(existingIndex, 1);
+  }
+
+  notes.push(trimmed);
+  while (notes.length > limit) {
+    notes.shift();
+  }
+}
+
+function formatDecisionNote(record) {
+  const status = typeof record.status === "string" ? record.status : "unknown";
+  const decision = isPlainObject(record.decision) ? record.decision : {};
+  const reason = typeof decision.reason === "string" && decision.reason.trim() !== ""
+    ? decision.reason.trim()
+    : null;
+  const stateDelta = isPlainObject(record.state_delta) ? record.state_delta : null;
+  const playerDelta = stateDelta && isPlainObject(stateDelta.player) ? stateDelta.player : null;
+  const hpLost = playerDelta ? readNumber(playerDelta.hp_lost) : null;
+  const enemyHpLost = stateDelta ? readNumber(stateDelta.enemy_hp_lost) : null;
+  const parts = [`판단 ${status}`];
+  if (hpLost !== null) {
+    parts.push(`체력 손실 ${hpLost}`);
+  }
+  if (enemyHpLost !== null) {
+    parts.push(`적 체력 감소 ${enemyHpLost}`);
+  }
+  if (reason) {
+    parts.push(`이유: ${reason}`);
+  }
+
+  return parts.join(", ");
+}
+
+function rebuildMemorySummary(runLogDir, options) {
+  if (!runLogDir) {
+    return null;
+  }
+
+  const decisions = readJsonLines(path.join(runLogDir, "decisions.jsonl"));
+  const combatEvents = readJsonLines(path.join(runLogDir, "combat_log.jsonl"));
+  const summary = createEmptyMemorySummary(options);
+  summary.source.decisions_seen = decisions.length;
+  summary.source.combat_events_seen = combatEvents.length;
+
+  for (const record of decisions) {
+    summary.combat.decisions_recorded += 1;
+    summary.combat.last_status = typeof record.status === "string" ? record.status : summary.combat.last_status;
+
+    if (record.status === "result_timeout") {
+      summary.combat.result_timeouts += 1;
+    }
+    if (record.status === "submit_failed") {
+      summary.combat.submit_failures += 1;
+    }
+
+    const finalPlan = isPlainObject(record.final_action_plan)
+      ? record.final_action_plan
+      : (isPlainObject(record.action_plan) ? record.action_plan : null);
+    if (finalPlan) {
+      summary.combat.actions_applied += Array.isArray(finalPlan.completed) ? finalPlan.completed.length : 0;
+      summary.combat.stale_retries += countObjectValues(finalPlan.stale_retries);
+    }
+
+    const finalLatestAction = isPlainObject(record.final_latest_action) ? record.final_latest_action : null;
+    if (!finalPlan && finalLatestAction && finalLatestAction.result === "applied") {
+      summary.combat.actions_applied += 1;
+    }
+    if (finalLatestAction
+      && finalLatestAction.result === "applied"
+      && finalLatestAction.selected_action_id === "end_turn") {
+      summary.combat.end_turns_applied += 1;
+    }
+
+    const stateDelta = isPlainObject(record.state_delta)
+      ? record.state_delta
+      : (isPlainObject(record.latest_state_delta) ? record.latest_state_delta : null);
+    const playerDelta = stateDelta && isPlainObject(stateDelta.player) ? stateDelta.player : null;
+    const hpLost = playerDelta ? readNumber(playerDelta.hp_lost) : null;
+    const enemyHpLost = stateDelta ? readNumber(stateDelta.enemy_hp_lost) : null;
+    if (hpLost !== null) {
+      summary.combat.player_hp_lost += hpLost;
+    }
+    if (enemyHpLost !== null) {
+      summary.combat.enemy_hp_lost += enemyHpLost;
+    }
+
+    addUniqueNote(summary.recent_notes, formatDecisionNote(record), 8);
+  }
+
+  if (summary.combat.player_hp_lost >= 15) {
+    addUniqueNote(summary.risk_notes, `최근 기록에서 누적 체력 손실이 ${summary.combat.player_hp_lost}입니다. 방어와 전투 종료 속도를 함께 고려해야 합니다.`, 4);
+  }
+  if (summary.combat.result_timeouts > 0) {
+    addUniqueNote(summary.risk_notes, `판단 결과 대기 시간 초과가 ${summary.combat.result_timeouts}회 있었습니다. 오래 걸리는 판단은 실행 시점의 상태와 어긋날 수 있습니다.`, 4);
+  }
+  if (summary.combat.submit_failures > 0) {
+    addUniqueNote(summary.risk_notes, `행동 제출 실패가 ${summary.combat.submit_failures}회 있었습니다. 현재 legal_actions만 사용해야 합니다.`, 4);
+  }
+
+  summary.updated_at = nowIsoString();
+  writeJsonFile(path.join(runLogDir, "memory_summary.json"), summary);
+  return summary;
+}
+
+function ensureScenarioConfigFile(runLogDir, options) {
+  if (!runLogDir) {
+    return;
+  }
+
+  const scenarioConfigPath = path.join(runLogDir, "scenario_config.json");
+  if (fs.existsSync(scenarioConfigPath)) {
+    return;
+  }
+
+  writeJsonFile(scenarioConfigPath, {
+    scenario_id: options.scenarioId,
+    play_session_id: options.playSessionId,
+    description: "SpireMind combat play session",
+    character: null,
+    ascension: null,
+    seed: null,
+    start_point: "current_game_state",
+    allowed_systems: ["combat"],
+    decision_timeout_ms: options.timeoutMs,
+    result_timeout_ms: options.resultTimeoutMs,
+    max_retries: 2,
+    human_intervention: "setup_only",
+    created_at: nowIsoString()
+  });
+}
+
+function ensureRunRecordFiles(runLogDir, options) {
+  if (!runLogDir) {
+    return;
+  }
+
+  ensureScenarioConfigFile(runLogDir, options);
+
+  const deciderConfigPath = path.join(runLogDir, "decider_config.json");
+  if (!fs.existsSync(deciderConfigPath)) {
+    writeJsonFile(deciderConfigPath, {
+      play_session_id: options.playSessionId,
+      decider_type: options.mode,
+      command: options.mode === "command" ? options.command : null,
+      command_args_count: options.mode === "command" ? options.commandArgs.length : 0,
+      max_actions_per_turn: options.maxActionsPerTurn,
+      recent_history_limit: options.recentHistoryLimit,
+      wait_result: options.waitResult,
+      decision_timeout_ms: options.timeoutMs,
+      result_timeout_ms: options.resultTimeoutMs,
+      created_at: nowIsoString()
+    });
+  }
+
+  const memorySummaryPath = path.join(runLogDir, "memory_summary.json");
+  if (!fs.existsSync(memorySummaryPath)) {
+    writeJsonFile(memorySummaryPath, createEmptyMemorySummary(options));
+  }
+}
+
+function appendCombatLog(runLogDir, event) {
+  if (!runLogDir) {
+    return;
+  }
+
+  appendJsonLine(path.join(runLogDir, "combat_log.jsonl"), event);
+}
+
+function createCombatObservedEvent(options, decisionId, stateSummary) {
+  return {
+    event_type: "combat_observed",
+    recorded_at: nowIsoString(),
+    play_session_id: options.playSessionId,
+    decision_id: decisionId,
+    state_version: stateSummary.state_version,
+    state_id: stateSummary.state_id,
+    phase: stateSummary.phase,
+    player: stateSummary.player,
+    hand_count: stateSummary.hand.length,
+    enemies: stateSummary.enemies
+  };
+}
+
+function createCombatProgress(stateSummary) {
+  return {
+    started_at: nowIsoString(),
+    start_state_summary: stateSummary,
+    latest_state_summary: stateSummary,
+    decisions: 0,
+    actions_applied: 0,
+    end_turns_applied: 0,
+    stale_retries: 0,
+    result_timeouts: 0,
+    submit_failures: 0,
+    enemy_hp_lost: 0,
+    player_hp_lost: 0
+  };
+}
+
+function addDecisionRecordToCombatProgress(progress, record, fallbackAfterStateSummary) {
+  if (!progress || !isPlainObject(record)) {
+    return;
+  }
+
+  progress.decisions += 1;
+  progress.latest_state_summary = isPlainObject(record.after_state_summary)
+    ? record.after_state_summary
+    : (isPlainObject(fallbackAfterStateSummary) ? fallbackAfterStateSummary : progress.latest_state_summary);
+
+  if (record.status === "result_timeout") {
+    progress.result_timeouts += 1;
+  }
+  if (record.status === "submit_failed") {
+    progress.submit_failures += 1;
+  }
+
+  const finalPlan = isPlainObject(record.final_action_plan)
+    ? record.final_action_plan
+    : (isPlainObject(record.action_plan) ? record.action_plan : null);
+  if (finalPlan) {
+    progress.actions_applied += Array.isArray(finalPlan.completed) ? finalPlan.completed.length : 0;
+    progress.stale_retries += countObjectValues(finalPlan.stale_retries);
+  }
+
+  const finalLatestAction = isPlainObject(record.final_latest_action) ? record.final_latest_action : null;
+  if (!finalPlan && finalLatestAction && finalLatestAction.result === "applied") {
+    progress.actions_applied += 1;
+  }
+  if (finalLatestAction
+    && finalLatestAction.result === "applied"
+    && finalLatestAction.selected_action_id === "end_turn") {
+    progress.end_turns_applied += 1;
+  }
+
+  const stateDelta = isPlainObject(record.state_delta)
+    ? record.state_delta
+    : (isPlainObject(record.latest_state_delta) ? record.latest_state_delta : null);
+  const playerDelta = stateDelta && isPlainObject(stateDelta.player) ? stateDelta.player : null;
+  const playerHpLost = playerDelta ? readNumber(playerDelta.hp_lost) : null;
+  const enemyHpLost = stateDelta ? readNumber(stateDelta.enemy_hp_lost) : null;
+  if (playerHpLost !== null) {
+    progress.player_hp_lost += playerHpLost;
+  }
+  if (enemyHpLost !== null) {
+    progress.enemy_hp_lost += enemyHpLost;
+  }
+}
+
+function createCombatOutcome(options, progress, endStateSummary, reason, decisions) {
+  const startSummary = progress && isPlainObject(progress.start_state_summary)
+    ? progress.start_state_summary
+    : null;
+  const finalSummary = isPlainObject(endStateSummary)
+    ? endStateSummary
+    : (progress && isPlainObject(progress.latest_state_summary) ? progress.latest_state_summary : null);
+  const startPlayer = startSummary && isPlainObject(startSummary.player) ? startSummary.player : {};
+  const finalPlayer = finalSummary && isPlainObject(finalSummary.player) ? finalSummary.player : {};
+  const hpBefore = readNumber(startPlayer.hp);
+  const hpAfter = readNumber(finalPlayer.hp);
+
+  return {
+    play_session_id: options.playSessionId,
+    reason,
+    result: String(reason).startsWith("terminal:victory")
+      ? "victory"
+      : String(reason).startsWith("terminal:defeat")
+      ? "defeat"
+      : reason === "player_defeated"
+      ? "defeat"
+      : (reason === "no_live_enemies" || String(reason).startsWith("non_combat_phase:") ? "cleared_or_transitioned" : "stopped"),
+    started_at: progress ? progress.started_at : null,
+    ended_at: nowIsoString(),
+    decisions,
+    actions_applied: progress ? progress.actions_applied : 0,
+    turns_ended: progress ? progress.end_turns_applied : 0,
+    stale_retries: progress ? progress.stale_retries : 0,
+    result_timeouts: progress ? progress.result_timeouts : 0,
+    submit_failures: progress ? progress.submit_failures : 0,
+    player: {
+      hp_before: hpBefore,
+      hp_after: hpAfter,
+      hp_lost: hpBefore !== null && hpAfter !== null ? Math.max(0, hpBefore - hpAfter) : null,
+      recorded_hp_lost: progress ? progress.player_hp_lost : 0
+    },
+    enemy_hp_lost: progress ? progress.enemy_hp_lost : 0,
+    start_state: startSummary,
+    end_state: finalSummary
+  };
+}
+
+function createDecisionSubmittedEvent(options, decisionId, stateSummary, decision, submitted) {
+  return {
+    event_type: "decision_submitted",
+    recorded_at: nowIsoString(),
+    play_session_id: options.playSessionId,
+    decision_id: decisionId,
+    state_version: stateSummary.state_version,
+    state_id: stateSummary.state_id,
+    decider_type: options.mode,
+    decision,
+    selected_action_id: isPlainObject(submitted.latest_action) ? submitted.latest_action.selected_action_id || null : null,
+    plan_id: isPlainObject(submitted.action_plan) ? submitted.action_plan.plan_id || null : null
+  };
+}
+
+function createActionResultObservedEvent(options, decisionId, finalLatest, finalStatus, afterStateSummary, stateDelta) {
+  const latestAction = finalLatest && isPlainObject(finalLatest.latest_action) ? finalLatest.latest_action : null;
+  const actionPlan = finalLatest && isPlainObject(finalLatest.action_plan) ? finalLatest.action_plan : null;
+  return {
+    event_type: "action_result_observed",
+    recorded_at: nowIsoString(),
+    play_session_id: options.playSessionId,
+    decision_id: decisionId,
+    status: finalStatus,
+    selected_action_id: latestAction ? latestAction.selected_action_id || null : null,
+    result: latestAction ? latestAction.result || null : null,
+    result_note: latestAction ? latestAction.result_note || null : null,
+    action_type: latestAction ? latestAction.action_type || null : null,
+    plan_id: actionPlan ? actionPlan.plan_id || null : null,
+    plan_status: actionPlan ? actionPlan.status || null : null,
+    completed_count: actionPlan && Array.isArray(actionPlan.completed) ? actionPlan.completed.length : null,
+    after_state_summary: afterStateSummary || null,
+    state_delta: stateDelta || null
+  };
+}
+
+function createCombatEndedEvent(outcome) {
+  return {
+    event_type: "combat_ended",
+    recorded_at: nowIsoString(),
+    ...outcome
+  };
+}
+
+function createCombatStoppedEvent(options, stateSummary, reason, decisions, outcome) {
+  return {
+    event_type: "combat_loop_stopped",
+    recorded_at: nowIsoString(),
+    play_session_id: options.playSessionId,
+    reason,
+    decisions,
+    state_version: stateSummary.state_version,
+    state_id: stateSummary.state_id,
+    phase: stateSummary.phase,
+    player: stateSummary.player,
+    live_enemy_count: countLiveEnemies(stateSummary),
+    hand_count: stateSummary.hand.length,
+    combat_outcome: outcome || null
+  };
+}
+
+function pickRecentEventFields(event) {
+  const eventType = typeof event.event_type === "string" ? event.event_type : null;
+  return {
+    event_type: eventType,
+    recorded_at: typeof event.recorded_at === "string" ? event.recorded_at : null,
+    decision_id: typeof event.decision_id === "string" ? event.decision_id : null,
+    status: typeof event.status === "string" ? event.status : null,
+    result: typeof event.result === "string" ? event.result : null,
+    reason: typeof event.reason === "string" ? event.reason : null,
+    selected_action_id: typeof event.selected_action_id === "string" ? event.selected_action_id : null,
+    plan_status: typeof event.plan_status === "string" ? event.plan_status : null,
+    completed_count: readNumber(event.completed_count),
+    state_delta: isPlainObject(event.state_delta) ? event.state_delta : null
+  };
+}
+
+function pickRecentDecisionFields(record) {
+  return {
+    recorded_at: typeof record.recorded_at === "string" ? record.recorded_at : null,
+    decision_id: typeof record.decision_id === "string" ? record.decision_id : null,
+    status: typeof record.status === "string" ? record.status : null,
+    decision: isPlainObject(record.decision) ? record.decision : null,
+    state_delta: isPlainObject(record.state_delta) ? record.state_delta : null,
+    wait_error: typeof record.wait_error === "string" ? record.wait_error : null,
+    submit_error: typeof record.submit_error === "string" ? record.submit_error : null
+  };
+}
+
+function buildRecentHistory(runLogDir, limit) {
+  if (!runLogDir) {
+    return null;
+  }
+
+  const normalizedLimit = Math.max(0, readNumber(limit) ?? 0);
+  if (normalizedLimit <= 0) {
+    return null;
+  }
+
+  const combatEvents = readJsonLines(path.join(runLogDir, "combat_log.jsonl"))
+    .map(pickRecentEventFields)
+    .slice(-normalizedLimit);
+  const decisions = readJsonLines(path.join(runLogDir, "decisions.jsonl"))
+    .map(pickRecentDecisionFields)
+    .slice(-normalizedLimit);
+  const memorySummary = readJsonFile(path.join(runLogDir, "memory_summary.json"));
+
+  if (combatEvents.length === 0 && decisions.length === 0 && !isPlainObject(memorySummary)) {
+    return null;
+  }
+
+  return {
+    limit: normalizedLimit,
+    memory_summary: isPlainObject(memorySummary) ? memorySummary : null,
+    combat_events: combatEvents,
+    decisions
+  };
+}
+
+function buildActionMetadata(options, snapshot) {
+  const state = isPlainObject(snapshot.state) ? snapshot.state : {};
+  const phase = typeof state.phase === "string" ? state.phase : "";
+  if (phase !== "shop" && phase !== "card_selection" && phase !== "combat_turn") {
+    return null;
+  }
+
+  const metadata = readJsonFile(options.actionMetadataPath);
+  return isPlainObject(metadata) ? metadata : null;
+}
+
+function buildShopVisitHistory(runLogDir, limit) {
+  if (!runLogDir) {
+    return null;
+  }
+
+  const normalizedLimit = Math.max(0, readNumber(limit) ?? 0);
+  if (normalizedLimit <= 0) {
+    return null;
+  }
+
+  const records = readJsonLines(path.join(runLogDir, "decisions.jsonl"));
+  const actions = records
+    .map((record) => {
+      const stateSummary = isPlainObject(record.state_summary) ? record.state_summary : {};
+      const afterStateSummary = isPlainObject(record.after_state_summary) ? record.after_state_summary : {};
+      const phase = typeof stateSummary.phase === "string" ? stateSummary.phase : null;
+      const afterPhase = typeof afterStateSummary.phase === "string" ? afterStateSummary.phase : null;
+      if (phase !== "shop" && phase !== "card_selection" && afterPhase !== "shop" && afterPhase !== "card_selection") {
+        return null;
+      }
+
+      const latestAction = isPlainObject(record.final_latest_action)
+        ? record.final_latest_action
+        : isPlainObject(record.latest_action)
+          ? record.latest_action
+          : null;
+      const decision = isPlainObject(record.decision) ? record.decision : {};
+      const selectedActionId = typeof decision.selected_action_id === "string"
+        ? decision.selected_action_id
+        : latestAction && typeof latestAction.selected_action_id === "string"
+          ? latestAction.selected_action_id
+          : null;
+
+      return {
+        recorded_at: typeof record.recorded_at === "string" ? record.recorded_at : null,
+        phase,
+        after_phase: afterPhase,
+        selected_action_id: selectedActionId,
+        status: typeof record.status === "string" ? record.status : null,
+        result: latestAction && typeof latestAction.result === "string" ? latestAction.result : null
+      };
+    })
+    .filter(Boolean)
+    .slice(-normalizedLimit);
+
+  return actions.length === 0 ? null : {
+    limit: normalizedLimit,
+    actions
+  };
+}
+
+function hasStateChangedSinceDecision(snapshot, latestSnapshot) {
+  const originalVersion = readNumber(snapshot.state_version);
+  const latestVersion = readNumber(latestSnapshot.state_version);
+  const originalStateId = typeof snapshot.state_id === "string" ? snapshot.state_id : "";
+  const latestStateId = typeof latestSnapshot.state_id === "string" ? latestSnapshot.state_id : "";
+
+  if (originalVersion !== null && latestVersion !== null && originalVersion !== latestVersion) {
+    return true;
+  }
+
+  return originalStateId !== "" && latestStateId !== "" && originalStateId !== latestStateId;
+}
+
+async function waitForSubmittedResult(options, planId, submissionId) {
+  const deadline = Date.now() + options.resultTimeoutMs;
+  let lastLatest = null;
+  while (Date.now() <= deadline) {
+    const latest = await getLatestAction(options.bridgeUrl, options.timeoutMs);
+    lastLatest = latest;
+    const plan = isPlainObject(latest.action_plan) ? latest.action_plan : null;
+    if (planId && plan && plan.plan_id === planId && (plan.status === "completed" || plan.status === "failed")) {
+      return latest;
+    }
+
+    const latestAction = isPlainObject(latest.latest_action) ? latest.latest_action : null;
+    if (planId
+      && plan
+      && latestAction
+      && latestAction.plan_id === planId
+      && latestAction.result !== null
+      && Array.isArray(plan.actions)) {
+      const actionIndex = readNumber(latestAction.plan_action_index);
+      if (actionIndex !== null && actionIndex >= plan.actions.length - 1) {
+        return latest;
+      }
+    }
+
+    if (!planId
+      && latestAction
+      && latestAction.submission_id === submissionId
+      && latestAction.result !== null) {
+      return latest;
+    }
+
+    await sleep(options.pollMs);
+  }
+
+  throw new Error(`제출 결과를 기다리다 시간 초과했습니다. plan_id=${planId || ""}, submission_id=${submissionId || ""}, latest=${JSON.stringify(lastLatest)}`);
+}
+
+function hasPendingAction(snapshot) {
+  const latestAction = snapshot.latest_action;
+  if (!isPlainObject(latestAction)) {
+    return false;
+  }
+
+  return latestAction.result === null
+    && latestAction.execution_status !== "invalid"
+    && latestAction.execution_status !== "failed"
+    && latestAction.execution_status !== "stale"
+    && latestAction.execution_status !== "unsupported";
+}
+
+function isPostEndTurnTransitionSnapshot(snapshot) {
+  if (!isPlainObject(snapshot)) {
+    return false;
+  }
+
+  const state = isPlainObject(snapshot.state) ? snapshot.state : {};
+  if (state.phase !== "combat_turn") {
+    return false;
+  }
+
+  const player = isPlainObject(state.player) ? state.player : {};
+  const energy = readNumber(player.energy);
+  const piles = isPlainObject(state.piles) ? state.piles : {};
+  const hand = Array.isArray(piles.hand) ? piles.hand : [];
+  const legalActions = Array.isArray(state.legal_actions) ? state.legal_actions.filter(isPlainObject) : [];
+  const legalActionIds = legalActions
+    .map((action) => (typeof action.action_id === "string" ? action.action_id : ""))
+    .filter((actionId) => actionId !== "");
+
+  return hand.length === 0
+    && energy === 0
+    && legalActionIds.length === 1
+    && legalActionIds[0] === "end_turn";
+}
+
+function readNumber(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function readCount(source, key) {
+  if (!isPlainObject(source)) {
+    return 0;
+  }
+
+  const value = readNumber(source[key]);
+  return value === null ? 0 : value;
+}
+
+function readString(value) {
+  return typeof value === "string" ? value : "";
+}
+
+function findPathOptionForMapAction(map, legalAction) {
+  if (!isPlainObject(map) || !isPlainObject(legalAction)) {
+    return null;
+  }
+
+  const summary = isPlainObject(map.path_options_summary) ? map.path_options_summary : {};
+  const options = Array.isArray(summary.options) ? summary.options.filter(isPlainObject) : [];
+  const nodeId = readString(legalAction.node_id);
+  if (nodeId === "") {
+    return null;
+  }
+
+  return options.find((option) => readString(option.start_node_id) === nodeId) || null;
+}
+
+function scoreMapPathOption(option, player) {
+  if (!isPlainObject(option)) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  const counts = isPlainObject(option.reachable_room_counts) ? option.reachable_room_counts : {};
+  const playerHp = readNumber(player.hp);
+  const playerMaxHp = readNumber(player.max_hp);
+  const hpRatio = playerHp !== null && playerMaxHp !== null && playerMaxHp > 0
+    ? playerHp / playerMaxHp
+    : null;
+  const lowHp = hpRatio !== null && hpRatio < 0.45;
+  const veryLowHp = hpRatio !== null && hpRatio < 0.25;
+
+  let score = 0;
+  score += readCount(counts, "RestSite") * (lowHp ? 18 : 7);
+  score += readCount(counts, "Shop") * 6;
+  score += readCount(counts, "Treasure") * 5;
+  score += readCount(counts, "Monster") * (lowHp ? -4 : 2);
+  score += readCount(counts, "Elite") * (veryLowHp ? -18 : (lowHp ? -10 : 8));
+  score += readCount(counts, "Unknown") * (lowHp ? -1 : 1);
+  score += readCount(counts, "Boss") * 1;
+
+  const startRoomType = readString(option.start_room_type);
+  if (startRoomType === "RestSite") {
+    score += lowHp ? 30 : 8;
+  } else if (startRoomType === "Shop") {
+    score += 6;
+  } else if (startRoomType === "Elite") {
+    score += veryLowHp ? -35 : (lowHp ? -20 : 10);
+  } else if (startRoomType === "Monster") {
+    score += lowHp ? -8 : 2;
+  }
+
+  return score;
+}
+
+function summarizeMapOptionForReason(option) {
+  if (!isPlainObject(option)) {
+    return "경로 요약 없음";
+  }
+
+  const counts = isPlainObject(option.reachable_room_counts) ? option.reachable_room_counts : {};
+  const fragments = [
+    `시작=${readString(option.start_room_type) || "Unknown"}`,
+    `샘플=${readNumber(option.path_count_sampled) ?? 0}`,
+    `휴식=${readCount(counts, "RestSite")}`,
+    `상점=${readCount(counts, "Shop")}`,
+    `엘리트=${readCount(counts, "Elite")}`,
+    `보물=${readCount(counts, "Treasure")}`,
+    `전투=${readCount(counts, "Monster")}`,
+    `이벤트=${readCount(counts, "Unknown")}`
+  ];
+  return fragments.join(", ");
+}
+
+function summarizeMapPlanning(map) {
+  if (!isPlainObject(map)) {
+    return null;
+  }
+
+  const summary = isPlainObject(map.path_options_summary) ? map.path_options_summary : {};
+  const options = Array.isArray(summary.options) ? summary.options.filter(isPlainObject) : [];
+  return {
+    current_node_id: isPlainObject(map.current) ? readString(map.current.node_id) || null : null,
+    available_next_node_count: readNumber(map.available_next_node_count),
+    full_graph_node_count: isPlainObject(map.full_graph) ? readNumber(map.full_graph.node_count) : null,
+    full_graph_edge_count: isPlainObject(map.full_graph) ? readNumber(map.full_graph.edge_count) : null,
+    path_option_count: options.length,
+    path_options: options.map((option) => ({
+      start_node_id: readString(option.start_node_id) || null,
+      start_room_type: readString(option.start_room_type) || null,
+      path_count_sampled: readNumber(option.path_count_sampled),
+      reachable_room_counts: isPlainObject(option.reachable_room_counts) ? option.reachable_room_counts : {}
+    }))
+  };
+}
+
+function chooseMapDecision(state, legalActions, player) {
+  const map = isPlainObject(state.map) ? state.map : {};
+  const mapActions = legalActions.filter((legalAction) =>
+    legalAction.type === "choose_map_node" && typeof legalAction.action_id === "string"
+  );
+  if (mapActions.length === 0) {
+    return null;
+  }
+
+  const rankedActions = mapActions
+    .map((legalAction) => {
+      const option = findPathOptionForMapAction(map, legalAction);
+      return {
+        legalAction,
+        option,
+        score: option ? scoreMapPathOption(option, player) : 0
+      };
+    })
+    .sort((left, right) => right.score - left.score);
+
+  const selected = rankedActions[0];
+  return {
+    selected_action_id: selected.legalAction.action_id,
+    reason: `휴리스틱 지도 선택: ${selected.legalAction.node_id || selected.legalAction.action_id}. ${summarizeMapOptionForReason(selected.option)}`
+  };
+}
+
+function scoreFutureOfPotionsOption(legalAction) {
+  const text = [
+    legalAction.description,
+    legalAction.summary,
+    legalAction.title
+  ].filter((value) => typeof value === "string").join(" ");
+
+  if (text.includes("약화 포션")) {
+    return 10;
+  }
+
+  if (text.includes("폭발성 앰플")) {
+    return 30;
+  }
+
+  return 20;
+}
+
+function hasFilledPotionSlot(state) {
+  const player = isPlainObject(state && state.player) ? state.player : {};
+  const potionSlots = Array.isArray(player.potion_slots) ? player.potion_slots : [];
+  return potionSlots.some((slot) => {
+    if (!isPlainObject(slot) || slot.empty === true) {
+      return false;
+    }
+
+    return isPlainObject(slot.potion) || readNumber(slot.slot_index) !== null;
+  });
+}
+
+function choosePotionAdapterAction(state, legalActions) {
+  const usablePotionAction = legalActions.find((legalAction) =>
+    legalAction.type === "use_potion" && typeof legalAction.action_id === "string"
+  );
+  if (usablePotionAction) {
+    return {
+      selected_action_id: usablePotionAction.action_id,
+      reason: `어댑터 검증: 인벤토리 포션을 즉시 사용합니다. ${usablePotionAction.potion_id || usablePotionAction.action_id}`
+    };
+  }
+
+  if (!hasFilledPotionSlot(state)) {
+    return null;
+  }
+
+  const discardPotionAction = legalActions.find((legalAction) => {
+    if (typeof legalAction.action_id !== "string") {
+      return false;
+    }
+
+    const text = [
+      legalAction.type,
+      legalAction.action_id,
+      legalAction.summary,
+      legalAction.description,
+      legalAction.potion_id,
+      legalAction.name
+    ].filter((value) => typeof value === "string").join(" ").toLowerCase();
+
+    const mentionsPotion = text.includes("potion") || text.includes("포션");
+    const mentionsDiscard = text.includes("discard")
+      || text.includes("drop")
+      || text.includes("remove_potion")
+      || text.includes("throw_away")
+      || text.includes("버리")
+      || text.includes("폐기");
+    return mentionsPotion && mentionsDiscard;
+  });
+
+  if (!discardPotionAction) {
+    return null;
+  }
+
+  return {
+    selected_action_id: discardPotionAction.action_id,
+    reason: `어댑터 검증: 인벤토리 포션을 사용할 수 없어 버립니다. ${discardPotionAction.potion_id || discardPotionAction.action_id}`
+  };
+}
+
+function chooseCardSelectionDecision(state, legalActions) {
+  const cardSelection = isPlainObject(state.card_selection) ? state.card_selection : {};
+  const selectionKind = typeof cardSelection.selection_kind === "string"
+    ? cardSelection.selection_kind
+    : "unknown";
+  const selectedCount = readNumber(cardSelection.selected_count) ?? 0;
+  const minSelect = readNumber(cardSelection.min_select);
+  const maxSelect = readNumber(cardSelection.max_select);
+  const targetSelect = getCardSelectionTargetCount(minSelect, maxSelect);
+  const confirmAction = legalActions.find((legalAction) =>
+    legalAction.type === "confirm_card_selection" && typeof legalAction.action_id === "string"
+  );
+
+  if (selectedCount >= targetSelect && confirmAction) {
+    return {
+      selected_action_id: confirmAction.action_id,
+      reason: `휴리스틱 카드 선택 확인: ${selectionKind}, selected=${selectedCount}, target=${targetSelect}`
+    };
+  }
+
+  const chooseActions = legalActions.filter((legalAction) =>
+    legalAction.type === "choose_card_selection" && typeof legalAction.action_id === "string"
+  );
+  if (selectedCount < targetSelect && chooseActions.length > 0) {
+    const cardByActionId = buildCardSelectionCardLookup(cardSelection);
+    const selectedAction = chooseActions
+      .map((legalAction) => ({
+        legalAction,
+        score: scoreCardSelectionAction(selectionKind, legalAction, cardByActionId.get(legalAction.action_id))
+      }))
+      .sort((left, right) => right.score - left.score)[0].legalAction;
+
+    return {
+      selected_action_id: selectedAction.action_id,
+      reason: `휴리스틱 카드 선택: ${selectionKind}, ${selectedAction.name || selectedAction.card_selection_id || selectedAction.action_id}`
+    };
+  }
+
+  if (confirmAction) {
+    return {
+      selected_action_id: confirmAction.action_id,
+      reason: `휴리스틱 카드 선택 확인: ${selectionKind}, 더 선택할 후보가 없습니다.`
+    };
+  }
+
+  return null;
+}
+
+function getCardSelectionTargetCount(minSelect, maxSelect) {
+  const minimum = minSelect === null ? 1 : Math.max(0, minSelect);
+  if (maxSelect === null) {
+    return minimum;
+  }
+
+  return Math.min(minimum, Math.max(0, maxSelect));
+}
+
+function buildCardSelectionCardLookup(cardSelection) {
+  const cards = Array.isArray(cardSelection.cards)
+    ? cardSelection.cards.filter(isPlainObject)
+    : [];
+  const lookup = new Map();
+  for (const card of cards) {
+    const cardSelectionId = typeof card.card_selection_id === "string" ? card.card_selection_id : "";
+    const cardSelectionIndex = readNumber(card.card_selection_index);
+    if (cardSelectionId !== "") {
+      lookup.set(`choose_${cardSelectionId}`, card);
+    }
+    if (cardSelectionIndex !== null) {
+      lookup.set(`index:${cardSelectionIndex}`, card);
+    }
+  }
+
+  return lookup;
+}
+
+function scoreCardSelectionAction(selectionKind, legalAction, card) {
+  const normalizedKind = String(selectionKind || "").toLowerCase();
+  const cardName = readCardSelectionText(legalAction, card, "name").toLowerCase();
+  const cardId = readCardSelectionText(legalAction, card, "card_id").toUpperCase();
+  const cardType = readCardSelectionText(legalAction, card, "type").toLowerCase();
+  const rarity = readCardSelectionText(legalAction, card, "rarity").toLowerCase();
+  const cost = readNumber(card?.cost) ?? readNumber(card?.base_cost) ?? 1;
+
+  if (normalizedKind.includes("remove")) {
+    return scoreCardRemovalCandidate(cardName, cardId, cardType);
+  }
+
+  if (normalizedKind.includes("transform")) {
+    return scoreCardTransformCandidate(cardName, cardId, cardType);
+  }
+
+  if (normalizedKind.includes("upgrade") || normalizedKind.includes("enchant")) {
+    return scoreCardUpgradeCandidate(cardName, cardId, cardType, rarity, cost);
+  }
+
+  return scoreGenericCardSelectionCandidate(cardName, cardId, cardType, rarity, cost);
+}
+
+function readCardSelectionText(legalAction, card, fieldName) {
+  const actionFieldName = fieldName === "type" ? "card_type" : fieldName;
+  const actionValue = legalAction && typeof legalAction[fieldName] === "string"
+    ? legalAction[fieldName]
+    : (legalAction && typeof legalAction[actionFieldName] === "string"
+      ? legalAction[actionFieldName]
+      : "");
+  const cardFieldName = fieldName === "type" ? "card_type" : fieldName;
+  const cardValue = card && typeof card[fieldName] === "string"
+    ? card[fieldName]
+    : (card && typeof card[cardFieldName] === "string"
+      ? card[cardFieldName]
+      : "");
+  return actionValue || cardValue || "";
+}
+
+function scoreCardUpgradeCandidate(cardName, cardId, cardType, rarity, cost) {
+  let score = 0;
+  if (cardId.includes("BASH") || cardName.includes("강타")) {
+    score += 120;
+  }
+  if (cardId.includes("WHIRLWIND") || cardName.includes("소용돌이")) {
+    score += 95;
+  }
+  if (cardId.includes("PERFECTED_STRIKE") || cardName.includes("완벽한 타격")) {
+    score += 80;
+  }
+  if (cardType.includes("attack")) {
+    score += 30;
+  }
+  if (cardType.includes("skill")) {
+    score += 20;
+  }
+  if (rarity.includes("rare")) {
+    score += 25;
+  }
+  if (rarity.includes("uncommon")) {
+    score += 15;
+  }
+  score += Math.max(0, cost) * 5;
+  if (cardId.includes("STRIKE") || cardName === "타격") {
+    score -= 20;
+  }
+  if (cardId.includes("DEFEND") || cardName === "수비") {
+    score -= 15;
+  }
+
+  return score;
+}
+
+function scoreCardRemovalCandidate(cardName, cardId, cardType) {
+  let score = 0;
+  if (cardType.includes("curse") || cardId.includes("CURSE")) {
+    score += 200;
+  }
+  if (cardType.includes("status") || cardId.includes("STATUS")) {
+    score += 150;
+  }
+  if (cardId.includes("STRIKE") || cardName === "타격") {
+    score += 90;
+  }
+  if (cardId.includes("DEFEND") || cardName === "수비") {
+    score += 70;
+  }
+
+  return score;
+}
+
+function scoreCardTransformCandidate(cardName, cardId, cardType) {
+  return scoreCardRemovalCandidate(cardName, cardId, cardType);
+}
+
+function scoreGenericCardSelectionCandidate(cardName, cardId, cardType, rarity, cost) {
+  let score = 0;
+  if (cardType.includes("attack")) {
+    score += 20;
+  }
+  if (cardType.includes("skill")) {
+    score += 15;
+  }
+  if (rarity.includes("rare")) {
+    score += 30;
+  }
+  if (rarity.includes("uncommon")) {
+    score += 15;
+  }
+  score += Math.max(0, cost) * 3;
+  if (cardId.includes("STRIKE") || cardName === "타격") {
+    score -= 10;
+  }
+  if (cardId.includes("DEFEND") || cardName === "수비") {
+    score -= 8;
+  }
+
+  return score;
+}
+
+function chooseHeuristicDecision(snapshot, maxActionsPerTurn) {
+  const state = snapshot.state;
+  if (!isPlainObject(state)) {
+    return null;
+  }
+
+  const player = isPlainObject(state.player) ? state.player : {};
+  let energy = readNumber(player.energy);
+  const legalActions = Array.isArray(state.legal_actions)
+    ? state.legal_actions.filter(isPlainObject)
+    : [];
+  const phase = typeof state.phase === "string" ? state.phase : "";
+  if (phase === "game_over" || phase === "run_finished") {
+    return null;
+  }
+
+  if (phase === "main_menu") {
+    const continueAction = legalActions.find((legalAction) =>
+      legalAction.type === "continue_run" && typeof legalAction.action_id === "string"
+    );
+    if (continueAction) {
+      return {
+        selected_action_id: continueAction.action_id,
+        reason: "휴리스틱 메인 메뉴 처리: 저장된 런을 이어서 진행"
+      };
+    }
+  }
+
+  if (phase === "main_menu") {
+    const startNewRunAction = legalActions.find((legalAction) =>
+      legalAction.type === "start_new_run" && typeof legalAction.action_id === "string"
+    );
+    if (startNewRunAction) {
+      return {
+        selected_action_id: startNewRunAction.action_id,
+        reason: "메인 메뉴에서 저장된 런이 없어 새 싱글플레이 런을 시작"
+      };
+    }
+  }
+
+  const potionAdapterAction = choosePotionAdapterAction(state, legalActions);
+  if (potionAdapterAction) {
+    return potionAdapterAction;
+  }
+
+  if (phase === "reward") {
+    const preferredRewardActionTypes = [
+      "claim_gold_reward",
+      "claim_relic_reward",
+      "claim_potion_reward",
+      "choose_card_reward",
+      "skip_card_reward",
+      "proceed_reward_screen"
+    ];
+    for (const actionType of preferredRewardActionTypes) {
+      const rewardAction = legalActions.find((legalAction) => legalAction.type === actionType);
+      if (rewardAction && typeof rewardAction.action_id === "string") {
+        return {
+          selected_action_id: rewardAction.action_id,
+          reason: `휴리스틱 보상 처리: ${actionType}`
+        };
+      }
+    }
+  }
+
+  if (phase === "card_selection") {
+    return chooseCardSelectionDecision(state, legalActions);
+  }
+
+  if (phase === "treasure") {
+    const preferredTreasureActionTypes = [
+      "open_treasure_chest",
+      "claim_treasure_relic",
+      "choose_treasure_relic",
+      "proceed_treasure"
+    ];
+    for (const actionType of preferredTreasureActionTypes) {
+      const treasureAction = legalActions.find((legalAction) => legalAction.type === actionType);
+      if (treasureAction && typeof treasureAction.action_id === "string") {
+        return {
+          selected_action_id: treasureAction.action_id,
+          reason: `Heuristic treasure action: ${actionType}`
+        };
+      }
+    }
+  }
+
+  if (phase === "event") {
+    const eventActions = legalActions.filter((legalAction) =>
+      legalAction.type === "choose_event_option" && typeof legalAction.action_id === "string"
+    );
+    const event = isPlainObject(state.event) ? state.event : {};
+    const eventId = typeof event.event_id === "string" ? event.event_id : "";
+    if (eventId === "EVENT.THE_FUTURE_OF_POTIONS") {
+      const rankedPotionActions = eventActions
+        .map((legalAction) => ({
+          legalAction,
+          score: scoreFutureOfPotionsOption(legalAction)
+        }))
+        .sort((left, right) => left.score - right.score);
+      if (rankedPotionActions.length > 0) {
+        const selected = rankedPotionActions[0].legalAction;
+        return {
+          selected_action_id: selected.action_id,
+          reason: `휴리스틱 이벤트 처리: 포션의 미래? - ${selected.description || selected.action_id}`
+        };
+      }
+    }
+
+    const eventAction = eventActions[0];
+    if (eventAction) {
+      return {
+        selected_action_id: eventAction.action_id,
+        reason: `Heuristic event option: ${eventAction.title || eventAction.event_option_id || eventAction.action_id}`
+      };
+    }
+  }
+
+  if (phase === "rest_site") {
+    const proceedAction = legalActions.find((legalAction) =>
+      legalAction.type === "proceed_rest_site" && typeof legalAction.action_id === "string"
+    );
+    const restActions = legalActions.filter((legalAction) =>
+      legalAction.type === "choose_rest_site_option" && typeof legalAction.action_id === "string"
+    );
+    const playerHp = readNumber(player.hp);
+    const playerMaxHp = readNumber(player.max_hp);
+    const shouldHeal = playerHp !== null && playerMaxHp !== null && playerHp < playerMaxHp;
+    const healAction = restActions.find((legalAction) => {
+      const text = [
+        legalAction.rest_option_id,
+        legalAction.title,
+        legalAction.description,
+        legalAction.summary
+      ].filter((value) => typeof value === "string").join(" ").toLowerCase();
+      return text.includes("heal") || text.includes("rest") || text.includes("회복") || text.includes("휴식");
+    });
+    const nonHealAction = restActions.find((legalAction) => legalAction !== healAction);
+    const selectedAction = (shouldHeal ? healAction : null)
+      || proceedAction
+      || nonHealAction
+      || restActions[0];
+    if (selectedAction) {
+      return {
+        selected_action_id: selectedAction.action_id,
+        reason: `휴리스틱 모닥불 처리: ${selectedAction.rest_option_id || selectedAction.action_id}`
+      };
+    }
+  }
+
+  if (phase === "shop") {
+    const proceedAction = legalActions.find((legalAction) =>
+      legalAction.type === "proceed_shop" && typeof legalAction.action_id === "string"
+    );
+    if (proceedAction) {
+      return {
+        selected_action_id: proceedAction.action_id,
+        reason: "휴리스틱 상점 처리: 구매 판단은 아직 보수적으로 건너뛰고 진행"
+      };
+    }
+  }
+
+  if (phase === "map") {
+    const mapDecision = chooseMapDecision(state, legalActions, player);
+    if (mapDecision) {
+      return mapDecision;
+    }
+  }
+
+  const enemies = Array.isArray(state.enemies)
+    ? state.enemies.filter((enemy) => isPlainObject(enemy) && (readNumber(enemy.hp) ?? 1) > 0)
+    : [];
+  const primaryEnemy = enemies[0] || null;
+  const targetCombatId = primaryEnemy ? readNumber(primaryEnemy.combat_id) : null;
+
+  const attackAction = legalActions.find((legalAction) => {
+    if (legalAction.type !== "play_card" || typeof legalAction.action_id !== "string") {
+      return false;
+    }
+
+    const execution = isPlainObject(legalAction.execution) ? legalAction.execution : {};
+    const card = isPlainObject(execution.card) ? execution.card : {};
+    return readString(card.type).toLowerCase().includes("attack");
+  });
+  if (attackAction) {
+    return {
+      selected_action_id: attackAction.action_id,
+      reason: `휴리스틱 전투 처리: 공격 카드 하나를 선택합니다. ${attackAction.summary || attackAction.action_id}`
+    };
+  }
+
+  for (const legalAction of legalActions) {
+    if (legalAction.type !== "play_card" || legalAction.target_id === null || legalAction.target_id === undefined) {
+      continue;
+    }
+
+    const cost = readNumber(legalAction.energy_cost);
+    if (energy !== null && cost !== null && cost > energy) {
+      continue;
+    }
+
+    const combatCardId = readNumber(legalAction.combat_card_id);
+    const actionTargetCombatId = readNumber(legalAction.target_combat_id) ?? targetCombatId;
+    if (combatCardId === null || actionTargetCombatId === null) {
+      continue;
+    }
+
+    if (usedCombatCardIds.has(combatCardId)) {
+      continue;
+    }
+
+    return {
+      selected_action_id: legalAction.action_id,
+      reason: `휴리스틱 전투 처리: 사용 가능한 공격 카드 하나를 선택합니다. combat_card_id=${combatCardId}, target_combat_id=${actionTargetCombatId}`
+    };
+  }
+
+  const endTurn = legalActions.find((legalAction) => legalAction.type === "end_turn");
+  if (endTurn) {
+    return {
+      selected_action_id: endTurn.action_id,
+      note: "사용할 공격 카드가 없어 턴을 종료합니다."
+    };
+  }
+
+  return null;
+}
+
+function buildCommandPrompt(options, snapshot) {
+  const recentHistory = buildRecentHistory(options.resolvedRunLogDir, options.recentHistoryLimit);
+  const actionMetadata = buildActionMetadata(options, snapshot);
+  const shopVisitHistory = buildShopVisitHistory(options.resolvedRunLogDir, 12);
+  return JSON.stringify(
+    {
+      task: "Slay the Spire 2 상태를 보고 현재 legal_actions 중 실행할 행동 하나를 JSON으로만 결정하세요.",
+      play_session_id: options.playSessionId,
+      recent_history: recentHistory,
+      action_metadata: actionMetadata,
+      shop_visit_history: shopVisitHistory,
+      response_contract: {
+        selected_action_id: "legal_actions 배열에 있는 action_id 문자열",
+        reason: "선택 이유를 한 문장으로 설명"
+      },
+      rules: [
+        "반드시 legal_actions에 있는 action_id 하나만 selected_action_id로 선택하세요.",
+        "actions 배열을 사용하지 마세요. LLM command 모드의 기본 계약은 단일 행동입니다.",
+        "action_metadata는 조작 절차와 화면 전환만 설명합니다. 카드, 유물, 포션의 가치 평가는 포함하지 않습니다.",
+        "상점에서 remove_card_at_shop을 고르면 다음 상태는 보통 card_selection입니다. 이후 choose_card_selection 하나를 고르고 confirm_card_selection으로 확정합니다.",
+        "card_selection에서 적절한 대상이 없고 cancel_card_selection이 legal_actions에 있으면 취소할 수 있습니다.",
+        "전투에서 use_potion을 고를 때는 potion_slot_index와 target_combat_id가 이미 legal_actions에 고정되어 있는 action_id를 선택하세요.",
+        "카드 선택 화면에서는 selected_count, min_select, max_select를 보고 다음에 필요한 카드 선택 또는 확인 행동 하나만 고르세요.",
+        "지도 화면에서는 state.map.path_options_summary.options를 먼저 읽고, 각 start_node_id 이후 보스까지 이어지는 휴식, 상점, 엘리트, 보물, 전투, 이벤트 분포를 비교한 뒤 choose_map_node 하나를 고르세요.",
+        "지도에서 실제로 제출할 값은 sample_paths 안의 중간 노드가 아니라 legal_actions에 있는 현재 선택 가능 노드의 action_id입니다.",
+        "메인 메뉴에서 continue_run이 legal_actions에 있으면 저장된 런을 이어가는 행동입니다.",
+        "전투에서도 한 번에 카드 한 장 또는 턴 종료 하나만 선택하세요. 실행 후 상태를 다시 관찰합니다.",
+        "설명 없이 JSON 객체만 출력하세요."
+      ],
+      state_version: snapshot.state_version,
+      state: snapshot.state
+    },
+    null,
+    2
+  );
+}
+
+function runCommandDecision(options, snapshot) {
+  if (options.command.trim() === "") {
+    throw new Error("--mode command에는 --command가 필요합니다.");
+  }
+
+  const prompt = buildCommandPrompt(options, snapshot);
+  return new Promise((resolve, reject) => {
+    const child = spawn(options.command, options.commandArgs, {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true
+    });
+
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`의사결정 명령이 ${options.timeoutMs}ms 안에 끝나지 않았습니다.`));
+    }, options.timeoutMs);
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(`의사결정 명령 실패: exit=${code}, stderr=${stderr.trim()}`));
+        return;
+      }
+
+      const parsed = safeJsonParse(stdout.trim());
+      if (!isPlainObject(parsed)) {
+        reject(new Error(`의사결정 명령 출력이 JSON 객체가 아닙니다: ${stdout}`));
+        return;
+      }
+
+      resolve(parsed);
+    });
+
+    child.stdin.end(prompt);
+  });
+}
+
+async function chooseDecision(options, snapshot) {
+  if (options.mode === "heuristic") {
+    return chooseHeuristicDecision(snapshot, options.maxActionsPerTurn);
+  }
+
+  if (options.mode === "command") {
+    return runCommandDecision(options, snapshot);
+  }
+
+  throw new Error(`지원하지 않는 의사결정 모드입니다: ${options.mode}`);
+}
+
+async function waitForReadySnapshot(options, lastSeenVersion) {
+  const deadline = Date.now() + options.timeoutMs;
+  let lastSnapshot = null;
+  while (Date.now() <= deadline) {
+    const snapshot = await getCurrentState(options.bridgeUrl, options.timeoutMs);
+    lastSnapshot = snapshot;
+    const stateVersion = readNumber(snapshot.state_version) ?? 0;
+    if (snapshot.status === "ready"
+      && stateVersion >= lastSeenVersion
+      && !hasPendingAction(snapshot)
+      && !isPostEndTurnTransitionSnapshot(snapshot)) {
+      return snapshot;
+    }
+
+    await sleep(options.pollMs);
+  }
+
+  throw new Error(`결정 가능한 상태를 기다리다 시간 초과했습니다. 마지막 상태: ${JSON.stringify(lastSnapshot)}`);
+}
+
+async function waitForCombatDecisionOrStop(options, lastSeenVersion) {
+  const deadline = Date.now() + options.timeoutMs;
+  let lastSnapshot = null;
+  let lastReadiness = null;
+  while (Date.now() <= deadline) {
+    const snapshot = await getCurrentState(options.bridgeUrl, options.timeoutMs);
+    lastSnapshot = snapshot;
+    const stateVersion = readNumber(snapshot.state_version) ?? 0;
+    if (snapshot.status === "ready"
+      && stateVersion >= lastSeenVersion
+      && !hasPendingAction(snapshot)
+      && !isPostEndTurnTransitionSnapshot(snapshot)) {
+      const readiness = classifyCombatReadiness(snapshot);
+      lastReadiness = readiness;
+      if (readiness.readyForDecision || readiness.shouldStop) {
+        return {
+          snapshot,
+          stateSummary: readiness.stateSummary,
+          stopReason: readiness.shouldStop ? readiness.reason : null
+        };
+      }
+    }
+
+    await sleep(options.pollMs);
+  }
+
+  throw new Error(`전투 판단 가능 상태를 기다리다 시간 초과했습니다. 마지막 판정=${JSON.stringify(lastReadiness)}, 마지막 상태=${JSON.stringify(lastSnapshot)}`);
+}
+
+async function main() {
+  const options = parseArgs(process.argv.slice(2));
+  if (options.help) {
+    showHelp();
+    return;
+  }
+
+  if (typeof options.scenarioId !== "string" || options.scenarioId.trim() === "") {
+    options.scenarioId = createRecordId("scenario");
+  }
+  if (typeof options.playSessionId !== "string" || options.playSessionId.trim() === "") {
+    options.playSessionId = createRecordId("session");
+  }
+
+  const runLogDir = ensureRunLogDir(options.runLogDir);
+  options.resolvedRunLogDir = runLogDir;
+  ensureRunRecordFiles(runLogDir, options);
+
+  let decisions = 0;
+  let lastSeenVersion = 0;
+  let combatLoopStopped = false;
+  let combatProgress = null;
+  let staleRetryCount = 0;
+  while (decisions < options.maxDecisions) {
+    const readiness = options.untilCombatEnd
+      ? await waitForCombatDecisionOrStop(options, lastSeenVersion)
+      : null;
+    if (readiness && readiness.stopReason) {
+      combatLoopStopped = true;
+      const combatOutcome = createCombatOutcome(options, combatProgress, readiness.stateSummary, readiness.stopReason, decisions);
+      appendCombatLog(runLogDir, createCombatEndedEvent(combatOutcome));
+      appendCombatLog(runLogDir, createCombatStoppedEvent(options, readiness.stateSummary, readiness.stopReason, decisions, combatOutcome));
+      updateCombatStopMetrics(runLogDir);
+      process.stdout.write(`${JSON.stringify({
+        status: "combat_loop_stopped",
+        reason: readiness.stopReason,
+        decisions,
+        combat_outcome: combatOutcome,
+        state_version: readiness.stateSummary.state_version,
+        state_id: readiness.stateSummary.state_id,
+        phase: readiness.stateSummary.phase,
+        live_enemy_count: countLiveEnemies(readiness.stateSummary)
+      }, null, 2)}\n`);
+      break;
+    }
+
+    const snapshot = readiness ? readiness.snapshot : await waitForReadySnapshot(options, lastSeenVersion);
+    const stateVersion = readNumber(snapshot.state_version) ?? 0;
+    const decisionId = createDecisionId();
+    const stateSummary = readiness ? readiness.stateSummary : summarizeState(snapshot);
+    const combatObserved = stateSummary.phase === "combat_turn" && combatProgress === null;
+    if (combatObserved) {
+      combatProgress = createCombatProgress(stateSummary);
+      appendCombatLog(runLogDir, createCombatObservedEvent(options, decisionId, stateSummary));
+    }
+    const decisionStartedAt = Date.now();
+    const decision = await chooseDecision(options, snapshot);
+    const decisionMs = Date.now() - decisionStartedAt;
+    if (!isPlainObject(decision)) {
+      throw new Error("의사결정 결과가 비어 있습니다.");
+    }
+
+    if (options.dryRun) {
+      const record = {
+        event_type: "decision_recorded",
+        decision_id: decisionId,
+        recorded_at: nowIsoString(),
+        status: "dry_run",
+        decider_type: options.mode,
+        state_version: stateVersion,
+        state_summary: stateSummary,
+        play_session_id: options.playSessionId,
+        combat_observed: combatObserved,
+        decision,
+        decision_ms: decisionMs
+      };
+      if (runLogDir) {
+        appendJsonLine(path.join(runLogDir, "decisions.jsonl"), record);
+        updateMetrics(runLogDir, record);
+        rebuildMemorySummary(runLogDir, options);
+      }
+      addDecisionRecordToCombatProgress(combatProgress, record, stateSummary);
+      process.stdout.write(`${JSON.stringify({ status: "dry_run", state_version: stateVersion, decision }, null, 2)}\n`);
+    } else {
+      {
+        const latestBeforeSubmit = await getCurrentState(options.bridgeUrl, options.timeoutMs);
+        if (hasStateChangedSinceDecision(snapshot, latestBeforeSubmit)) {
+          staleRetryCount += 1;
+          const latestBeforeSubmitSummary = summarizeState(latestBeforeSubmit);
+          const record = {
+            event_type: "decision_recorded",
+            decision_id: decisionId,
+            recorded_at: nowIsoString(),
+            status: "decision_stale_before_submit",
+            decider_type: options.mode,
+            state_version: stateVersion,
+            state_summary: stateSummary,
+            latest_state_summary: latestBeforeSubmitSummary,
+            latest_state_delta: buildStateDelta(stateSummary, latestBeforeSubmitSummary),
+            play_session_id: options.playSessionId,
+            combat_observed: combatObserved,
+            decision,
+            decision_ms: decisionMs
+          };
+          if (runLogDir) {
+            appendJsonLine(path.join(runLogDir, "decisions.jsonl"), record);
+            updateMetrics(runLogDir, record);
+            rebuildMemorySummary(runLogDir, options);
+          }
+          addDecisionRecordToCombatProgress(combatProgress, record, latestBeforeSubmitSummary);
+          process.stdout.write(`${JSON.stringify({
+            status: "decision_stale_before_submit",
+            state_version: stateVersion,
+            latest_state_version: readNumber(latestBeforeSubmit.state_version),
+            stale_retry_count: staleRetryCount,
+            decision
+          }, null, 2)}\n`);
+          lastSeenVersion = readNumber(latestBeforeSubmit.state_version) ?? stateVersion;
+          if (staleRetryCount > options.maxStaleRetries) {
+            decisions += 1;
+          }
+          continue;
+        }
+      }
+
+      let submitted = null;
+      try {
+        submitted = await submitDecision(
+          options.bridgeUrl,
+          decision,
+          stateVersion,
+          `spiremind-decision-loop:${options.mode}`,
+          options.timeoutMs
+        );
+      } catch (error) {
+        const record = {
+          event_type: "decision_recorded",
+          decision_id: decisionId,
+          recorded_at: nowIsoString(),
+          status: "submit_failed",
+          decider_type: options.mode,
+          state_version: stateVersion,
+          state_summary: stateSummary,
+          play_session_id: options.playSessionId,
+          combat_observed: combatObserved,
+          decision,
+          submit_error: error instanceof Error ? error.message : String(error),
+          decision_ms: decisionMs
+        };
+        if (runLogDir) {
+          appendJsonLine(path.join(runLogDir, "decisions.jsonl"), record);
+          updateMetrics(runLogDir, record);
+          rebuildMemorySummary(runLogDir, options);
+        }
+        addDecisionRecordToCombatProgress(combatProgress, record, stateSummary);
+        throw error;
+      }
+      appendCombatLog(runLogDir, createDecisionSubmittedEvent(options, decisionId, stateSummary, decision, submitted));
+      const submittedPlan = isPlainObject(submitted.action_plan) ? submitted.action_plan : null;
+      const planId = submittedPlan ? submittedPlan.plan_id : null;
+      const submittedAction = isPlainObject(submitted.latest_action) ? submitted.latest_action : null;
+      const submissionId = submittedAction ? submittedAction.submission_id : null;
+      const shouldWaitResult = options.waitResult
+        && submittedAction
+        && submittedAction.valid === true
+        && submittedAction.execution_status !== "invalid";
+      let waitError = null;
+      let finalLatest = null;
+      if (shouldWaitResult) {
+        try {
+          finalLatest = await waitForSubmittedResult(options, planId, submissionId);
+        } catch (error) {
+          waitError = error;
+          finalLatest = { latest_action: submitted.latest_action || null, action_plan: submitted.action_plan || null };
+        }
+      } else if (options.waitResult) {
+        finalLatest = { latest_action: submitted.latest_action || null, action_plan: submitted.action_plan || null };
+      }
+      const rawFinalPlan = finalLatest && isPlainObject(finalLatest.action_plan) ? finalLatest.action_plan : null;
+      const finalPlan = rawFinalPlan
+        && planId
+        && typeof rawFinalPlan.plan_id === "string"
+        && rawFinalPlan.plan_id === planId
+        ? rawFinalPlan
+        : null;
+      const finalLatestAction = finalLatest && isPlainObject(finalLatest.latest_action) ? finalLatest.latest_action : null;
+      const finalStatus = waitError
+        ? "result_timeout"
+        : finalPlan && (finalPlan.status === "completed" || finalPlan.status === "failed")
+        ? finalPlan.status
+        : (finalLatestAction && typeof finalLatestAction.result === "string" ? finalLatestAction.result : null)
+          || (finalLatestAction && typeof finalLatestAction.execution_status === "string" ? finalLatestAction.execution_status : null)
+          || "submitted";
+      let afterStateSummary = null;
+      let stateDelta = null;
+      let afterStateError = null;
+      if (finalLatest) {
+        try {
+          const afterSnapshot = await getCurrentState(options.bridgeUrl, options.timeoutMs);
+          afterStateSummary = summarizeState(afterSnapshot);
+          stateDelta = buildStateDelta(stateSummary, afterStateSummary);
+        } catch (error) {
+          afterStateError = error instanceof Error ? error.message : String(error);
+        }
+      }
+      const record = {
+        event_type: "decision_recorded",
+        decision_id: decisionId,
+        recorded_at: nowIsoString(),
+        status: finalStatus,
+        decider_type: options.mode,
+        state_version: stateVersion,
+        state_summary: stateSummary,
+        play_session_id: options.playSessionId,
+        combat_observed: combatObserved,
+        decision,
+        latest_action: submitted.latest_action || null,
+        action_plan: submitted.action_plan || null,
+        final_latest_action: finalLatest ? finalLatest.latest_action || null : null,
+        final_action_plan: finalPlan,
+        after_state_summary: afterStateSummary,
+        state_delta: stateDelta,
+        after_state_error: afterStateError,
+        wait_error: waitError ? waitError.message : null,
+        decision_ms: decisionMs
+      };
+      if (runLogDir) {
+        appendJsonLine(path.join(runLogDir, "decisions.jsonl"), record);
+        updateMetrics(runLogDir, record);
+        rebuildMemorySummary(runLogDir, options);
+      }
+      addDecisionRecordToCombatProgress(combatProgress, record, afterStateSummary);
+      if (finalLatest) {
+        appendCombatLog(runLogDir, createActionResultObservedEvent(options, decisionId, finalLatest, finalStatus, afterStateSummary, stateDelta));
+      }
+      if (waitError) {
+        throw waitError;
+      }
+      process.stdout.write(`${JSON.stringify({
+        status: finalStatus,
+        state_version: stateVersion,
+        decision,
+        latest_action: submitted.latest_action || null,
+        action_plan: submitted.action_plan || null,
+        final_latest_action: finalLatest ? finalLatest.latest_action || null : null,
+        final_action_plan: finalPlan
+      }, null, 2)}\n`);
+
+      if (finalStatus === "stale") {
+        staleRetryCount += 1;
+        const retryVersion = afterStateSummary
+          ? readNumber(afterStateSummary.state_version)
+          : null;
+        lastSeenVersion = retryVersion !== null ? retryVersion : stateVersion + 1;
+        if (staleRetryCount <= options.maxStaleRetries) {
+          continue;
+        }
+      }
+    }
+
+    staleRetryCount = 0;
+    decisions += 1;
+    lastSeenVersion = stateVersion + 1;
+    if (options.once) {
+      break;
+    }
+  }
+
+  if (options.untilCombatEnd && !combatLoopStopped && decisions >= options.maxDecisions) {
+    process.stdout.write(`${JSON.stringify({
+      status: "max_decisions_reached",
+      decisions,
+      max_decisions: options.maxDecisions
+    }, null, 2)}\n`);
+  }
+}
+
+main().catch((error) => {
+  process.stderr.write(`${error.stack || error.message || String(error)}\n`);
+  process.exit(1);
+});

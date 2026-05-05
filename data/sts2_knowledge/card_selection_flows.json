@@ -1,0 +1,96 @@
+{
+  "schema_version": "card_selection_flows.v1",
+  "generated_from": "artifacts/decompiled/sts2/MegaCrit.Sts2.Core.Models.Cards",
+  "reference_api": "MegaCrit.Sts2.Core.Commands.CardSelectCmd",
+  "adapter_rule": "선택 화면 타입과 legal_actions를 공통 처리하고, 카드별 정보는 선택 목적 설명에만 사용한다.",
+  "normalized_sources": [
+    "hand",
+    "discard_pile",
+    "draw_pile",
+    "deck",
+    "generated_choices"
+  ],
+  "normalized_purposes": [
+    "discard_from_hand",
+    "exhaust_from_hand",
+    "upgrade_from_hand",
+    "move_from_discard_to_draw_top",
+    "transform",
+    "choose_generated_card",
+    "put_back_on_draw_top"
+  ],
+  "ironclad_priority_cards": [
+    {
+      "card": "Armaments",
+      "call": "FromHandForUpgrade",
+      "source": "hand",
+      "purpose": "upgrade_from_hand"
+    },
+    {
+      "card": "Brand",
+      "call": "FromHand",
+      "source": "hand",
+      "purpose": "exhaust_from_hand"
+    },
+    {
+      "card": "BurningPact",
+      "call": "FromHand",
+      "source": "hand",
+      "purpose": "exhaust_from_hand"
+    },
+    {
+      "card": "Headbutt",
+      "call": "FromSimpleGrid",
+      "source": "discard_pile",
+      "purpose": "move_from_discard_to_draw_top"
+    },
+    {
+      "card": "TrueGrit",
+      "call": "FromHand",
+      "source": "hand",
+      "purpose": "exhaust_from_hand",
+      "condition": "강화된 TrueGrit만 수동 선택을 연다. 미강화 TrueGrit은 무작위 소멸이다."
+    }
+  ],
+  "all_detected_cardselectcmd_cards": [
+    { "card": "Acrobatics", "call": "FromHandForDiscard", "source": "hand", "purpose": "discard_from_hand" },
+    { "card": "Armaments", "call": "FromHandForUpgrade", "source": "hand", "purpose": "upgrade_from_hand" },
+    { "card": "Begone", "call": "FromHand", "source": "hand", "purpose": "transform" },
+    { "card": "Brand", "call": "FromHand", "source": "hand", "purpose": "exhaust_from_hand" },
+    { "card": "BurningPact", "call": "FromHand", "source": "hand", "purpose": "exhaust_from_hand" },
+    { "card": "Charge", "call": "FromSimpleGrid", "source": "generated_choices", "purpose": "transform" },
+    { "card": "Cleanse", "call": "FromSimpleGrid", "source": "generated_choices", "purpose": "exhaust_from_hand" },
+    { "card": "CosmicIndifference", "call": "FromSimpleGrid", "source": "discard_pile", "purpose": "move_from_discard_to_draw_top" },
+    { "card": "DaggerThrow", "call": "FromHandForDiscard", "source": "hand", "purpose": "discard_from_hand" },
+    { "card": "DecisionsDecisions", "call": "FromHand", "source": "hand", "purpose": "choose_generated_card" },
+    { "card": "Discovery", "call": "FromChooseACardScreen", "source": "generated_choices", "purpose": "choose_generated_card" },
+    { "card": "Dredge", "call": "FromSimpleGrid", "source": "discard_pile", "purpose": "choose_generated_card" },
+    { "card": "DualWield", "call": "FromHand", "source": "hand", "purpose": "choose_generated_card" },
+    { "card": "Glimmer", "call": "FromHand", "source": "hand", "purpose": "put_back_on_draw_top" },
+    { "card": "Graveblast", "call": "FromSimpleGrid", "source": "discard_pile", "purpose": "choose_generated_card" },
+    { "card": "Guards", "call": "FromHand", "source": "hand", "purpose": "choose_generated_card" },
+    { "card": "HandTrick", "call": "FromHand", "source": "hand", "purpose": "choose_generated_card" },
+    { "card": "Headbutt", "call": "FromSimpleGrid", "source": "discard_pile", "purpose": "move_from_discard_to_draw_top" },
+    { "card": "HeirloomHammer", "call": "FromHand", "source": "hand", "purpose": "choose_generated_card" },
+    { "card": "HiddenDaggers", "call": "FromHandForDiscard", "source": "hand", "purpose": "discard_from_hand" },
+    { "card": "Hologram", "call": "FromSimpleGrid", "source": "discard_pile", "purpose": "choose_generated_card" },
+    { "card": "Nightmare", "call": "FromHand", "source": "hand", "purpose": "choose_generated_card" },
+    { "card": "PhotonCut", "call": "FromHand", "source": "hand", "purpose": "put_back_on_draw_top" },
+    { "card": "Prepared", "call": "FromHandForDiscard", "source": "hand", "purpose": "discard_from_hand" },
+    { "card": "Purity", "call": "FromHand", "source": "hand", "purpose": "exhaust_from_hand" },
+    { "card": "Quasar", "call": "FromChooseACardScreen", "source": "generated_choices", "purpose": "choose_generated_card" },
+    { "card": "Scavenge", "call": "FromHand", "source": "hand", "purpose": "exhaust_from_hand" },
+    { "card": "SculptingStrike", "call": "FromHand", "source": "hand", "purpose": "choose_generated_card" },
+    { "card": "Seance", "call": "FromSimpleGrid", "source": "generated_choices", "purpose": "transform" },
+    { "card": "SecretTechnique", "call": "FromSimpleGrid", "source": "deck", "purpose": "choose_generated_card" },
+    { "card": "SecretWeapon", "call": "FromSimpleGrid", "source": "deck", "purpose": "choose_generated_card" },
+    { "card": "SeekerStrike", "call": "FromSimpleGrid", "source": "draw_pile", "purpose": "choose_generated_card" },
+    { "card": "Snap", "call": "FromHand", "source": "hand", "purpose": "choose_generated_card" },
+    { "card": "Splash", "call": "FromChooseACardScreen", "source": "generated_choices", "purpose": "choose_generated_card" },
+    { "card": "Survivor", "call": "FromHandForDiscard", "source": "hand", "purpose": "discard_from_hand" },
+    { "card": "ThinkingAhead", "call": "FromHand", "source": "hand", "purpose": "put_back_on_draw_top" },
+    { "card": "Transfigure", "call": "FromHand", "source": "hand", "purpose": "transform" },
+    { "card": "TrueGrit", "call": "FromHand", "source": "hand", "purpose": "exhaust_from_hand" },
+    { "card": "Wish", "call": "FromSimpleGrid", "source": "generated_choices", "purpose": "choose_generated_card" }
+  ]
+}

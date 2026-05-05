@@ -2,6 +2,7 @@ param(
     [string]$ProjectPath = "src/SpireMindMod/SpireMindMod.csproj",
     [string]$Configuration = "Release",
     [string]$ModsDir = "",
+    [switch]$AlsoDeployAppData,
     [string]$PckPath = ""
 )
 
@@ -29,7 +30,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 [xml]$projectXml = Get-Content -Raw $resolvedProjectPath
-$targetFramework = $projectXml.Project.PropertyGroup.TargetFramework
+$targetFramework = @(
+    $projectXml.Project.PropertyGroup |
+        ForEach-Object { $_.TargetFramework } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -First 1
+)
+$targetFramework = ([string]$targetFramework).Trim()
 if ([string]::IsNullOrWhiteSpace($targetFramework)) {
     throw "TargetFramework was not found in the project file."
 }
@@ -41,6 +48,18 @@ New-Item -ItemType Directory -Force -Path $deployDir | Out-Null
 
 Copy-Item -Force (Join-Path $outputDir "SpireMind.dll") $deployDir
 Copy-Item -Force (Join-Path $outputDir "SpireMind.json") $deployDir
+
+if ($AlsoDeployAppData) {
+    $appDataDeployDir = Join-Path $env:APPDATA "SlayTheSpire2\SpireMind"
+    New-Item -ItemType Directory -Force -Path $appDataDeployDir | Out-Null
+    Copy-Item -Force (Join-Path $outputDir "SpireMind.dll") $appDataDeployDir
+    Copy-Item -Force (Join-Path $outputDir "SpireMind.json") $appDataDeployDir
+    $depsPath = Join-Path $outputDir "SpireMind.deps.json"
+    if (Test-Path $depsPath) {
+        Copy-Item -Force $depsPath $appDataDeployDir
+    }
+    Write-Host "[SpireMind] AppData deploy finished: $appDataDeployDir"
+}
 
 if (-not [string]::IsNullOrWhiteSpace($PckPath)) {
     $resolvedPckPath = Resolve-Path $PckPath

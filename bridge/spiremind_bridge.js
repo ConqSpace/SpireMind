@@ -147,6 +147,20 @@ function getStateId(stateObject) {
   return candidate.trim();
 }
 
+function isTerminalStateEnvelope(state) {
+  if (!state) {
+    return false;
+  }
+
+  const currentState = isPlainObject(state.currentState) ? state.currentState : null;
+  const phase = currentState && typeof currentState.phase === "string" ? currentState.phase.trim() : "";
+  if (phase === "game_over") {
+    return true;
+  }
+
+  return typeof state.currentStateId === "string" && state.currentStateId.startsWith("game_over_");
+}
+
 function getLegalActionIds(stateObject) {
   const legalActions = isPlainObject(stateObject) ? stateObject.legal_actions : null;
   if (!Array.isArray(legalActions)) {
@@ -197,6 +211,548 @@ function getLegalActionById(stateObject, actionId) {
   return null;
 }
 
+function getLegalActions(stateObject) {
+  const legalActions = isPlainObject(stateObject) ? stateObject.legal_actions : null;
+  return Array.isArray(legalActions) ? legalActions.filter(isPlainObject) : [];
+}
+
+function getHandCards(stateObject) {
+  const piles = isPlainObject(stateObject) ? stateObject.piles : null;
+  const hand = isPlainObject(piles) ? piles.hand : null;
+  return Array.isArray(hand) ? hand.filter(isPlainObject) : [];
+}
+
+function getLiveEnemies(stateObject) {
+  const enemies = isPlainObject(stateObject) ? stateObject.enemies : null;
+  if (!Array.isArray(enemies)) {
+    return [];
+  }
+
+  return enemies.filter((enemy) => {
+    if (!isPlainObject(enemy)) {
+      return false;
+    }
+
+    const hp = Number(enemy.hp);
+    return !Number.isFinite(hp) || hp > 0;
+  });
+}
+
+function readTrimmedString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function readOptionalInteger(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const numberValue = Number(value);
+  return Number.isInteger(numberValue) ? numberValue : null;
+}
+
+function normalizeOptionalTargetId(value) {
+  const targetId = readTrimmedString(value);
+  return targetId === "" ? null : targetId;
+}
+
+function findHandCardForAction(stateObject, actionObject) {
+  const hand = getHandCards(stateObject);
+  const combatCardId = readOptionalInteger(actionObject.combat_card_id);
+  if (combatCardId !== null) {
+    const card = hand.find((candidate) => readOptionalInteger(candidate.combat_card_id) === combatCardId);
+    if (!card) {
+      return {
+        ok: false,
+        error: `현재 손패에서 combat_card_id ${combatCardId} 카드를 찾지 못했습니다.`
+      };
+    }
+
+    return {
+      ok: true,
+      card,
+      cardInstanceId: readTrimmedString(card.instance_id || card.card_instance_id)
+    };
+  }
+
+  const directCardId = readTrimmedString(actionObject.card_id || actionObject.card_instance_id || actionObject.instance_id);
+  if (directCardId !== "") {
+    const card = hand.find((candidate) => {
+      return readTrimmedString(candidate.instance_id) === directCardId
+        || readTrimmedString(candidate.card_instance_id) === directCardId
+        || readTrimmedString(candidate.fallback_instance_id) === directCardId;
+    });
+    if (!card) {
+      return {
+        ok: false,
+        error: `현재 손패에서 card_id '${directCardId}'와 일치하는 instance_id를 찾지 못했습니다.`
+      };
+    }
+
+    return {
+      ok: true,
+      card,
+      cardInstanceId: readTrimmedString(card.instance_id || card.card_instance_id)
+    };
+  }
+
+  const indexCandidate = Object.prototype.hasOwnProperty.call(actionObject, "hand_index")
+    ? actionObject.hand_index
+    : actionObject.card_index;
+  const cardIndex = Number(indexCandidate);
+  if (!Number.isInteger(cardIndex) || cardIndex < 0 || cardIndex >= hand.length) {
+    return {
+      ok: false,
+      error: "play_card에는 card_id 또는 유효한 hand_index/card_index가 필요합니다."
+    };
+  }
+
+  const card = hand[cardIndex];
+  const cardInstanceId = readTrimmedString(card.instance_id || card.card_instance_id);
+  if (cardInstanceId === "") {
+    return {
+      ok: false,
+      error: `손패 ${cardIndex}번 카드에 instance_id가 없습니다.`
+    };
+  }
+
+  return {
+    ok: true,
+    card,
+    cardInstanceId
+  };
+}
+
+function resolveTargetIdForAction(stateObject, actionObject) {
+  const liveEnemies = getLiveEnemies(stateObject);
+  const targetCombatId = readOptionalInteger(actionObject.target_combat_id);
+  if (targetCombatId !== null) {
+    const enemy = liveEnemies.find((candidate) => readOptionalInteger(candidate.combat_id) === targetCombatId);
+    if (!enemy) {
+      return {
+        ok: false,
+        error: `현재 적 목록에서 target_combat_id ${targetCombatId} 대상을 찾지 못했습니다.`
+      };
+    }
+
+    const targetId = readTrimmedString(enemy.id);
+    if (targetId === "") {
+      return {
+        ok: false,
+        error: `target_combat_id ${targetCombatId} 대상에 id가 없습니다.`
+      };
+    }
+
+    return {
+      ok: true,
+      targetId,
+      targetCombatId
+    };
+  }
+
+  const explicitTargetId = normalizeOptionalTargetId(actionObject.target_id);
+  if (explicitTargetId !== null) {
+    const enemy = liveEnemies.find((candidate) => readTrimmedString(candidate.id) === explicitTargetId);
+    return {
+      ok: true,
+      targetId: explicitTargetId,
+      targetCombatId: enemy ? readOptionalInteger(enemy.combat_id) : null
+    };
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(actionObject, "target_index")
+    || actionObject.target_index === null
+    || actionObject.target_index === undefined) {
+    return {
+      ok: true,
+      targetId: null,
+      targetCombatId: null
+    };
+  }
+
+  const targetIndex = Number(actionObject.target_index);
+  if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= liveEnemies.length) {
+    return {
+      ok: false,
+      error: `target_index ${actionObject.target_index}가 현재 적 목록 범위를 벗어났습니다.`
+    };
+  }
+
+  const targetId = readTrimmedString(liveEnemies[targetIndex].id);
+  if (targetId === "") {
+    return {
+      ok: false,
+      error: `target_index ${targetIndex}의 적에 id가 없습니다.`
+    };
+  }
+
+  return {
+    ok: true,
+    targetId,
+    targetCombatId: readOptionalInteger(liveEnemies[targetIndex].combat_id)
+  };
+}
+
+function validateCardEnergy(stateObject, card) {
+  const player = isPlainObject(stateObject) ? stateObject.player : null;
+  const energy = isPlainObject(player) ? Number(player.energy) : Number.NaN;
+  const cost = Number(card.cost);
+  if (Number.isFinite(energy) && Number.isFinite(cost) && cost > energy) {
+    return {
+      ok: false,
+      error: `에너지가 부족합니다. 필요 ${cost}, 현재 ${energy}.`
+    };
+  }
+
+  return {
+    ok: true
+  };
+}
+
+function resolveLegalActionForPlannedStep(stateObject, actionObject) {
+  if (!isPlainObject(stateObject)) {
+    return {
+      ok: false,
+      error: "현재 전투 상태가 없어 행동을 검증할 수 없습니다."
+    };
+  }
+
+  if (!isPlainObject(actionObject)) {
+    return {
+      ok: false,
+      error: "actions 배열의 각 항목은 JSON 객체여야 합니다."
+    };
+  }
+
+  const selectedActionId = readTrimmedString(actionObject.selected_action_id || actionObject.action_id);
+  if (selectedActionId !== "") {
+    const legalAction = getLegalActionById(stateObject, selectedActionId);
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: `현재 legal_actions에서 action_id '${selectedActionId}'를 찾지 못했습니다.`
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  const actionType = readTrimmedString(actionObject.type);
+  if (actionType === "end_turn") {
+    const legalAction = getLegalActions(stateObject).find((candidate) => readTrimmedString(candidate.type) === "end_turn");
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: "현재 legal_actions에서 end_turn을 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType === "confirm_card_selection") {
+    const legalAction = getLegalActions(stateObject).find((candidate) =>
+      readTrimmedString(candidate.type) === "confirm_card_selection"
+    );
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: "현재 legal_actions에서 confirm_card_selection을 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType === "cancel_card_selection") {
+    const legalAction = getLegalActions(stateObject).find((candidate) =>
+      readTrimmedString(candidate.type) === "cancel_card_selection"
+    );
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: "현재 legal_actions에서 cancel_card_selection을 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType === "use_potion") {
+    const requestedSlotIndex = readOptionalInteger(actionObject.potion_slot_index);
+    const requestedPotionId = readTrimmedString(actionObject.potion_id);
+    const requestedTargetCombatId = readOptionalInteger(actionObject.target_combat_id);
+    const requestedTargetId = normalizeOptionalTargetId(actionObject.target_id);
+    const legalAction = getLegalActions(stateObject).find((candidate) => {
+      if (readTrimmedString(candidate.type) !== "use_potion") {
+        return false;
+      }
+
+      if (requestedSlotIndex !== null && readOptionalInteger(candidate.potion_slot_index) !== requestedSlotIndex) {
+        return false;
+      }
+
+      if (requestedPotionId !== "" && readTrimmedString(candidate.potion_id) !== requestedPotionId) {
+        return false;
+      }
+
+      if (requestedTargetCombatId !== null) {
+        return readOptionalInteger(candidate.target_combat_id) === requestedTargetCombatId;
+      }
+
+      if (requestedTargetId !== null) {
+        return normalizeOptionalTargetId(candidate.target_id) === requestedTargetId;
+      }
+
+      return requestedSlotIndex !== null || requestedPotionId !== "";
+    });
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: "현재 legal_actions에서 요청한 use_potion을 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType === "choose_card_selection") {
+    const requestedSelectionId = readTrimmedString(actionObject.card_selection_id);
+    const requestedCardId = readTrimmedString(actionObject.card_id);
+    const requestedName = readTrimmedString(actionObject.name);
+    const requestedIndex = readOptionalInteger(actionObject.card_selection_index);
+    const legalAction = getLegalActions(stateObject).find((candidate) => {
+      if (readTrimmedString(candidate.type) !== "choose_card_selection") {
+        return false;
+      }
+
+      if (requestedSelectionId !== "") {
+        return readTrimmedString(candidate.card_selection_id) === requestedSelectionId
+          && (requestedIndex === null || readOptionalInteger(candidate.card_selection_index) === requestedIndex)
+          && (requestedCardId === "" || readTrimmedString(candidate.card_id) === requestedCardId)
+          && (requestedName === "" || readTrimmedString(candidate.name) === requestedName);
+      }
+
+      if (requestedIndex !== null) {
+        return readOptionalInteger(candidate.card_selection_index) === requestedIndex
+          && (requestedCardId === "" || readTrimmedString(candidate.card_id) === requestedCardId)
+          && (requestedName === "" || readTrimmedString(candidate.name) === requestedName);
+      }
+
+      if (requestedCardId !== "") {
+        return readTrimmedString(candidate.card_id) === requestedCardId
+          && (requestedName === "" || readTrimmedString(candidate.name) === requestedName);
+      }
+
+      if (requestedName !== "") {
+        return readTrimmedString(candidate.name) === requestedName;
+      }
+
+      return false;
+    });
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: "현재 legal_actions에서 요청한 choose_card_selection을 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType === "choose_card_reward") {
+    const requestedRewardId = readTrimmedString(actionObject.reward_id);
+    const requestedStableId = readTrimmedString(actionObject.reward_stable_id || actionObject.card_reward_stable_id);
+    const requestedModelId = readTrimmedString(actionObject.model_id || actionObject.card_id);
+    const requestedIndex = readOptionalInteger(actionObject.card_reward_index);
+    const legalAction = getLegalActions(stateObject).find((candidate) => {
+      if (readTrimmedString(candidate.type) !== "choose_card_reward") {
+        return false;
+      }
+
+      if (requestedRewardId !== "" && readTrimmedString(candidate.reward_id) !== requestedRewardId) {
+        return false;
+      }
+
+      if (requestedStableId !== "" && readTrimmedString(candidate.reward_stable_id || candidate.card_reward_stable_id) !== requestedStableId) {
+        return false;
+      }
+
+      if (requestedModelId !== "" && readTrimmedString(candidate.model_id || candidate.card_id) !== requestedModelId) {
+        return false;
+      }
+
+      return requestedIndex === null || readOptionalInteger(candidate.card_reward_index) === requestedIndex;
+    });
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: "현재 legal_actions에서 요청한 choose_card_reward를 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType === "claim_potion_reward_with_discard") {
+    const requestedRewardId = readTrimmedString(actionObject.reward_id);
+    const requestedStableId = readTrimmedString(actionObject.reward_stable_id);
+    const requestedModelId = readTrimmedString(actionObject.model_id || actionObject.potion_id);
+    const requestedDiscardSlotIndex = readOptionalInteger(actionObject.discard_potion_slot_index);
+    const requestedDiscardPotionId = readTrimmedString(actionObject.discard_potion_id);
+    const legalAction = getLegalActions(stateObject).find((candidate) => {
+      if (readTrimmedString(candidate.type) !== "claim_potion_reward_with_discard") {
+        return false;
+      }
+
+      if (requestedRewardId !== "" && readTrimmedString(candidate.reward_id) !== requestedRewardId) {
+        return false;
+      }
+
+      if (requestedStableId !== "" && readTrimmedString(candidate.reward_stable_id) !== requestedStableId) {
+        return false;
+      }
+
+      if (requestedModelId !== "" && readTrimmedString(candidate.model_id || candidate.potion_id) !== requestedModelId) {
+        return false;
+      }
+
+      if (requestedDiscardPotionId !== "" && readTrimmedString(candidate.discard_potion_id) !== requestedDiscardPotionId) {
+        return false;
+      }
+
+      return requestedDiscardSlotIndex === null
+        || readOptionalInteger(candidate.discard_potion_slot_index) === requestedDiscardSlotIndex;
+    });
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: "현재 legal_actions에서 요청한 claim_potion_reward_with_discard를 찾지 못했습니다."
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType === "claim_treasure_relic" || actionType === "choose_treasure_relic") {
+    const requestedStableId = readTrimmedString(actionObject.treasure_relic_id);
+    const requestedRelicId = readTrimmedString(actionObject.relic_id || actionObject.model_id);
+    const requestedIndex = readOptionalInteger(actionObject.treasure_relic_index);
+    const legalAction = getLegalActions(stateObject).find((candidate) => {
+      if (readTrimmedString(candidate.type) !== actionType) {
+        return false;
+      }
+
+      if (requestedStableId !== "" && readTrimmedString(candidate.treasure_relic_id) !== requestedStableId) {
+        return false;
+      }
+
+      if (requestedRelicId !== "" && readTrimmedString(candidate.relic_id || candidate.model_id) !== requestedRelicId) {
+        return false;
+      }
+
+      return requestedIndex === null || readOptionalInteger(candidate.treasure_relic_index) === requestedIndex;
+    });
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: `현재 legal_actions에서 요청한 ${actionType}를 찾지 못했습니다.`
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType === "open_treasure_chest" || actionType === "proceed_treasure") {
+    const legalAction = getLegalActions(stateObject).find((candidate) =>
+      readTrimmedString(candidate.type) === actionType
+    );
+    if (!legalAction) {
+      return {
+        ok: false,
+        error: `현재 legal_actions에서 ${actionType}를 찾지 못했습니다.`
+      };
+    }
+
+    return {
+      ok: true,
+      legalAction
+    };
+  }
+
+  if (actionType !== "play_card") {
+    return {
+      ok: false,
+      error: `지원하지 않는 행동 타입입니다: ${actionType || "<empty>"}`
+    };
+  }
+
+  const cardResult = findHandCardForAction(stateObject, actionObject);
+  if (!cardResult.ok) {
+    return cardResult;
+  }
+
+  const energyResult = validateCardEnergy(stateObject, cardResult.card);
+  if (!energyResult.ok) {
+    return energyResult;
+  }
+
+  const targetResult = resolveTargetIdForAction(stateObject, actionObject);
+  if (!targetResult.ok) {
+    return targetResult;
+  }
+
+  const legalAction = getLegalActions(stateObject).find((candidate) => {
+    const candidateTargetCombatId = readOptionalInteger(candidate.target_combat_id);
+    const targetCombatIdMatches = targetResult.targetCombatId === null
+      || candidateTargetCombatId === null
+      || candidateTargetCombatId === targetResult.targetCombatId;
+
+    return readTrimmedString(candidate.type) === "play_card"
+      && readTrimmedString(candidate.card_instance_id) === cardResult.cardInstanceId
+      && normalizeOptionalTargetId(candidate.target_id) === targetResult.targetId
+      && targetCombatIdMatches;
+  });
+  if (!legalAction) {
+    return {
+      ok: false,
+      error: `현재 legal_actions에서 카드 ${cardResult.cardInstanceId}, 대상 ${targetResult.targetId || "없음"} 조합을 찾지 못했습니다.`
+    };
+  }
+
+  return {
+    ok: true,
+    legalAction
+  };
+}
+
 function getLatestStateSummary(stateEnvelope) {
   if (!stateEnvelope) {
     return null;
@@ -234,6 +790,7 @@ function createServerState(runDirectory, httpHost, httpPort) {
     currentStateId: "",
     legalActionIds: [],
     latestAction: null,
+    actionPlan: null,
     httpServer: null
   };
 
@@ -295,6 +852,8 @@ function updateCurrentState(state, nextState) {
     state_id: envelope.state_id,
     legal_action_count: envelope.legal_action_ids.length
   });
+  correlateActionResultWithState(state, envelope);
+  advanceActionPlanAfterStateUpdate(state);
   return envelope;
 }
 
@@ -307,6 +866,249 @@ function setLatestAction(state, actionObject) {
     state_id: actionObject.state_id,
     selected_action_id: actionObject.selected_action_id,
     valid: actionObject.valid
+  });
+}
+
+function createActionSubmissionFromLegalAction(state, legalAction, actionArguments) {
+  const selectedActionId = readTrimmedString(legalAction.action_id || legalAction.actionId);
+  return createActionSubmission(state, {
+    selected_action_id: selectedActionId,
+    expected_state_version: state.stateVersion,
+    source: actionArguments.source,
+    note: actionArguments.note
+  });
+}
+
+function createActionPlanSubmission(state, actionArguments) {
+  if (!Array.isArray(actionArguments.actions) || actionArguments.actions.length === 0) {
+    return {
+      ok: false,
+      status: "invalid",
+      error: "actions는 비어 있지 않은 배열이어야 합니다."
+    };
+  }
+
+  if (state.latestAction
+    && state.latestAction.result === null
+    && state.latestAction.execution_status !== "invalid"
+    && state.latestAction.execution_status !== "failed"
+    && state.latestAction.execution_status !== "stale"
+    && state.latestAction.execution_status !== "unsupported") {
+    return {
+      ok: false,
+      status: "busy",
+      error: "아직 처리 중인 행동이 있어 새 행동 묶음을 받을 수 없습니다."
+    };
+  }
+
+  const firstStep = actionArguments.actions[0];
+  const resolved = resolveLegalActionForPlannedStep(state.currentState, firstStep);
+  const plan = {
+    plan_id: crypto.randomUUID(),
+    submitted_at: toIsoString(new Date()),
+    status: resolved.ok ? "running" : "failed",
+    state_version_started: state.stateVersion,
+    state_id_started: state.currentStateId,
+    reason: typeof actionArguments.reason === "string" ? actionArguments.reason.trim() : null,
+    source: typeof actionArguments.source === "string" ? actionArguments.source.trim() : null,
+    actions: actionArguments.actions,
+    current_index: 0,
+    completed: [],
+    failure: resolved.ok ? null : {
+      action_index: 0,
+      reason: resolved.error
+    }
+  };
+  state.actionPlan = plan;
+
+  if (!resolved.ok) {
+    appendEvent(state, "action_plan_failed", {
+      plan_id: plan.plan_id,
+      action_index: 0,
+      reason: resolved.error
+    });
+
+    return {
+      ok: false,
+      status: "invalid",
+      action_plan: plan,
+      error: resolved.error
+    };
+  }
+
+  const submission = createActionSubmissionFromLegalAction(state, resolved.legalAction, {
+    source: actionArguments.source,
+    note: actionArguments.reason || actionArguments.note
+  });
+  submission.plan_id = plan.plan_id;
+  submission.plan_action_index = 0;
+  submission.planned_action = firstStep;
+  setLatestAction(state, submission);
+  appendEvent(state, "action_plan_started", {
+    plan_id: plan.plan_id,
+    action_count: plan.actions.length,
+    first_submission_id: submission.submission_id,
+    selected_action_id: submission.selected_action_id
+  });
+
+  return {
+    ok: true,
+    status: "queued",
+    action_plan: plan,
+    latest_action: submission
+  };
+}
+
+function advanceActionPlanAfterStateUpdate(state) {
+  const plan = state.actionPlan;
+  if (!plan || plan.status !== "running") {
+    return;
+  }
+
+  const latestAction = state.latestAction;
+  if (!latestAction || latestAction.plan_id !== plan.plan_id) {
+    return;
+  }
+
+  if (latestAction.result === null) {
+    return;
+  }
+
+  if (latestAction.result !== "applied") {
+    plan.status = "failed";
+    plan.failure = {
+      action_index: latestAction.plan_action_index,
+      submission_id: latestAction.submission_id,
+      result: latestAction.result,
+      reason: latestAction.result_note || "이전 행동이 적용되지 않아 남은 행동을 중단했습니다."
+    };
+    appendEvent(state, "action_plan_failed", {
+      plan_id: plan.plan_id,
+      action_index: latestAction.plan_action_index,
+      submission_id: latestAction.submission_id,
+      result: latestAction.result
+    });
+    return;
+  }
+
+  const completedIndex = Number(latestAction.plan_action_index);
+  if (!plan.completed.some((item) => item.submission_id === latestAction.submission_id)) {
+    plan.completed.push({
+      action_index: completedIndex,
+      submission_id: latestAction.submission_id,
+      selected_action_id: latestAction.selected_action_id,
+      applied_at_state_version: state.stateVersion
+    });
+  }
+
+  const nextIndex = completedIndex + 1;
+  plan.current_index = nextIndex;
+  if (nextIndex >= plan.actions.length) {
+    plan.status = "completed";
+    appendEvent(state, "action_plan_completed", {
+      plan_id: plan.plan_id,
+      completed_count: plan.completed.length
+    });
+    return;
+  }
+
+  const resolved = resolveLegalActionForPlannedStep(state.currentState, plan.actions[nextIndex]);
+  if (!resolved.ok) {
+    plan.status = "failed";
+    plan.failure = {
+      action_index: nextIndex,
+      reason: resolved.error
+    };
+    appendEvent(state, "action_plan_failed", {
+      plan_id: plan.plan_id,
+      action_index: nextIndex,
+      reason: resolved.error
+    });
+    return;
+  }
+
+  const submission = createActionSubmissionFromLegalAction(state, resolved.legalAction, {
+    source: plan.source,
+    note: plan.reason
+  });
+  submission.plan_id = plan.plan_id;
+  submission.plan_action_index = nextIndex;
+  submission.planned_action = plan.actions[nextIndex];
+  setLatestAction(state, submission);
+  appendEvent(state, "action_plan_step_submitted", {
+    plan_id: plan.plan_id,
+    action_index: nextIndex,
+    submission_id: submission.submission_id,
+    selected_action_id: submission.selected_action_id
+  });
+}
+
+function retryCurrentPlanStepAfterStale(state, staleAction, note) {
+  const plan = state.actionPlan;
+  if (!plan || plan.status !== "running" || staleAction.plan_id !== plan.plan_id) {
+    return null;
+  }
+
+  const actionIndex = Number(staleAction.plan_action_index);
+  if (!Number.isInteger(actionIndex) || actionIndex < 0 || actionIndex >= plan.actions.length) {
+    return null;
+  }
+
+  if (!isPlainObject(plan.stale_retries)) {
+    plan.stale_retries = {};
+  }
+
+  const retryCount = Number(plan.stale_retries[String(actionIndex)] || 0);
+  if (retryCount >= 2) {
+    return null;
+  }
+
+  const plannedAction = plan.actions[actionIndex];
+  const resolved = resolveLegalActionForPlannedStep(state.currentState, plannedAction);
+  if (!resolved.ok) {
+    return null;
+  }
+
+  plan.stale_retries[String(actionIndex)] = retryCount + 1;
+  plan.current_index = actionIndex;
+  const submission = createActionSubmissionFromLegalAction(state, resolved.legalAction, {
+    source: plan.source,
+    note: plan.reason || note
+  });
+  submission.plan_id = plan.plan_id;
+  submission.plan_action_index = actionIndex;
+  submission.planned_action = plannedAction;
+  setLatestAction(state, submission);
+  appendEvent(state, "action_plan_step_retried_after_stale", {
+    plan_id: plan.plan_id,
+    action_index: actionIndex,
+    retry_count: retryCount + 1,
+    stale_submission_id: staleAction.submission_id,
+    submission_id: submission.submission_id,
+    selected_action_id: submission.selected_action_id
+  });
+  return submission;
+}
+
+function failCurrentPlanStepAfterStale(state, staleAction, note) {
+  if (!state.actionPlan
+    || state.actionPlan.status !== "running"
+    || staleAction.plan_id !== state.actionPlan.plan_id) {
+    return;
+  }
+
+  state.actionPlan.status = "failed";
+  state.actionPlan.failure = {
+    action_index: staleAction.plan_action_index,
+    submission_id: staleAction.submission_id,
+    result: "stale",
+    reason: note || "stale 행동을 최신 상태에서 다시 제출하지 못했습니다."
+  };
+  updateLatestAction(state, "action_plan_failed", {
+    plan_id: state.actionPlan.plan_id,
+    action_index: staleAction.plan_action_index,
+    submission_id: staleAction.submission_id,
+    result: "stale"
   });
 }
 
@@ -348,10 +1150,225 @@ function createActionSubmission(state, actionArguments) {
     result_reported_at: null,
     source: source || null,
     note: note || null,
+    pre_action_state_id: stateEnvelope.state_id,
+    pre_action_state_version: stateEnvelope.state_version,
+    pre_action_state_summary: summarizeStateForAction(state.currentState, selectedActionId),
     reason: isValid
       ? "최신 state_version의 legal_actions 안에 있습니다."
       : "selected_action_id가 없거나, expected_state_version이 최신 state_version과 다릅니다."
   };
+}
+
+function correlateActionResultWithState(state, envelope) {
+  const latestAction = state.latestAction;
+  if (!latestAction || latestAction.result === null || !latestAction.result_reported_at) {
+    return;
+  }
+
+  if (latestAction.post_result_state_version !== undefined && latestAction.post_result_state_version !== null) {
+    return;
+  }
+
+  if (envelope.state_version <= latestAction.state_version) {
+    return;
+  }
+
+  const postSummary = summarizeStateForAction(envelope.state, latestAction.selected_action_id);
+  const delta = compareActionStateSummaries(
+    latestAction.pre_action_state_summary || null,
+    postSummary,
+    latestAction.action || null);
+
+  latestAction.post_result_state_id = envelope.state_id;
+  latestAction.post_result_state_version = envelope.state_version;
+  latestAction.post_result_received_at = envelope.received_at;
+  latestAction.post_result_state_summary = postSummary;
+  latestAction.state_delta = delta;
+
+  writeJsonFile(state.latestActionFilePath, latestAction);
+  appendEvent(state, "action_state_observed", {
+    submission_id: latestAction.submission_id,
+    selected_action_id: latestAction.selected_action_id || null,
+    action_type: latestAction.action_type || null,
+    result: latestAction.result,
+    pre_state_version: latestAction.pre_action_state_version ?? null,
+    result_observed_state_version: latestAction.result_observed_state_version ?? null,
+    post_state_version: envelope.state_version,
+    state_delta: delta
+  });
+}
+
+function summarizeStateForAction(combatState, selectedActionId) {
+  if (!isPlainObject(combatState)) {
+    return null;
+  }
+
+  const player = isPlainObject(combatState.player) ? combatState.player : {};
+  const piles = isPlainObject(combatState.piles) ? combatState.piles : {};
+  const hand = Array.isArray(piles.hand) ? piles.hand : [];
+  const enemies = Array.isArray(combatState.enemies) ? combatState.enemies : [];
+  const potionSlots = Array.isArray(player.potion_slots) ? player.potion_slots : [];
+  const shop = isPlainObject(combatState.shop) ? combatState.shop : {};
+  const shopItems = Array.isArray(shop.items) ? shop.items : [];
+  const legalAction = getLegalActionById(combatState, selectedActionId);
+
+  return {
+    phase: typeof combatState.phase === "string" ? combatState.phase : null,
+    state_id: getStateId(combatState),
+    player: {
+      hp: toNullableNumber(player.hp),
+      block: toNullableNumber(player.block),
+      energy: toNullableNumber(player.energy),
+      gold: toNullableNumber(player.gold)
+    },
+    hand: hand.map((card) => ({
+      instance_id: readTrimmedString(card && (card.instance_id || card.instanceId)),
+      combat_card_id: toNullableNumber(card && (card.combat_card_id ?? card.combatCardId)),
+      card_id: readTrimmedString(card && (card.card_id || card.cardId)),
+      name: readTrimmedString(card && card.name)
+    })),
+    enemies: enemies.map((enemy) => ({
+      id: readTrimmedString(enemy && enemy.id),
+      combat_id: toNullableNumber(enemy && (enemy.combat_id ?? enemy.combatId)),
+      name: readTrimmedString(enemy && enemy.name),
+      hp: toNullableNumber(enemy && enemy.hp),
+      block: toNullableNumber(enemy && enemy.block),
+      alive: enemy && typeof enemy.alive === "boolean" ? enemy.alive : null
+    })),
+    potion_slots: potionSlots.map((slot) => {
+      const potion = isPlainObject(slot && slot.potion) ? slot.potion : null;
+      return {
+        slot_index: toNullableNumber(slot && (slot.slot_index ?? slot.slotIndex)),
+        empty: slot && typeof slot.empty === "boolean" ? slot.empty : null,
+        potion_id: potion ? readTrimmedString(potion.potion_id || potion.potionId || potion.id) : null
+      };
+    }),
+    shop: {
+      item_count: toNullableNumber(shop.item_count) ?? shopItems.length,
+      gold: toNullableNumber(shop.gold),
+      items: shopItems.map((item) => ({
+        shop_item_id: readTrimmedString(item && (item.shop_item_id || item.shopItemId)),
+        kind: readTrimmedString(item && (item.kind || item.item_type || item.itemType)),
+        model_id: readTrimmedString(item && (item.model_id || item.modelId)),
+        name: readTrimmedString(item && item.name),
+        cost: toNullableNumber(item && (item.cost ?? item.price)),
+        slot_group: readTrimmedString(item && (item.slot_group || item.slotGroup)),
+        slot_index: toNullableNumber(item && (item.slot_index ?? item.slotIndex)),
+        locator_id: readTrimmedString(item && (item.locator_id || item.locatorId)),
+        is_stocked: item && typeof item.is_stocked === "boolean" ? item.is_stocked : null,
+        is_purchase_legal_now: item && typeof item.is_purchase_legal_now === "boolean" ? item.is_purchase_legal_now : null
+      }))
+    },
+    selected_action: legalAction ? {
+      action_id: readTrimmedString(legalAction.action_id || legalAction.actionId),
+      type: readTrimmedString(legalAction.type),
+      card_instance_id: readTrimmedString(legalAction.card_instance_id || legalAction.cardInstanceId),
+      combat_card_id: toNullableNumber(legalAction.combat_card_id ?? legalAction.combatCardId),
+      potion_slot_index: toNullableNumber(legalAction.potion_slot_index ?? legalAction.potionSlotIndex),
+      target_id: readTrimmedString(legalAction.target_id || legalAction.targetId),
+      shop_item_id: readTrimmedString(legalAction.shop_item_id || legalAction.shopItemId),
+      slot_group: readTrimmedString(legalAction.slot_group || legalAction.slotGroup),
+      slot_index: toNullableNumber(legalAction.slot_index ?? legalAction.slotIndex),
+      locator_id: readTrimmedString(legalAction.locator_id || legalAction.locatorId)
+    } : null
+  };
+}
+
+function compareActionStateSummaries(before, after, action) {
+  if (!before || !after) {
+    return {
+      comparable: false,
+      reason: "pre 또는 post 상태 요약이 없습니다."
+    };
+  }
+
+  const actionType = readTrimmedString(action && action.type);
+  const selectedCombatCardId = toNullableNumber(action && (action.combat_card_id ?? action.combatCardId));
+  const selectedPotionSlotIndex = toNullableNumber(action && (action.potion_slot_index ?? action.potionSlotIndex));
+  const selectedTargetCombatId = toNullableNumber(action && (action.target_combat_id ?? action.targetCombatId));
+
+  const beforeHandIds = new Set((before.hand || []).map((card) => card.combat_card_id).filter((value) => value !== null));
+  const afterHandIds = new Set((after.hand || []).map((card) => card.combat_card_id).filter((value) => value !== null));
+  const selectedCardLeftHand = selectedCombatCardId !== null
+    ? beforeHandIds.has(selectedCombatCardId) && !afterHandIds.has(selectedCombatCardId)
+    : null;
+
+  const beforePotion = findPotionSlotSummary(before, selectedPotionSlotIndex);
+  const afterPotion = findPotionSlotSummary(after, selectedPotionSlotIndex);
+  const potionSlotChanged = beforePotion && afterPotion
+    ? beforePotion.empty !== afterPotion.empty || beforePotion.potion_id !== afterPotion.potion_id
+    : null;
+
+  const beforeTarget = findEnemySummary(before, selectedTargetCombatId);
+  const afterTarget = findEnemySummary(after, selectedTargetCombatId);
+  const targetHpChanged = beforeTarget && afterTarget
+    ? beforeTarget.hp !== afterTarget.hp
+    : null;
+  const beforeGold = before.player && before.player.gold;
+  const afterGold = after.player && after.player.gold;
+  const playerGoldDelta = beforeGold !== null && afterGold !== null
+    ? afterGold - beforeGold
+    : null;
+  const selectedShopItemId = readTrimmedString(action && (action.shop_item_id || action.shopItemId));
+  const beforeShopItem = findShopItemSummary(before, selectedShopItemId);
+  const afterShopItem = findShopItemSummary(after, selectedShopItemId);
+  const selectedShopItemRemoved = selectedShopItemId
+    ? beforeShopItem !== null && afterShopItem === null
+    : null;
+
+  return {
+    comparable: true,
+    action_type: actionType || null,
+    phase_changed: before.phase !== after.phase,
+    state_id_changed: before.state_id !== after.state_id,
+    player_energy_changed: before.player.energy !== after.player.energy,
+    player_block_changed: before.player.block !== after.player.block,
+    hand_count_delta: (after.hand || []).length - (before.hand || []).length,
+    selected_card_left_hand: selectedCardLeftHand,
+    potion_slot_changed: potionSlotChanged,
+    target_hp_changed: targetHpChanged,
+    enemy_count_delta: (after.enemies || []).length - (before.enemies || []).length,
+    player_gold_delta: playerGoldDelta,
+    shop_item_count_delta: ((after.shop && after.shop.items) || []).length - ((before.shop && before.shop.items) || []).length,
+    selected_shop_item_removed: selectedShopItemRemoved
+  };
+}
+
+function findPotionSlotSummary(summary, slotIndex) {
+  if (slotIndex === null || !summary || !Array.isArray(summary.potion_slots)) {
+    return null;
+  }
+
+  return summary.potion_slots.find((slot) => slot.slot_index === slotIndex) || null;
+}
+
+function findEnemySummary(summary, combatId) {
+  if (combatId === null || !summary || !Array.isArray(summary.enemies)) {
+    return null;
+  }
+
+  return summary.enemies.find((enemy) => enemy.combat_id === combatId) || null;
+}
+
+function findShopItemSummary(summary, shopItemId) {
+  if (!shopItemId || !summary || !summary.shop || !Array.isArray(summary.shop.items)) {
+    return null;
+  }
+
+  return summary.shop.items.find((item) => item.shop_item_id === shopItemId) || null;
+}
+
+function toNullableNumber(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
 }
 
 function getSupportedActionTypes(claimArguments) {
@@ -396,16 +1413,30 @@ function createActionClaim(state, claimArguments) {
     };
   }
 
+  const legalAction = getLegalActionById(state.currentState, latestAction.selected_action_id);
+  const actionType = legalAction && typeof legalAction.type === "string" ? legalAction.type.trim() : "";
   const stateMatches = latestAction.state_id === state.currentStateId
     && latestAction.state_version === state.stateVersion
     && latestAction.state_id === observedStateId
     && latestAction.state_version === observedStateVersion;
+  const canClaimAcrossFreshCombatState = !stateMatches
+    && legalAction
+    && latestAction.state_id.startsWith("combat_")
+    && state.currentStateId.startsWith("combat_")
+    && observedStateId === state.currentStateId
+    && observedStateVersion === state.stateVersion
+    && (actionType === "play_card" || actionType === "use_potion");
 
-  if (!stateMatches) {
-    latestAction.execution_status = "stale";
-    latestAction.result = "stale";
+  if (!stateMatches && !canClaimAcrossFreshCombatState) {
+    const terminalTransition = isTerminalStateEnvelope(state);
+    const claimResult = terminalTransition ? "terminal_transition" : "stale";
+    const claimNote = terminalTransition
+      ? "claim 시점에 종료 상태로 전환되었습니다. terminal_phase=game_over"
+      : "claim 시점의 상태가 제출 시점 상태와 다릅니다.";
+    latestAction.execution_status = claimResult;
+    latestAction.result = claimResult;
     latestAction.result_reported_at = toIsoString(new Date());
-    latestAction.result_note = "claim 시점의 상태가 제출 시점 상태와 다릅니다.";
+    latestAction.result_note = claimNote;
     updateLatestAction(state, "action_marked_stale", {
       submission_id: latestAction.submission_id,
       state_id: latestAction.state_id,
@@ -414,6 +1445,26 @@ function createActionClaim(state, claimArguments) {
       observed_state_version: observedStateVersion
     });
 
+    if (terminalTransition) {
+      return {
+        ok: true,
+        status: claimResult,
+        reason: claimNote,
+        action: latestAction
+      };
+    }
+
+    const retrySubmission = retryCurrentPlanStepAfterStale(state, latestAction, latestAction.result_note);
+    if (retrySubmission) {
+      return {
+        ok: true,
+        status: "stale_retry_queued",
+        reason: "상태가 바뀐 행동을 최신 상태 기준으로 다시 제출했습니다.",
+        action: retrySubmission
+      };
+    }
+
+    failCurrentPlanStepAfterStale(state, latestAction, latestAction.result_note);
     return {
       ok: true,
       status: "stale",
@@ -422,7 +1473,6 @@ function createActionClaim(state, claimArguments) {
     };
   }
 
-  const legalAction = getLegalActionById(state.currentState, latestAction.selected_action_id);
   if (!legalAction) {
     latestAction.execution_status = "stale";
     latestAction.result = "stale";
@@ -433,6 +1483,17 @@ function createActionClaim(state, claimArguments) {
       selected_action_id: latestAction.selected_action_id
     });
 
+    const retrySubmission = retryCurrentPlanStepAfterStale(state, latestAction, latestAction.result_note);
+    if (retrySubmission) {
+      return {
+        ok: true,
+        status: "stale_retry_queued",
+        reason: "사라진 행동을 최신 legal_actions 기준으로 다시 제출했습니다.",
+        action: retrySubmission
+      };
+    }
+
+    failCurrentPlanStepAfterStale(state, latestAction, latestAction.result_note);
     return {
       ok: true,
       status: "stale",
@@ -441,7 +1502,6 @@ function createActionClaim(state, claimArguments) {
     };
   }
 
-  const actionType = typeof legalAction.type === "string" ? legalAction.type.trim() : "";
   if (supportedActionTypes.length > 0 && !supportedActionTypes.includes(actionType)) {
     latestAction.execution_status = "unsupported";
     latestAction.result = "unsupported";
@@ -497,7 +1557,7 @@ function createActionResult(state, resultArguments) {
   const note = typeof resultArguments.note === "string" ? resultArguments.note.trim() : "";
   const observedStateId = typeof resultArguments.observed_state_id === "string" ? resultArguments.observed_state_id.trim() : "";
   const observedStateVersion = normalizeStateVersion(resultArguments.observed_state_version, -1);
-  const allowedResults = new Set(["applied", "stale", "unsupported", "failed", "ignored_duplicate"]);
+  const allowedResults = new Set(["applied", "stale", "terminal_transition", "unsupported", "failed", "ignored_duplicate"]);
 
   if (!latestAction || latestAction.submission_id !== submissionId) {
     return {
@@ -523,28 +1583,99 @@ function createActionResult(state, resultArguments) {
     };
   }
 
+  const terminalTransition = result === "stale" && isTerminalStateEnvelope(state);
+  const effectiveResult = terminalTransition ? "terminal_transition" : result;
+  const effectiveNote = terminalTransition
+    ? [note, "terminal_phase=game_over"].filter((item) => item !== "").join(" ")
+    : note;
+
   const reportedAt = toIsoString(new Date());
-  latestAction.execution_status = result;
-  latestAction.result = result;
+  latestAction.execution_status = effectiveResult;
+  latestAction.result = effectiveResult;
   latestAction.result_reported_at = reportedAt;
   latestAction.result_executor_id = executorId || null;
   latestAction.result_observed_state_id = observedStateId || null;
   latestAction.result_observed_state_version = observedStateVersion >= 0 ? observedStateVersion : null;
-  latestAction.result_note = note || null;
+  latestAction.result_note = effectiveNote || null;
+  attachObservedResultStateIfCurrent(state, latestAction);
+
+  if (state.actionPlan
+    && state.actionPlan.status === "running"
+    && latestAction.plan_id === state.actionPlan.plan_id
+    && effectiveResult !== "applied"
+    && effectiveResult !== "stale"
+    && effectiveResult !== "terminal_transition") {
+    state.actionPlan.status = "failed";
+    state.actionPlan.failure = {
+      action_index: latestAction.plan_action_index,
+      submission_id: latestAction.submission_id,
+      result: effectiveResult,
+      reason: note || "행동 실행 결과가 applied가 아니어서 남은 행동을 중단했습니다."
+    };
+  }
+
   updateLatestAction(state, "action_result_reported", {
     submission_id: latestAction.submission_id,
     claim_token: latestAction.claim_token,
     executor_id: executorId || null,
-    result,
+    selected_action_id: latestAction.selected_action_id || null,
+    action_type: latestAction.action_type || null,
+    result: effectiveResult,
     observed_state_id: observedStateId || null,
-    observed_state_version: observedStateVersion >= 0 ? observedStateVersion : null
+    observed_state_version: observedStateVersion >= 0 ? observedStateVersion : null,
+    result_note: effectiveNote || null
   });
+
+  if (effectiveResult === "stale") {
+    const retrySubmission = retryCurrentPlanStepAfterStale(state, latestAction, effectiveNote);
+    if (retrySubmission) {
+      return {
+        ok: true,
+        status: "stale_retry_queued",
+        latest_action: retrySubmission,
+        action_plan: state.actionPlan
+      };
+    }
+
+    failCurrentPlanStepAfterStale(state, latestAction, effectiveNote);
+  }
+
+  if (effectiveResult === "applied") {
+    advanceActionPlanAfterStateUpdate(state);
+  }
 
   return {
     ok: true,
-    status: result,
-    latest_action: latestAction
+    status: effectiveResult,
+    latest_action: state.latestAction,
+    action_plan: state.actionPlan
   };
+}
+
+function attachObservedResultStateIfCurrent(state, latestAction) {
+  if (!latestAction
+    || latestAction.result === null
+    || latestAction.post_result_state_version !== undefined
+    || latestAction.result_observed_state_version === null
+    || latestAction.result_observed_state_version === undefined
+    || latestAction.result_observed_state_version <= latestAction.state_version
+    || state.currentState === null
+    || state.stateVersion <= latestAction.state_version) {
+    return;
+  }
+
+  const envelope = buildStateEnvelope(state);
+  const postSummary = summarizeStateForAction(envelope.state, latestAction.selected_action_id);
+  const delta = compareActionStateSummaries(
+    latestAction.pre_action_state_summary || null,
+    postSummary,
+    latestAction.action || null);
+
+  latestAction.post_result_state_id = envelope.state_id;
+  latestAction.post_result_state_version = envelope.state_version;
+  latestAction.post_result_received_at = envelope.received_at;
+  latestAction.post_result_state_summary = postSummary;
+  latestAction.state_delta = delta;
 }
 
 function getCurrentStatePayload(state) {
@@ -552,9 +1683,33 @@ function getCurrentStatePayload(state) {
     state_version: state.stateVersion,
     received_at: state.currentStateReceivedAt,
     state_id: state.currentStateId,
+    room_context_summary: getRoomContextSummary(state.currentState),
     legal_action_ids: state.legalActionIds,
     state: state.currentState,
-    latest_action: state.latestAction
+    latest_action: state.latestAction,
+    action_plan: state.actionPlan
+  };
+}
+
+function getRoomContextSummary(currentState) {
+  if (!isPlainObject(currentState)) {
+    return null;
+  }
+
+  const roomContext = isPlainObject(currentState.room_context) ? currentState.room_context : {};
+  const currentRoom = isPlainObject(roomContext.current_room) ? roomContext.current_room : {};
+  const currentMapPoint = isPlainObject(roomContext.current_map_point) ? roomContext.current_map_point : {};
+  return {
+    phase: typeof currentState.phase === "string" ? currentState.phase : null,
+    room_kind: typeof currentRoom.kind === "string" ? currentRoom.kind : null,
+    room_type: typeof currentRoom.type_name === "string" ? currentRoom.type_name : null,
+    room_name: typeof currentRoom.name === "string" ? currentRoom.name : null,
+    screen_type: typeof roomContext.current_screen_type === "string" ? roomContext.current_screen_type : null,
+    map_point_kind: typeof currentMapPoint.kind === "string" ? currentMapPoint.kind : null,
+    map_row: readOptionalInteger(currentMapPoint.row),
+    map_column: readOptionalInteger(currentMapPoint.column),
+    run_in_progress: roomContext.run_in_progress === true ? true : (roomContext.run_in_progress === false ? false : null),
+    combat_in_progress: roomContext.combat_in_progress === true ? true : (roomContext.combat_in_progress === false ? false : null)
   };
 }
 
@@ -638,7 +1793,8 @@ function startHttpServer(state) {
       if (req.method === "GET" && requestUrl.pathname === "/action/latest") {
         sendJson(res, 200, {
           ok: true,
-          latest_action: state.latestAction
+          latest_action: state.latestAction,
+          action_plan: state.actionPlan
         });
         return;
       }
@@ -676,6 +1832,12 @@ function startHttpServer(state) {
             ok: false,
             error: "행동 제출 본문은 JSON 객체여야 합니다."
           });
+          return;
+        }
+
+        if (Array.isArray(body.actions)) {
+          const planSubmission = createActionPlanSubmission(state, body);
+          sendJson(res, planSubmission.ok ? 200 : 400, planSubmission);
           return;
         }
 
@@ -795,3 +1957,4 @@ process.on("SIGTERM", () => {
 
   process.exit(0);
 });
+

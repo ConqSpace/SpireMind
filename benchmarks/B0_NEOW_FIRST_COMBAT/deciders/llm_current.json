@@ -1,0 +1,10 @@
+{
+  "decider_id": "llm_current",
+  "decision_backend": "app-server",
+  "model": "gpt-5.4-mini",
+  "effort": "low",
+  "prompt_version": "current",
+  "command": null,
+  "command_args": [],
+  "codex_command": null
+}

@@ -1,0 +1,119 @@
+{
+  "schema_version": "sts2_action_flows.v1",
+  "scope": "operation_semantics_only",
+  "benchmark_guardrail": "This file describes adapter control flow and state transitions only. It intentionally excludes card, relic, potion, and strategy ratings.",
+  "actions": {
+    "play_card": {
+      "meaning": "Play one legal card from the current hand.",
+      "preconditions": [
+        "The current state phase is combat_turn.",
+        "The selected action is present in legal_actions.",
+        "The same combat_card_id is still in hand.",
+        "If the action has a target, target_combat_id or target_id still resolves to a legal target."
+      ],
+      "expected_immediate_result": "The card play is queued and the combat state is posted again after the game processes it.",
+      "next_decision": "Observe the refreshed combat state before choosing another action."
+    },
+    "end_turn": {
+      "meaning": "End the current player turn.",
+      "preconditions": [
+        "The current state phase is combat_turn.",
+        "The end_turn action is present in legal_actions."
+      ],
+      "expected_immediate_result": "The player turn ends and the game advances to enemy actions or the next observable combat state.",
+      "next_decision": "Wait for the next posted state before deciding again."
+    },
+    "buy_shop_item": {
+      "meaning": "Purchase one legal shop card, relic, or potion.",
+      "preconditions": [
+        "The current state phase is shop.",
+        "The selected action is present in legal_actions.",
+        "The item is stocked, affordable, and not blocked by adapter validation."
+      ],
+      "expected_immediate_result": "Gold decreases, the purchased item is added or applied, and the shop state is posted again.",
+      "next_decision": "Re-read legal_actions before choosing another shop action."
+    },
+    "remove_card_at_shop": {
+      "meaning": "Open the shop card removal service.",
+      "preconditions": [
+        "The current state phase is shop.",
+        "The removal service action is present in legal_actions.",
+        "The player has enough gold and the service has not already been used."
+      ],
+      "expected_immediate_result": "The next state should be a card_selection screen when the service opens.",
+      "next_decision": "Choose exactly one choose_card_selection action, then confirm_card_selection. Use cancel_card_selection only when no target should be chosen."
+    },
+    "use_potion": {
+      "meaning": "Use one legal combat potion from a specific potion slot.",
+      "preconditions": [
+        "The current state phase is combat_turn.",
+        "The selected action is present in legal_actions.",
+        "The same potion is still in the same potion_slot_index.",
+        "If requires_target is true, target_combat_id or target_id still resolves to a live target."
+      ],
+      "expected_immediate_result": "The potion effect is queued, the potion slot may become empty, and the combat state is posted again.",
+      "next_decision": "Observe the refreshed combat state before choosing another action."
+    },
+    "choose_card_selection": {
+      "meaning": "Select one card shown by the active card selection screen.",
+      "preconditions": [
+        "The current state phase is card_selection.",
+        "The selected card action is present in legal_actions.",
+        "selected_count is lower than max_select."
+      ],
+      "expected_immediate_result": "The card selection screen marks the selected card.",
+      "next_decision": "If selected_count reaches min_select, confirm_card_selection may become the correct next control action."
+    },
+    "confirm_card_selection": {
+      "meaning": "Confirm the current card selection.",
+      "preconditions": [
+        "The current state phase is card_selection.",
+        "The action is present in legal_actions.",
+        "selected_count satisfies the screen's minimum requirement."
+      ],
+      "expected_immediate_result": "The selection resolves and the game returns to the previous flow, often the shop or reward screen.",
+      "next_decision": "Observe the next posted state before deciding again."
+    },
+    "cancel_card_selection": {
+      "meaning": "Cancel the active card selection screen and return to the previous screen when the game UI supports cancellation.",
+      "preconditions": [
+        "The current state phase is card_selection.",
+        "The action is present in legal_actions."
+      ],
+      "expected_immediate_result": "The card selection screen closes or attempts to close without applying a selection.",
+      "next_decision": "Observe the next posted state. If cancellation fails, use legal_actions from the refreshed state."
+    },
+    "proceed_shop": {
+      "meaning": "Leave the shop.",
+      "preconditions": [
+        "The current state phase is shop.",
+        "The proceed action is present in legal_actions."
+      ],
+      "expected_immediate_result": "The shop is completed and the run advances.",
+      "next_decision": "Observe the next room or map state before deciding again."
+    }
+  },
+  "screen_flows": {
+    "shop": [
+      "buy_shop_item",
+      "remove_card_at_shop",
+      "proceed_shop"
+    ],
+    "combat_turn": [
+      "play_card",
+      "use_potion",
+      "end_turn"
+    ],
+    "card_selection": [
+      "choose_card_selection",
+      "confirm_card_selection",
+      "cancel_card_selection"
+    ]
+  },
+  "state_fields": {
+    "shop.potion_slots": "Current potion slots if visible through runtime state.",
+    "shop.has_open_potion_slots": "False means potion purchases should be treated as blocked even when the player has enough gold.",
+    "combat_turn.player.potion_slots": "Current combat potion slots. Filled slots expose potion_id, target_type, requires_target, and is_usable_now when available.",
+    "shop_visit_history": "Recent shop and card_selection actions from decisions.jsonl. This is procedural memory, not strategic evaluation."
+  }
+}

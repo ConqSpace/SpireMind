@@ -362,3 +362,18 @@ R5.1 구현 전에 다음 STS2 내부 경로를 조사한다.
 - 행동 실행 후 상태가 안정됐는지 확인할 수 있는 신호.
 
 조사 결과가 불확실하면 R5.1은 턴 종료 버튼 핸들러 호출까지 허용한다. 그래도 마우스 좌표 클릭은 사용하지 않는다.
+## R5.2 범위: 카드 사용 실행
+
+R5.2부터 모드 실행기는 `play_card`도 claim할 수 있다.
+
+- 실행기는 `combat_card_id`로 `NetCombatCardDb.Instance.TryGetCard(...)`를 호출해 현재 전투 카드 객체를 복원한다.
+- 대상이 있는 행동은 `target_combat_id`로 현재 `CombatState.Creatures`에서 `Creature`를 찾는다.
+- 실행은 `CardModel.TryManualPlay(Creature?)`만 호출한다.
+- 자원 소모, 카드 효과, 카드 이동은 STS2의 `PlayCardAction` 큐가 처리한다.
+- 실행 직전 카드가 손패에 없거나 대상이 사라졌으면 실행하지 않고 `failed`로 보고한다.
+
+검증 기준:
+
+- 브리지 `/action/claim`에서 `play_card`가 `claimed` 상태가 된다.
+- 모드가 `applied` 결과를 보고한다.
+- 다음 `combat_state.json`에서 손패 수, 버린 더미, 적 체력 중 하나 이상이 카드 사용 이후 상태로 바뀐다.

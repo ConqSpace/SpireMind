@@ -12,9 +12,20 @@
 
   <Import Project="SpireMind.Local.props" Condition="Exists('SpireMind.Local.props')" />
 
+  <PropertyGroup>
+    <GodotSharpAssemblyPath Condition="'$(GodotSharpAssemblyPath)' == '' and '$(Sts2GameDataPath)' != ''">$(Sts2GameDataPath)\GodotSharp.dll</GodotSharpAssemblyPath>
+  </PropertyGroup>
+
   <ItemGroup Condition="'$(Sts2AssemblyPath)' != '' and Exists('$(Sts2AssemblyPath)')">
     <Reference Include="sts2">
       <HintPath>$(Sts2AssemblyPath)</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(GodotSharpAssemblyPath)' != '' and Exists('$(GodotSharpAssemblyPath)')">
+    <Reference Include="GodotSharp">
+      <HintPath>$(GodotSharpAssemblyPath)</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
