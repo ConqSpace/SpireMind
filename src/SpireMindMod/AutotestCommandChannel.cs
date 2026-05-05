@@ -271,6 +271,7 @@ internal static class AutotestCommandChannel
         diagnostics["timeout_ms"] = ReadInt(command.Params, "timeout_ms") ?? StartNewRunOperation.DefaultTimeoutMs;
         diagnostics["ready_timeout_ms"] = ReadInt(command.Params, "ready_timeout_ms") ?? StartNewRunOperation.DefaultReadyTimeoutMs;
         diagnostics["requested_character_id"] = ReadString(command.Params, "character_id");
+        diagnostics["force_abandon"] = ReadBool(command.Params, "force_abandon") == true;
 
         startNewRunOperation = new StartNewRunOperation(command, diagnostics);
         WriteCommandResult(command, "started", "새 런 시작 UI 흐름을 준비합니다.", diagnostics);
@@ -1355,10 +1356,15 @@ internal static class AutotestCommandChannel
         private readonly string? requestedCharacterId;
         private readonly string? requestedSeed;
         private readonly bool useCustomRun;
+        private readonly bool forceAbandon;
 
         private string stage = "press_singleplayer";
         private long readyWaitStartedAtMs;
+        private long abandonStartedAtMs;
+        private long returnToMainMenuStartedAtMs;
         private long lastWaitStageResultAtMs;
+        private Task? returnToMainMenuTask;
+        private bool mainMenuSaveAbandonAttempted;
 
         internal StartNewRunOperation(AutotestCommand command, Dictionary<string, object?> diagnostics)
         {
@@ -1371,8 +1377,10 @@ internal static class AutotestCommandChannel
             useCustomRun = !string.IsNullOrWhiteSpace(requestedSeed)
                 || string.Equals(ReadString(command.Params, "run_mode"), "custom", StringComparison.OrdinalIgnoreCase)
                 || ReadBool(command.Params, "custom") == true;
+            forceAbandon = ReadBool(command.Params, "force_abandon") == true;
             diagnostics["requested_seed"] = requestedSeed;
             diagnostics["use_custom_run"] = useCustomRun;
+            diagnostics["force_abandon"] = forceAbandon;
         }
 
         internal bool Tick()
@@ -1393,6 +1401,14 @@ internal static class AutotestCommandChannel
                 {
                     case "press_singleplayer":
                         return PressSingleplayer();
+                    case "force_abandon_run":
+                        return ForceAbandonRun();
+                    case "wait_abandon_game_over":
+                        return WaitAbandonGameOver();
+                    case "return_to_main_menu_after_abandon":
+                        return ReturnToMainMenuAfterAbandon();
+                    case "wait_main_menu_after_abandon":
+                        return WaitMainMenuAfterAbandon();
                     case "open_run_mode_if_needed":
                         return OpenRunModeIfNeeded();
                     case "set_custom_seed":
@@ -1437,6 +1453,13 @@ internal static class AutotestCommandChannel
 
             if (ReadInstanceMember(runManager, "IsInProgress") is bool isInProgress && isInProgress)
             {
+                if (forceAbandon)
+                {
+                    stage = "force_abandon_run";
+                    WriteCommandResult(command, "running", "진행 중인 런을 포기한 뒤 새 시드 런을 시작합니다.", diagnostics);
+                    return false;
+                }
+
                 readyWaitStartedAtMs = Environment.TickCount64;
                 stage = "wait_state_ready";
                 WriteCommandResult(command, "running", "이미 런이 진행 중이므로 상태 파일 준비만 확인합니다.", diagnostics);
@@ -1445,8 +1468,8 @@ internal static class AutotestCommandChannel
 
             if (mainMenu is null)
             {
-                Reject("현재 화면에서 메인 메뉴 객체를 찾을 수 없어 새 런을 시작하지 않았습니다.");
-                return true;
+                WriteRunningResultIfDue("메인 메뉴 객체가 준비되기를 기다리는 중입니다.");
+                return false;
             }
 
             object? currentSubmenu = PeekMainMenuSubmenu(mainMenu);
@@ -1476,10 +1499,24 @@ internal static class AutotestCommandChannel
 
             TryInvokeVoidMethod(mainMenu, "RefreshButtons");
             object? singleplayerButton = ReadInstanceMember(mainMenu, "_singleplayerButton");
-            if (!IsButtonReady(singleplayerButton, "singleplayer_button"))
+            if (!IsButtonEnabled(singleplayerButton, "singleplayer_button"))
             {
-                Reject("싱글플레이 버튼이 아직 누를 수 있는 상태가 아닙니다.");
-                return true;
+                WriteRunningResultIfDue("싱글플레이 버튼이 누를 수 있는 상태가 되기를 기다리는 중입니다.");
+                return false;
+            }
+
+            if (forceAbandon && !mainMenuSaveAbandonAttempted)
+            {
+                MethodInfo? abandonSavedRun = FindMethod(mainMenu.GetType(), "AbandonRun", 0);
+                diagnostics["main_menu_abandon_saved_run_method_found"] = abandonSavedRun is not null;
+                if (abandonSavedRun is not null)
+                {
+                    abandonSavedRun.Invoke(mainMenu, Array.Empty<object>());
+                    TryInvokeVoidMethod(mainMenu, "RefreshButtons");
+                    diagnostics["main_menu_abandon_saved_run_requested"] = true;
+                }
+
+                mainMenuSaveAbandonAttempted = true;
             }
 
             MethodInfo? singleplayerPressed = FindCompatibleMethod(
@@ -1496,6 +1533,147 @@ internal static class AutotestCommandChannel
             singleplayerPressed.Invoke(mainMenu, new[] { singleplayerButton });
             stage = "open_run_mode_if_needed";
             WriteCommandResult(command, "running", "싱글플레이 메뉴 진입을 요청했습니다.", diagnostics);
+            return false;
+        }
+
+        private bool ForceAbandonRun()
+        {
+            object? runManager = ReadStaticMember(AccessTools.TypeByName("MegaCrit.Sts2.Core.Runs.RunManager"), "Instance");
+            RefreshContinueRunDiagnostics(diagnostics);
+            diagnostics["abandon_run_manager_found"] = runManager is not null;
+            diagnostics["abandon_run_in_progress"] = ReadInstanceMember(runManager, "IsInProgress") is bool isInProgress && isInProgress;
+            diagnostics["abandon_combat_in_progress"] = IsCombatInProgress();
+
+            if (diagnostics["abandon_run_in_progress"] is not true)
+            {
+                stage = "press_singleplayer";
+                WriteCommandResult(command, "running", "포기할 진행 중인 런이 없어 새 런 시작 단계로 이동합니다.", diagnostics);
+                return false;
+            }
+
+            if (runManager is null)
+            {
+                Fail("RunManager.Instance를 찾을 수 없어 진행 중인 런을 포기할 수 없습니다.");
+                return true;
+            }
+
+            MethodInfo? abandon = FindMethod(runManager.GetType(), "Abandon", 0);
+            diagnostics["abandon_method_found"] = abandon is not null;
+            if (abandon is null)
+            {
+                Fail("RunManager.Abandon 메서드를 찾을 수 없어 진행 중인 런을 포기할 수 없습니다.");
+                return true;
+            }
+
+            abandon.Invoke(runManager, Array.Empty<object>());
+            abandonStartedAtMs = Environment.TickCount64;
+            stage = "wait_abandon_game_over";
+            WriteCommandResult(command, "running", "진행 중인 런 포기를 요청했습니다. 게임오버 상태를 기다립니다.", diagnostics);
+            Logger.Info($"start_new_run force_abandon 요청: id={command.Id}");
+            return false;
+        }
+
+        private bool WaitAbandonGameOver()
+        {
+            object? runManager = ReadStaticMember(AccessTools.TypeByName("MegaCrit.Sts2.Core.Runs.RunManager"), "Instance");
+            long elapsedMs = Environment.TickCount64 - abandonStartedAtMs;
+            bool isInProgress = ReadInstanceMember(runManager, "IsInProgress") is bool runInProgress && runInProgress;
+            bool isGameOver = ReadInstanceMember(runManager, "IsGameOver") is bool gameOver && gameOver;
+            bool isAbandoned = ReadInstanceMember(runManager, "IsAbandoned") is bool abandoned && abandoned;
+            string? latestFilePhase = CombatStateExporter.ReadLatestStateFilePhase("start_new_run_force_abandon");
+
+            diagnostics["abandon_elapsed_ms"] = elapsedMs;
+            diagnostics["abandon_run_in_progress"] = isInProgress;
+            diagnostics["abandon_is_game_over"] = isGameOver;
+            diagnostics["abandon_is_abandoned"] = isAbandoned;
+            diagnostics["abandon_latest_file_phase"] = latestFilePhase;
+
+            if (!isInProgress)
+            {
+                stage = "press_singleplayer";
+                WriteCommandResult(command, "running", "런 포기 후 이미 메인 메뉴 상태로 정리되었습니다.", diagnostics);
+                return false;
+            }
+
+            if (isGameOver || string.Equals(latestFilePhase, "game_over", StringComparison.OrdinalIgnoreCase))
+            {
+                stage = "return_to_main_menu_after_abandon";
+                WriteCommandResult(command, "running", "런 포기가 반영되어 메인 메뉴 복귀를 요청합니다.", diagnostics);
+                return false;
+            }
+
+            if (elapsedMs > readyTimeoutMs)
+            {
+                Fail("진행 중인 런 포기 후 게임오버 상태 대기 시간이 초과되었습니다.");
+                return true;
+            }
+
+            WriteRunningResultIfDue("진행 중인 런이 포기 처리되기를 기다리는 중입니다.");
+            return false;
+        }
+
+        private bool ReturnToMainMenuAfterAbandon()
+        {
+            object? nGame = ReadStaticMember(AccessTools.TypeByName("MegaCrit.Sts2.Core.Nodes.NGame"), "Instance");
+            if (nGame is null)
+            {
+                Fail("NGame.Instance를 찾을 수 없어 메인 메뉴로 돌아갈 수 없습니다.");
+                return true;
+            }
+
+            MethodInfo? returnToMainMenu = FindMethod(nGame.GetType(), "ReturnToMainMenuAfterRun", 0);
+            diagnostics["return_to_main_menu_method_found"] = returnToMainMenu is not null;
+            if (returnToMainMenu is null)
+            {
+                Fail("NGame.ReturnToMainMenuAfterRun 메서드를 찾을 수 없어 메인 메뉴로 돌아갈 수 없습니다.");
+                return true;
+            }
+
+            object? result = returnToMainMenu.Invoke(nGame, Array.Empty<object>());
+            returnToMainMenuTask = result as Task;
+            returnToMainMenuStartedAtMs = Environment.TickCount64;
+            stage = "wait_main_menu_after_abandon";
+            WriteCommandResult(command, "running", "메인 메뉴 복귀를 요청했습니다.", diagnostics);
+            return false;
+        }
+
+        private bool WaitMainMenuAfterAbandon()
+        {
+            long elapsedMs = Environment.TickCount64 - returnToMainMenuStartedAtMs;
+            object? nGame = ReadStaticMember(AccessTools.TypeByName("MegaCrit.Sts2.Core.Nodes.NGame"), "Instance");
+            object? runManager = ReadStaticMember(AccessTools.TypeByName("MegaCrit.Sts2.Core.Runs.RunManager"), "Instance");
+            object? mainMenu = ReadInstanceMember(nGame, "MainMenu");
+            bool isInProgress = ReadInstanceMember(runManager, "IsInProgress") is bool runInProgress && runInProgress;
+            bool taskCompleted = returnToMainMenuTask?.IsCompleted ?? true;
+
+            diagnostics["return_to_main_menu_elapsed_ms"] = elapsedMs;
+            diagnostics["return_to_main_menu_task_status"] = returnToMainMenuTask?.Status.ToString() ?? "no_task";
+            diagnostics["return_to_main_menu_task_completed"] = taskCompleted;
+            diagnostics["return_to_main_menu_main_menu_found"] = mainMenu is not null;
+            diagnostics["return_to_main_menu_run_in_progress"] = isInProgress;
+
+            if (returnToMainMenuTask?.IsFaulted == true)
+            {
+                Exception exception = returnToMainMenuTask.Exception?.GetBaseException() ?? returnToMainMenuTask.Exception!;
+                RecordException(exception);
+                Fail($"메인 메뉴 복귀 작업 실패: {exception.GetType().Name}: {exception.Message}");
+                return true;
+            }
+
+            if (taskCompleted && mainMenu is not null && !isInProgress)
+            {
+                stage = "press_singleplayer";
+                WriteCommandResult(command, "running", "기존 런 포기와 메인 메뉴 복귀를 완료했습니다. 새 시드 런을 시작합니다.", diagnostics);
+                return false;
+            }
+
+            if (elapsedMs > readyTimeoutMs)
+            {
+                Fail("런 포기 후 메인 메뉴 복귀 시간이 초과되었습니다.");
+                return true;
+            }
+
+            WriteRunningResultIfDue("런 포기 후 메인 메뉴로 돌아가는 중입니다.");
             return false;
         }
 
@@ -1732,6 +1910,21 @@ internal static class AutotestCommandChannel
             diagnostics[$"{prefix}_visible_in_tree"] = visibleInTree;
             diagnostics[$"{prefix}_type"] = button?.GetType().FullName;
             return found && enabled && visible && visibleInTree;
+        }
+
+        private bool IsButtonEnabled(object? button, string prefix)
+        {
+            bool found = button is not null;
+            bool enabled = ReadInstanceMember(button, "IsEnabled") is bool isEnabled && isEnabled;
+            bool visible = InvokeBoolMethod(button, "IsVisible") ?? false;
+            bool visibleInTree = InvokeBoolMethod(button, "IsVisibleInTree") ?? false;
+            diagnostics[$"{prefix}_found"] = found;
+            diagnostics[$"{prefix}_enabled"] = enabled;
+            diagnostics[$"{prefix}_visible"] = visible;
+            diagnostics[$"{prefix}_visible_in_tree"] = visibleInTree;
+            diagnostics[$"{prefix}_automation_allows_hidden"] = true;
+            diagnostics[$"{prefix}_type"] = button?.GetType().FullName;
+            return found && enabled;
         }
 
         private object? GetMainMenu()

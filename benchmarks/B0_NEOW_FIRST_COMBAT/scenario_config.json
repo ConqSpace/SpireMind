@@ -1,0 +1,17 @@
+{
+  "benchmark_id": "B0_NEOW_FIRST_COMBAT",
+  "description": "단일 시드에서 니오우 선택부터 첫 전투 종료까지 검증한다.",
+  "character": "Ironclad",
+  "ascension": 0,
+  "seed_id": "seed_0001",
+  "stop_rule": "first_combat_finished",
+  "max_decisions": 30,
+  "timeout_ms": 120000,
+  "result_timeout_ms": 60000,
+  "poll_ms": 500,
+  "max_runtime_ms": 900000,
+  "shutdown_grace_ms": 2500,
+  "auto_trivial": false,
+  "dismiss_terminal": false,
+  "human_intervention": "setup_only"
+}

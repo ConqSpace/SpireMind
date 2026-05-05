@@ -1,63 +1,53 @@
-# STS2 AI Runner 기획 문서
+# 문서 색인
 
-이 문서는 Slay the Spire 2를 LLM에게 플레이시키는 실험 모드의 1차 기획을 정리한다.
+이 폴더는 SpireMind의 설계, 실행 방법, 벤치마크 기준을 정리합니다. 처음 보는 사람은 먼저 [루트 README](../README.md)를 읽는 편이 좋습니다.
 
-목표는 플레이어 보조가 아니다. 목표는 AI가 STS2의 전투와 장기 선택을 얼마나 잘 처리하는지 측정하는 것이다. 그래서 UI보다 상태 추출, 행동 제한, 로그, 반복 가능한 실험 조건을 먼저 잠근다.
+## 핵심 문서
 
-## 1차 목표
+- [benchmark_design.md](./benchmark_design.md): 단기/장기 벤치마크의 목적, 측정 지표, 통과 기준
+- [benchmark_implementation_plan.md](./benchmark_implementation_plan.md): 벤치마크 실행기, 설정 파일, 종료 조건, 요약 파일 설계
+- [autotest_commands.md](./autotest_commands.md): 게임 안에서 새 런 시작, 고정 시드 적용, 진행 중 런 포기 명령을 처리하는 방식
+- [bridge_architecture.md](./bridge_architecture.md): STS2 모드, 로컬 HTTP 브리지, MCP 프록시의 역할
+- [decision_loop.md](./decision_loop.md): 상태 관측, LLM 판단, 행동 제출, 결과 대기 흐름
+- [codex_decider.md](./codex_decider.md): Codex 기반 판단기 연결 방식
+- [run_memory_logging.md](./run_memory_logging.md): 런 로그, 판단 기록, 메모리 요약 설계
+- [game_launch_guide.md](./game_launch_guide.md): STS2 실행과 로컬 점검 절차
+- [session_handoff.md](./session_handoff.md): 현재 세션의 구현 상태와 다음 작업 인수인계
 
-- 전투 상태를 JSON으로 안정적으로 추출한다.
-- 모드가 실행 가능한 행동 목록을 만든다.
-- LLM은 행동 목록 중 하나의 `action_id`만 선택한다.
-- 모드는 응답을 검증한 뒤 실행한다.
-- 모든 입력, 응답, 결과를 로그로 남긴다.
+## 상태와 행동 스키마
 
-## 문서 목록
-
-- [state_schema.md](./state_schema.md): STS2에서 추출해 LLM에 전달할 상태 JSON 형식
+- [state_schema.md](./state_schema.md): LLM에 전달하는 게임 상태 JSON 형식
 - [action_schema.md](./action_schema.md): LLM이 선택할 수 있는 행동 목록과 응답 형식
-- [experiment_protocol.md](./experiment_protocol.md): 성능 측정 조건, 지표, 비교 기준
-- [scenario_framework.md](./scenario_framework.md): SpireMind를 STS2 AI 시나리오 평가 도구로 다루기 위한 상위 설계
-- [failure_policy.md](./failure_policy.md): 잘못된 응답, 지연, 상태 변경, 예외 처리 규칙
-- [development_roadmap.md](./development_roadmap.md): 구현 단계, 산출물, 검증 기준, 주요 위험
-- [strategic_roadmap.md](./strategic_roadmap.md): 연구 방향, 장기 단계, 의사결정 지점
-- [decision_loop.md](./decision_loop.md): 브리지 상태를 읽고 행동 묶음을 제출하는 의사결정 루프
-- [codex_decider.md](./codex_decider.md): Codex CLI를 외부 판단기로 연결하는 방법
-- [run_memory_logging.md](./run_memory_logging.md): 전투 로그, 런 로그, 판단 기록, LLM 기억 요약 설계
+- [action_batch_schema.md](./action_batch_schema.md): 여러 행동 후보를 묶어 다루는 형식
+- [action_execution_design.md](./action_execution_design.md): 행동 검증과 실행 설계
+- [failure_policy.md](./failure_policy.md): 잘못된 판단, 오래된 상태, 실행 실패를 처리하는 기준
 
-## 현재 잠글 범위
+## 어댑터와 런타임 설계
 
-- 단일 플레이 전투
-- 현재 플레이어 1명 기준
-- 손패, 뽑을 카드 더미, 버려진 카드 더미, 소멸된 카드 더미
-- 플레이어 체력, 방어도, 에너지, 버프, 디버프
-- 적 체력, 방어도, 버프, 디버프, 의도
-- 유물
-- 합법 행동 목록
-- 턴별 로그
+- [adapter_design_notes.md](./adapter_design_notes.md): STS2 런타임 상태를 안정적으로 읽기 위한 설계 메모
+- [adapter_implementation_roadmap.md](./adapter_implementation_roadmap.md): 어댑터 구현 단계와 남은 과제
+- [runtime_state_adapter_rebuild.md](./runtime_state_adapter_rebuild.md): 런타임 상태 어댑터 재구성 계획
+- [card_selection_bridge_design.md](./card_selection_bridge_design.md): 카드 선택 화면 브리지 설계
+- [persistent_agent_daemon.md](./persistent_agent_daemon.md): 장기 실행 에이전트 데몬 설계
 
-## 나중에 열어둘 범위
+## 카드, 포션, 전투 참고 문서
 
-- 보상 선택
-- 지도 경로 선택
-- 상점 구매
-- 휴식/강화 선택
-- 이벤트 선택
-- 협동 모드
-- 장기 기억
-- 강화학습 정책과의 비교
+- [ironclad_card_effect_reference.md](./ironclad_card_effect_reference.md): 아이언클래드 카드 효과 참고
+- [ironclad_card_execution_classification.md](./ironclad_card_execution_classification.md): 아이언클래드 카드 실행 방식 분류
+- [ironclad_followup_reference_implementation.md](./ironclad_followup_reference_implementation.md): 후속 카드 실행 참고 구현
+- [potion_reference_logic_review.md](./potion_reference_logic_review.md): 포션 처리 로직 검토
 
-## 구현 원칙
+## 로드맵과 실험 계획
 
-- LLM은 게임 객체를 직접 조작하지 않는다.
-- LLM은 항상 `legal_actions` 안의 `action_id`만 고른다.
-- 카드 사용 가능 여부, 대상 가능 여부, 에너지 부족 여부는 모드가 판단한다.
-- 같은 입력 JSON과 같은 모델 설정이면 같은 실험을 다시 실행할 수 있어야 한다.
-- 실패한 응답도 버리지 않는다. 실패 자체가 실험 결과다.
+- [development_roadmap.md](./development_roadmap.md): 구현 단계와 검증 기준
+- [strategic_roadmap.md](./strategic_roadmap.md): 장기 연구 방향과 전략 평가 기준
+- [scenario_framework.md](./scenario_framework.md): SpireMind를 시나리오 평가 도구로 확장하는 구조
+- [experiment_protocol.md](./experiment_protocol.md): 실험 조건, 반복 수, 비교 기준
+- [ai_teammate_gap_roadmap.md](./ai_teammate_gap_roadmap.md): AI 동료형 플레이어로 확장할 때의 차이와 과제
 
-## 로컬 빌드 설정
+## 정리 원칙
 
-- `src/SpireMindMod/SpireMind.Local.props.example`을 같은 폴더의 `SpireMind.Local.props`로 복사한다.
-- `Sts2AssemblyPath`는 로컬 STS2 `sts2.dll` 경로로 설정한다.
-- `Sts2GameDataPath`는 로컬 STS2 `data_sts2_windows_x86_64` 폴더로 설정한다. 이 값으로 `GodotSharp.dll` 참조를 찾는다.
-- `SpireMind.Local.props`는 개인 PC 경로를 담기 때문에 Git에 커밋하지 않는다.
+- 루트 README는 프로젝트의 현재 기준 문서입니다.
+- 이 폴더의 문서는 세부 설계와 실행 절차를 담당합니다.
+- 오래된 문서에 남은 인코딩 깨짐은 순차적으로 정리합니다.
+- 실행 결과와 전략 해석은 분리해서 기록합니다.

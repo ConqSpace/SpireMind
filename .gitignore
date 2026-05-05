@@ -2,6 +2,8 @@
 bin/
 obj/
 artifacts/
+benchmarks/**/runs/
+logs/
 
 # 로컬 사용자 설정
 *.Local.props

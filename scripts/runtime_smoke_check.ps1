@@ -21,6 +21,9 @@ one card, and ends the turn. It never clicks, moves the mouse, or sends keys.
 
 .EXAMPLE
 .\scripts\runtime_smoke_check.ps1 -Build -Deploy -StartBridge -LaunchGame -StartSeededRun -Seed "7MJCUHEB5Q" -ModsDir "I:\SteamLibrary\steamapps\common\Slay the Spire 2\mods"
+
+.EXAMPLE
+.\scripts\runtime_smoke_check.ps1 -StartBridge -StartSeededRun -ForceAbandonRun -Seed "7MJCUHEB5Q"
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
@@ -39,6 +42,7 @@ param(
     [string]$BridgeHost = "127.0.0.1",
     [int]$BridgePort = 17832,
     [switch]$StartSeededRun,
+    [switch]$ForceAbandonRun,
     [string]$Seed = "7MJCUHEB5Q",
     [string]$CharacterId = "Ironclad",
     [int]$LaunchWaitSeconds = 25,
@@ -63,6 +67,8 @@ function Show-SmokeHelp {
     Write-Host "  -StartBridge Start the local SpireMind bridge if it is not already healthy"
     Write-Host "  -StartSeededRun"
     Write-Host "               Write a start_new_run command for a custom seeded run"
+    Write-Host "  -ForceAbandonRun"
+    Write-Host "               Let start_new_run abandon the in-progress run before starting the seed"
     Write-Host "  -Seed        Seed used by -StartSeededRun. Default: 7MJCUHEB5Q"
     Write-Host "  -CharacterId Character used by -StartSeededRun. Default: Ironclad"
     Write-Host "  -WhatIf      Show build/deploy/launch actions without running them"
@@ -71,6 +77,7 @@ function Show-SmokeHelp {
     Write-Host '  .\scripts\runtime_smoke_check.ps1 -Build -Deploy -LaunchGame -ModsDir "I:\SteamLibrary\steamapps\common\Slay the Spire 2\mods"'
     Write-Host '  .\scripts\runtime_smoke_check.ps1 -LaunchGame -LaunchMode Exe -Sts2ExePath "I:\SteamLibrary\steamapps\common\Slay the Spire 2\SlayTheSpire2.exe"'
     Write-Host '  .\scripts\runtime_smoke_check.ps1 -Build -Deploy -StartBridge -LaunchGame -StartSeededRun -Seed "7MJCUHEB5Q" -ModsDir "I:\SteamLibrary\steamapps\common\Slay the Spire 2\mods"'
+    Write-Host '  .\scripts\runtime_smoke_check.ps1 -StartBridge -StartSeededRun -ForceAbandonRun -Seed "7MJCUHEB5Q"'
     Write-Host '  .\scripts\runtime_smoke_check.ps1 -CheckSeconds 90 -PollSeconds 5'
 }
 
@@ -150,6 +157,16 @@ function Get-SpireMindDataDir {
     return (Join-Path $env:APPDATA "SlayTheSpire2\SpireMind")
 }
 
+function Clear-AutotestCommandFiles {
+    $dataDir = Get-SpireMindDataDir
+    $commandPath = Join-Path $dataDir "autotest_command.json"
+    $resultPath = Join-Path $dataDir "autotest_result.json"
+
+    Remove-Item -LiteralPath $commandPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
+    Write-Host "[SpireMind] Cleared stale autotest command files."
+}
+
 function Invoke-BridgeHealth {
     param([string]$BridgeUrl)
 
@@ -215,7 +232,8 @@ function Write-StartSeededRunCommand {
     param(
         [string]$SeedValue,
         [string]$Character,
-        [int]$TimeoutSeconds
+        [int]$TimeoutSeconds,
+        [bool]$AbandonCurrentRun
     )
 
     $dataDir = Get-SpireMindDataDir
@@ -232,6 +250,7 @@ function Write-StartSeededRunCommand {
             character_id = $Character
             timeout_ms = [Math]::Max(1, $TimeoutSeconds) * 1000
             ready_timeout_ms = [Math]::Max(1, $TimeoutSeconds) * 1000
+            force_abandon = $AbandonCurrentRun
         }
     }
 
@@ -499,6 +518,10 @@ if ($StartBridge) {
     Start-SpireMindBridge -RepoRoot $repoRoot -HostName $BridgeHost -Port $BridgePort
 }
 
+if ($StartSeededRun) {
+    Clear-AutotestCommandFiles
+}
+
 if ($LaunchGame) {
     if ($LaunchMode -eq "Steam") {
         if ($PSCmdlet.ShouldProcess($steamLaunchUri, "Launch STS2 through Steam URL")) {
@@ -525,7 +548,11 @@ if ($StartSeededRun) {
         Start-Sleep -Seconds $LaunchWaitSeconds
     }
 
-    $commandInfo = Write-StartSeededRunCommand -SeedValue $Seed -Character $CharacterId -TimeoutSeconds $CommandWaitSeconds
+    $commandInfo = Write-StartSeededRunCommand `
+        -SeedValue $Seed `
+        -Character $CharacterId `
+        -TimeoutSeconds $CommandWaitSeconds `
+        -AbandonCurrentRun $ForceAbandonRun.IsPresent
     $commandResult = Wait-AutotestCommandResult `
         -CommandId $commandInfo.Id `
         -ResultPath $commandInfo.ResultPath `

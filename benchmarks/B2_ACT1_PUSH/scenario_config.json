@@ -1,0 +1,17 @@
+{
+  "benchmark_id": "B2_ACT1_PUSH",
+  "description": "고정 시드에서 가능한 한 멀리 진행하는 1막 장기 테스트입니다.",
+  "character": "Ironclad",
+  "ascension": 0,
+  "seed_id": "seed_0001",
+  "stop_rule": "terminal_or_max_decisions",
+  "max_decisions": 220,
+  "timeout_ms": 300000,
+  "result_timeout_ms": 60000,
+  "poll_ms": 500,
+  "max_runtime_ms": 3600000,
+  "shutdown_grace_ms": 2500,
+  "auto_trivial": false,
+  "dismiss_terminal": false,
+  "human_intervention": "setup_only"
+}

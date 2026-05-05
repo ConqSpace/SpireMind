@@ -1,0 +1,9 @@
+{
+  "seeds": [
+    {
+      "seed_id": "seed_0001",
+      "seed": "TO_BE_FILLED_AFTER_GAME_SUPPORT",
+      "notes": "첫 B0 고정 시드. 시드 자동 주입이 안정화되기 전까지는 사람이 같은 시드 런을 준비한다."
+    }
+  ]
+}
