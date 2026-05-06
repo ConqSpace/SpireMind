@@ -112,6 +112,9 @@ function inferAssemblyPath(installPath) {
   }
 
   return firstExistingPath([
+    path.join(trimmed, "data_sts2_windows_x86_64", "sts2.dll"),
+    path.join(trimmed, "data_sts2_windows", "sts2.dll"),
+    path.join(trimmed, "data", "sts2.dll"),
     path.join(trimmed, "SlayTheSpire2_Data", "Managed", "sts2.dll"),
     path.join(trimmed, "Slay the Spire 2_Data", "Managed", "sts2.dll"),
     path.join(trimmed, "sts2.dll")
@@ -376,7 +379,7 @@ function runSelfTest() {
     installPath: "D:\\SteamLibrary\\steamapps\\common\\Slay the Spire 2",
     exePath: "D:\\SteamLibrary\\steamapps\\common\\Slay the Spire 2\\SlayTheSpire2.exe",
     modsDir: "D:\\SteamLibrary\\steamapps\\common\\Slay the Spire 2\\mods",
-    assemblyPath: "D:\\SteamLibrary\\steamapps\\common\\Slay the Spire 2\\SlayTheSpire2_Data\\Managed\\sts2.dll",
+    assemblyPath: "D:\\SteamLibrary\\steamapps\\common\\Slay the Spire 2\\data_sts2_windows_x86_64\\sts2.dll",
     gameDataPath: "D:\\SteamLibrary\\steamapps\\common\\Slay the Spire 2\\data_sts2_windows_x86_64",
     launchMode: "Steam",
     pckPath: "",
