@@ -508,6 +508,58 @@ function Write-SmokeSummary {
     return $overallStatus
 }
 
+function Write-SmokeTroubleshooting {
+    param(
+        [object[]]$Results,
+        [string]$CombatStatePath,
+        [string]$GodotLogPath,
+        [string]$BridgeUrl,
+        [switch]$StartedSeededRun
+    )
+
+    $failedNames = @($Results | Where-Object { $_.Status -eq "FAIL" } | ForEach-Object { $_.Name })
+    $warnNames = @($Results | Where-Object { $_.Status -eq "WARN" } | ForEach-Object { $_.Name })
+
+    Write-Host ""
+    Write-Host "==== 막혔을 때 확인할 순서 ===="
+
+    if ($failedNames -contains "combat_state.json exists") {
+        Write-Host "1. combat_state.json이 없습니다."
+        Write-Host "   가능한 원인:"
+        Write-Host "   - 게임이 아직 실행되지 않았습니다."
+        Write-Host "   - SpireMind 모드가 로드되지 않았습니다."
+        Write-Host "   - 아직 지도, 이벤트, 보상, 전투 같은 상태 화면에 들어가지 않았습니다."
+        Write-Host "   - APPDATA 위치가 예상과 다릅니다."
+        Write-Host "   확인 경로: $CombatStatePath"
+    }
+
+    if ($warnNames -contains "godot.log SpireMind R2 log") {
+        Write-Host "2. godot.log에서 SpireMind 관측 로그가 약합니다."
+        Write-Host "   가능한 원인:"
+        Write-Host "   - 모드 DLL이 mods 폴더에 복사되지 않았습니다."
+        Write-Host "   - 게임을 배포 후 다시 실행하지 않았습니다."
+        Write-Host "   - 모드 로더가 SpireMind를 읽지 못했습니다."
+        Write-Host "   확인 경로: $GodotLogPath"
+    }
+
+    if ($failedNames -contains "legal_actions count") {
+        Write-Host "3. legal_actions가 비어 있습니다."
+        Write-Host "   가능한 원인:"
+        Write-Host "   - 현재 화면을 아직 행동 가능한 상태로 해석하지 못했습니다."
+        Write-Host "   - 어댑터가 해당 화면의 행동 후보를 아직 만들지 못했습니다."
+        Write-Host "   - 오래된 상태 파일을 보고 있습니다."
+    }
+
+    if ($StartedSeededRun) {
+        Write-Host "4. 고정 시드 시작 명령이 성공했다면 게임 화면에서 다음 흐름을 봐야 합니다."
+        Write-Host "   - 진행 중인 런을 포기합니다."
+        Write-Host "   - 커스텀 시드 입력 흐름으로 이동합니다."
+        Write-Host "   - 선택한 캐릭터로 새 런을 시작합니다."
+    }
+
+    Write-Host "5. 브리지는 다음 주소에서 확인합니다: $BridgeUrl/health"
+}
+
 if ($Help) {
     Show-SmokeHelp
     return
@@ -708,6 +760,12 @@ while ((Get-Date) -lt $deadline) {
 $overallStatus = Write-SmokeSummary -Results $lastResults
 
 if ($overallStatus -eq "FAIL") {
+    Write-SmokeTroubleshooting `
+        -Results $lastResults `
+        -CombatStatePath $combatStatePath `
+        -GodotLogPath $godotLogPath `
+        -BridgeUrl $bridgeUrl `
+        -StartedSeededRun:$StartSeededRun
     exit 1
 }
 

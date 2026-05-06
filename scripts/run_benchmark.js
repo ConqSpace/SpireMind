@@ -24,6 +24,7 @@ function parseArgs(argv) {
     maxRuntimeMs: null,
     handoffFile: "",
     allowStartInCombat: false,
+    preflight: false,
     dryRun: false,
     noDaemon: false,
     selfTest: false,
@@ -44,6 +45,11 @@ function parseArgs(argv) {
 
     if (token === "--dry-run") {
       options.dryRun = true;
+      continue;
+    }
+
+    if (token === "--preflight") {
+      options.preflight = true;
       continue;
     }
 
@@ -310,6 +316,102 @@ function loadBenchmarkConfig(options) {
     seed,
     decider
   };
+}
+
+function makePreflightCheck(name, status, detail, hint = "") {
+  return { name, status, detail, hint };
+}
+
+async function runPreflight(options) {
+  const checks = [];
+  let config = null;
+
+  try {
+    config = loadBenchmarkConfig(options);
+    checks.push(makePreflightCheck("벤치마크 설정", "PASS", config.benchmarkDir));
+    checks.push(makePreflightCheck("시드", "PASS", `${options.seedId} = ${config.seed.seed}`));
+    checks.push(makePreflightCheck("결정기", "PASS", `${options.deciderId} (${config.decider.decision_backend || config.decider.provider || "command"})`));
+  } catch (error) {
+    checks.push(makePreflightCheck(
+      "벤치마크 설정",
+      "FAIL",
+      error instanceof Error ? error.message : String(error),
+      "benchmark-dir, decider, seed 값을 확인하세요."));
+    return checks;
+  }
+
+  options.handoffFile = resolveHandoffFile(config, options);
+  if (options.handoffFile) {
+    checks.push(makePreflightCheck("handoff 연결", "PASS", options.handoffFile));
+  } else if (options.repeatIndex > 1 && isPlainObject(config.scenario.handoff) && config.scenario.handoff.enabled === true) {
+    checks.push(makePreflightCheck(
+      "handoff 연결",
+      "WARN",
+      "이전 런의 handoff.json을 찾지 못했습니다.",
+      "repeat-index 1을 먼저 실행했는지 확인하세요."));
+  } else {
+    checks.push(makePreflightCheck("handoff 연결", "PASS", "이번 실행에는 handoff 입력이 필요하지 않습니다."));
+  }
+
+  try {
+    const health = await getBridgeJson(options.bridgeUrl, "/health", 2000);
+    checks.push(makePreflightCheck("브리지 health", "PASS", `${options.bridgeUrl}/health ok=${health.ok}`));
+  } catch (error) {
+    checks.push(makePreflightCheck(
+      "브리지 health",
+      "FAIL",
+      error instanceof Error ? error.message : String(error),
+      ".\\scripts\\runtime_smoke_check.ps1 -StartBridge로 브리지를 먼저 켜세요."));
+  }
+
+  try {
+    const envelope = await getBridgeJson(options.bridgeUrl, "/state/current", 2000);
+    const snapshot = isPlainObject(envelope.state) ? envelope : isPlainObject(envelope.current_state) ? envelope.current_state : envelope;
+    const phase = normalizePhase(snapshot) || "unknown";
+    const stateId = getStateId(snapshot) || "unknown";
+    const legalActionCount = getLegalActions(snapshot).length;
+    const status = legalActionCount > 0 ? "PASS" : "WARN";
+    const hint = legalActionCount > 0 ? "" : "게임이 지도, 이벤트, 보상, 전투처럼 행동 가능한 화면에 있는지 확인하세요.";
+    checks.push(makePreflightCheck("현재 게임 상태", status, `phase=${phase}, state_id=${stateId}, legal_actions=${legalActionCount}`, hint));
+  } catch (error) {
+    checks.push(makePreflightCheck(
+      "현재 게임 상태",
+      "FAIL",
+      error instanceof Error ? error.message : String(error),
+      "게임을 실행하고 SpireMind 모드가 상태를 export하는지 runtime_smoke_check로 확인하세요."));
+  }
+
+  const deciderBackend = config.decider.decision_backend || config.decider.provider || "command";
+  if (deciderBackend === "local-http" || deciderBackend === "local_http") {
+    if (config.decider.endpoint) {
+      checks.push(makePreflightCheck("local-http endpoint", "PASS", config.decider.endpoint));
+    } else {
+      checks.push(makePreflightCheck("local-http endpoint", "FAIL", "endpoint가 비어 있습니다.", "decider JSON에 OpenAI 호환 chat/completions 주소를 넣으세요."));
+    }
+  }
+
+  return checks;
+}
+
+function printPreflightChecks(checks) {
+  let failCount = 0;
+  let warnCount = 0;
+  for (const check of checks) {
+    if (check.status === "FAIL") {
+      failCount += 1;
+    } else if (check.status === "WARN") {
+      warnCount += 1;
+    }
+
+    process.stdout.write(`[${check.status}] ${check.name}: ${check.detail}\n`);
+    if (check.hint) {
+      process.stdout.write(`  다음 행동: ${check.hint}\n`);
+    }
+  }
+
+  const overall = failCount > 0 ? "FAIL" : warnCount > 0 ? "WARN" : "PASS";
+  process.stdout.write(`\npreflight 결과: ${overall}\n`);
+  return overall;
 }
 
 function makeRunDirectory(config, options) {
@@ -1481,11 +1583,19 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
     showHelp();
+    process.stdout.write("  --preflight             설정, 브리지, 현재 게임 상태를 점검하고 실행하지 않음\n");
     return;
   }
 
   if (options.selfTest) {
     runSelfTest();
+    return;
+  }
+
+  if (options.preflight) {
+    const checks = await runPreflight(options);
+    const overall = printPreflightChecks(checks);
+    process.exitCode = overall === "FAIL" ? 1 : 0;
     return;
   }
 

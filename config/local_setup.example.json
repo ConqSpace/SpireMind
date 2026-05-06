@@ -5,7 +5,9 @@
     "exe_path": "D:\\SteamLibrary\\steamapps\\common\\Slay the Spire 2\\SlayTheSpire2.exe",
     "mods_dir": "D:\\SteamLibrary\\steamapps\\common\\Slay the Spire 2\\mods",
     "launch_mode": "Steam",
-    "pck_path": ""
+    "pck_path": "",
+    "assembly_path": "D:\\SteamLibrary\\steamapps\\common\\Slay the Spire 2\\SlayTheSpire2_Data\\Managed\\sts2.dll",
+    "game_data_path": "D:\\SteamLibrary\\steamapps\\common\\Slay the Spire 2\\data_sts2_windows_x86_64"
   },
   "bridge": {
     "host": "127.0.0.1",

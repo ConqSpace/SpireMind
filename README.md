@@ -16,6 +16,14 @@ node .\scripts\spiremind_setup.js
 
 이 명령은 `config/local_setup.local.json`을 만듭니다. 이 파일에는 STS2 설치 폴더, 실행 파일, `mods` 폴더, 브리지 포트, 기본 시드가 들어갑니다. 개인 PC 경로이므로 Git에 올리지 않습니다.
 
+세팅이 끝나면 다음 명령으로 빌드와 실행에 필요한 경로를 먼저 확인합니다.
+
+```powershell
+node .\scripts\spiremind_setup.js --check
+```
+
+모든 항목이 `PASS`이면 빌드로 넘어갑니다. `FAIL`이 있으면 출력된 “다음 행동”을 먼저 처리합니다.
+
 예시 형식은 [config/local_setup.example.json](./config/local_setup.example.json)에서 볼 수 있습니다.
 
 ### 2. 빌드
@@ -57,6 +65,8 @@ dotnet build .\src\SpireMindMod\SpireMindMod.csproj
   -CommandWaitSeconds 300
 ```
 
+성공하면 게임 화면에서 진행 중인 런 포기, 커스텀 시드 입력, 캐릭터 선택, 새 런 시작 흐름을 볼 수 있습니다. `combat_state.json`이 없거나 `legal_actions`가 비어 있으면 `runtime_smoke_check.ps1`이 가능한 원인과 다음 확인 위치를 함께 출력합니다.
+
 ## 현재 초점
 
 지금 단계의 핵심 질문은 네 가지입니다.
@@ -92,6 +102,18 @@ STS2 + SpireMind 모드
 LLM은 게임 객체를 직접 조작하지 않습니다. 항상 `legal_actions`에 포함된 `action_id`만 선택합니다. 실행 가능 여부, 대상 유효성, 에너지 부족, 오래된 상태 판단은 모드와 실행기가 검증합니다.
 
 ## 벤치마크 실행
+
+벤치마크를 실제로 실행하기 전에 현재 상태를 먼저 점검합니다.
+
+```powershell
+node .\scripts\run_benchmark.js `
+  --benchmark-dir .\benchmarks\B0_NEOW_FIRST_COMBAT `
+  --decider llm_current `
+  --seed seed_0001 `
+  --preflight
+```
+
+`preflight 결과`가 `PASS`이면 같은 설정에서 `--preflight`만 빼고 실행합니다. 실패하면 브리지, 현재 게임 화면, decider 설정, handoff 연결 여부를 먼저 고칩니다.
 
 ### B0: 첫 전투 안정성
 
