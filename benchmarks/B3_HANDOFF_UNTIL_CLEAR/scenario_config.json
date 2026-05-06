@@ -1,0 +1,23 @@
+{
+  "benchmark_id": "B3_HANDOFF_UNTIL_CLEAR",
+  "description": "같은 시드에서 handoff를 이어 붙여 클리어하거나 중단 한도에 도달할 때까지 반복하는 장기 테스트입니다.",
+  "character": "Ironclad",
+  "ascension": 0,
+  "seed_id": "seed_0001",
+  "stop_rule": "terminal_or_max_decisions",
+  "max_decisions": 220,
+  "timeout_ms": 300000,
+  "result_timeout_ms": 60000,
+  "poll_ms": 500,
+  "max_runtime_ms": 3600000,
+  "shutdown_grace_ms": 2500,
+  "auto_trivial": false,
+  "dismiss_terminal": false,
+  "human_intervention": "setup_only",
+  "handoff": {
+    "enabled": true,
+    "schema": "handoff.v1",
+    "source": "previous_run",
+    "repeat_policy": "until_run_finished"
+  }
+}

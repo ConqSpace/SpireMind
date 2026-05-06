@@ -1,6 +1,6 @@
 {
-  "benchmark_id": "B2_ACT1_PUSH",
-  "description": "고정 시드에서 가능한 한 멀리 진행하는 1막 장기 테스트입니다.",
+  "benchmark_id": "B1_FULL_RUN",
+  "description": "고정 시드에서 한 런을 가능한 한 멀리 진행하는 단일 런 테스트입니다. 1막으로 제한하지 않습니다.",
   "character": "Ironclad",
   "ascension": 0,
   "seed_id": "seed_0001",

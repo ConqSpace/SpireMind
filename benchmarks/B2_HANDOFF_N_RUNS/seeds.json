@@ -1,0 +1,9 @@
+{
+  "seeds": [
+    {
+      "seed_id": "seed_0001",
+      "seed": "7MJCUHEB5Q",
+      "notes": "B1과 같은 고정 시드입니다. 정해진 반복 횟수 안에서 handoff 반영 여부를 비교합니다."
+    }
+  ]
+}

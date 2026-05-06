@@ -1,6 +1,6 @@
 {
-  "benchmark_id": "B3_HANDOFF_CHAIN",
-  "description": "같은 시드에서 handoff.v1을 다음 런 입력으로 넘겨 실패가 전략 규칙으로 바뀌는지 확인합니다.",
+  "benchmark_id": "B2_HANDOFF_N_RUNS",
+  "description": "같은 시드에서 handoff.v1을 다음 런 입력으로 넘기며 정해진 횟수만큼 반복하는 테스트입니다.",
   "character": "Ironclad",
   "ascension": 0,
   "seed_id": "seed_0001",
@@ -17,6 +17,7 @@
   "handoff": {
     "enabled": true,
     "schema": "handoff.v1",
-    "source": "previous_run"
+    "source": "previous_run",
+    "repeat_policy": "fixed_n_runs"
   }
 }

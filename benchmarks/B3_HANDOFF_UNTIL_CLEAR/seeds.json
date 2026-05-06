@@ -1,0 +1,9 @@
+{
+  "seeds": [
+    {
+      "seed_id": "seed_0001",
+      "seed": "7MJCUHEB5Q",
+      "notes": "B1과 같은 고정 시드입니다. 클리어 또는 중단 한도까지 handoff를 계속 누적해 비교합니다."
+    }
+  ]
+}

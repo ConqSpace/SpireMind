@@ -132,11 +132,11 @@ node .\scripts\run_benchmark.js --benchmark-dir .\benchmarks\B0_NEOW_FIRST_COMBA
 node .\scripts\run_benchmark.js --self-test
 ```
 
-`B3_HANDOFF_CHAIN`은 `repeat-index`가 2 이상일 때 직전 실행의 `handoff.json`을 자동으로 다음 판단 요청에 붙인다.
+`B2_HANDOFF_N_RUNS`와 `B3_HANDOFF_UNTIL_CLEAR`는 `repeat-index`가 2 이상일 때 직전 실행의 `handoff.json`을 자동으로 다음 판단 요청에 붙인다.
 
 ```powershell
-node .\scripts\run_benchmark.js --benchmark-dir .\benchmarks\B3_HANDOFF_CHAIN --decider llm_current --repeat-index 1
-node .\scripts\run_benchmark.js --benchmark-dir .\benchmarks\B3_HANDOFF_CHAIN --decider llm_current --repeat-index 2
+node .\scripts\run_benchmark.js --benchmark-dir .\benchmarks\B2_HANDOFF_N_RUNS --decider llm_current --repeat-index 1
+node .\scripts\run_benchmark.js --benchmark-dir .\benchmarks\B2_HANDOFF_N_RUNS --decider llm_current --repeat-index 2
 ```
 
 다른 LLM API는 `scripts/deciders` 아래 backend로 추가한다. 현재는 외부 명령형 `command`, Codex `app-server`, OpenAI 호환 `local-http` backend가 있다.

@@ -356,13 +356,13 @@ benchmarks/
 
 ## 7. 장기 테스트 확장 설계
 
-B1 이후는 같은 실행 관리자를 재사용하고 `stop_rule`만 바꾼다.
+B1 이후는 같은 실행 관리자를 재사용하되, 반복 정책과 handoff 연결 여부를 다르게 둔다.
 
 ```text
-B1 stop_rule: act1_midpoint_or_max_decisions
-B2 stop_rule: act1_boss_finished_or_death
-B3 stop_rule: act1_boss_finished_or_death, seeds 여러 개
-B4 stop_rule: run_finished_or_death
+B1_FULL_RUN stop_rule: terminal_or_max_decisions
+B2_HANDOFF_N_RUNS stop_rule: terminal_or_max_decisions, handoff.repeat_policy=fixed_n_runs
+B3_HANDOFF_UNTIL_CLEAR stop_rule: terminal_or_max_decisions, handoff.repeat_policy=until_run_finished
+B4_ELITE_VALUE stop_rule: 지정 범위 또는 terminal_or_max_decisions
 ```
 
 장기 테스트에서 추가해야 하는 필드:
@@ -458,7 +458,8 @@ class Decider {
   "handoff": {
     "enabled": true,
     "schema": "handoff.v1",
-    "source": "previous_run"
+    "source": "previous_run",
+    "repeat_policy": "fixed_n_runs"
   }
 }
 ```
