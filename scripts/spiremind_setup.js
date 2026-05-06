@@ -61,7 +61,7 @@ function showHelp() {
 }
 
 function normalizePathText(value) {
-  return String(value || "").trim().replace(/^"(.*)"$/, "$1");
+  return String(value || "").replace(/^\uFEFF/, "").trim().replace(/^"(.*)"$/, "$1");
 }
 
 function readJsonFile(filePath) {
@@ -252,14 +252,54 @@ function printChecks(checks) {
 
 async function askText(rl, label, defaultValue) {
   const suffix = defaultValue ? ` [${defaultValue}]` : "";
-  const answer = normalizePathText(await rl.question(`${label}${suffix}: `));
-  return answer || defaultValue || "";
+  let answer = "";
+  try {
+    answer = await rl.question(`${label}${suffix}: `);
+  } catch (error) {
+    if (error && error.code === "ERR_USE_AFTER_CLOSE") {
+      throw new Error(`${label} 입력을 받기 전에 입력 스트림이 닫혔습니다. 대화형으로 다시 실행하세요.`);
+    }
+    throw error;
+  }
+  return normalizePathText(answer) || defaultValue || "";
+}
+
+function createPipedAnswerReader() {
+  if (input.isTTY) {
+    return null;
+  }
+
+  const rawInput = fs.readFileSync(0, "utf8").replace(/^\uFEFF/, "");
+  const answers = rawInput.split(/\r?\n/);
+  let index = 0;
+  return async function askPipedText(label, defaultValue) {
+    const suffix = defaultValue ? ` [${defaultValue}]` : "";
+    process.stdout.write(`${label}${suffix}: `);
+    const answer = index < answers.length ? answers[index] : "";
+    index += 1;
+    process.stdout.write(`${answer}\n`);
+    return normalizePathText(answer) || defaultValue || "";
+  };
 }
 
 async function askLaunchMode(rl, defaultValue) {
   const normalizedDefault = defaultValue === "Exe" ? "Exe" : "Steam";
   while (true) {
     const answer = (await askText(rl, "실행 방식 Steam/Exe", normalizedDefault)).trim().toLowerCase();
+    if (answer === "steam") {
+      return "Steam";
+    }
+    if (answer === "exe") {
+      return "Exe";
+    }
+    process.stdout.write("Steam 또는 Exe 중 하나를 입력하세요.\n");
+  }
+}
+
+async function askLaunchModeWith(ask, defaultValue) {
+  const normalizedDefault = defaultValue === "Exe" ? "Exe" : "Steam";
+  while (true) {
+    const answer = (await ask("실행 방식 Steam/Exe", normalizedDefault)).trim().toLowerCase();
     if (answer === "steam") {
       return "Steam";
     }
@@ -279,19 +319,21 @@ async function runSetup(options) {
   process.stdout.write("SpireMind 초기 세팅을 시작합니다.\n");
   process.stdout.write("게임 실행, 모드 배포, C# 빌드에 필요한 로컬 경로를 저장합니다.\n\n");
 
-  const rl = readline.createInterface({ input, output });
+  const pipedAsk = createPipedAnswerReader();
+  const rl = pipedAsk ? null : readline.createInterface({ input, output });
+  const ask = pipedAsk || ((label, defaultValue) => askText(rl, label, defaultValue));
   try {
-    const installPath = await askText(rl, "STS2 설치 폴더", existingSts2.install_path || "");
-    const exePath = await askText(rl, "STS2 실행 파일", existingSts2.exe_path || inferExePath(installPath));
-    const modsDir = await askText(rl, "STS2 mods 폴더", existingSts2.mods_dir || inferModsDir(installPath));
-    const assemblyPath = await askText(rl, "STS2 assembly sts2.dll", existingSts2.assembly_path || inferAssemblyPath(installPath));
-    const gameDataPath = await askText(rl, "STS2 game data 폴더", existingSts2.game_data_path || inferGameDataPath(installPath));
-    const launchMode = await askLaunchMode(rl, existingSts2.launch_mode || "Steam");
-    const pckPath = await askText(rl, "선택 사항: SpireMind.pck 경로", existingSts2.pck_path || "");
-    const bridgeHost = await askText(rl, "브리지 host", existingBridge.host || "127.0.0.1");
-    const bridgePortText = await askText(rl, "브리지 port", String(existingBridge.port || 17832));
-    const seed = await askText(rl, "기본 시드", existingDefaults.seed || "7MJCUHEB5Q");
-    const characterId = await askText(rl, "기본 캐릭터", existingDefaults.character_id || "Ironclad");
+    const installPath = await ask("STS2 설치 폴더", existingSts2.install_path || "");
+    const exePath = await ask("STS2 실행 파일", existingSts2.exe_path || inferExePath(installPath));
+    const modsDir = await ask("STS2 mods 폴더", existingSts2.mods_dir || inferModsDir(installPath));
+    const assemblyPath = await ask("STS2 assembly sts2.dll", existingSts2.assembly_path || inferAssemblyPath(installPath));
+    const gameDataPath = await ask("STS2 game data 폴더", existingSts2.game_data_path || inferGameDataPath(installPath));
+    const launchMode = await askLaunchModeWith(ask, existingSts2.launch_mode || "Steam");
+    const pckPath = await ask("선택 사항: SpireMind.pck 경로", existingSts2.pck_path || "");
+    const bridgeHost = await ask("브리지 host", existingBridge.host || "127.0.0.1");
+    const bridgePortText = await ask("브리지 port", String(existingBridge.port || 17832));
+    const seed = await ask("기본 시드", existingDefaults.seed || "7MJCUHEB5Q");
+    const characterId = await ask("기본 캐릭터", existingDefaults.character_id || "Ironclad");
 
     const bridgePort = Number.parseInt(bridgePortText, 10);
     if (!Number.isFinite(bridgePort) || bridgePort <= 0) {
@@ -323,7 +365,9 @@ async function runSetup(options) {
       process.stdout.write("\n위 경고와 실패 항목을 먼저 확인한 뒤 빌드하세요.\n");
     }
   } finally {
-    rl.close();
+    if (rl) {
+      rl.close();
+    }
   }
 }
 

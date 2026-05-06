@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Runs a semi-manual R2 runtime smoke check for SpireMind.
 
@@ -44,6 +44,7 @@ param(
     [int]$BridgePort = 17832,
     [switch]$StartSeededRun,
     [switch]$ForceAbandonRun,
+    [switch]$AllowNonCombatState,
     [string]$Seed = "7MJCUHEB5Q",
     [string]$CharacterId = "Ironclad",
     [int]$LaunchWaitSeconds = 25,
@@ -72,6 +73,8 @@ function Show-SmokeHelp {
     Write-Host "               Write a start_new_run command for a custom seeded run"
     Write-Host "  -ForceAbandonRun"
     Write-Host "               Let start_new_run abandon the in-progress run before starting the seed"
+    Write-Host "  -AllowNonCombatState"
+    Write-Host "               Treat map, reward, event, and other non-combat states as valid smoke states"
     Write-Host "  -Seed        Seed used by -StartSeededRun. Default: 7MJCUHEB5Q"
     Write-Host "  -CharacterId Character used by -StartSeededRun. Default: Ironclad"
     Write-Host "  -WhatIf      Show build/deploy/launch actions without running them"
@@ -746,7 +749,7 @@ while ((Get-Date) -lt $deadline) {
         -CombatStatePath $combatStatePath `
         -GodotLogPath $godotLogPath `
         -FreshSeconds $RecentSeconds `
-        -AllowNonCombatState:$StartSeededRun)
+        -AllowNonCombatState:($StartSeededRun -or $AllowNonCombatState))
     $failCount = @($lastResults | Where-Object { $_.Status -eq "FAIL" }).Count
     $warnCount = @($lastResults | Where-Object { $_.Status -eq "WARN" }).Count
     $passCount = @($lastResults | Where-Object { $_.Status -eq "PASS" }).Count
@@ -770,3 +773,4 @@ if ($overallStatus -eq "FAIL") {
 }
 
 exit 0
+

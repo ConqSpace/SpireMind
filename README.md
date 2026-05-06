@@ -14,6 +14,8 @@ SpireMind는 Slay the Spire 2를 LLM 에이전트가 플레이하고, 그 판단
 node .\scripts\spiremind_setup.js
 ```
 
+`spiremind_setup.js`는 대화형 CLI입니다. PC마다 달라지는 게임 설치 위치와 모드 폴더를 사용자가 직접 확인하도록 질문에 답하는 방식으로 진행합니다.
+
 이 명령은 `config/local_setup.local.json`을 만듭니다. 이 파일에는 STS2 설치 폴더, 실행 파일, `mods` 폴더, 브리지 포트, 기본 시드가 들어갑니다. 개인 PC 경로이므로 Git에 올리지 않습니다.
 
 세팅이 끝나면 다음 명령으로 빌드와 실행에 필요한 경로를 먼저 확인합니다.
@@ -51,7 +53,7 @@ dotnet build .\src\SpireMindMod\SpireMindMod.csproj
 게임과 브리지를 띄운 뒤 상태 export와 브리지 연결을 확인합니다.
 
 ```powershell
-.\scripts\runtime_smoke_check.ps1 -StartBridge -CheckSeconds 30 -PollSeconds 1
+.\scripts\runtime_smoke_check.ps1 -StartBridge -AllowNonCombatState -CheckSeconds 30 -PollSeconds 1
 ```
 
 고정 시드로 새 런을 시작하고, 진행 중인 런이 있으면 포기한 뒤 다시 시작하려면 다음 명령을 사용합니다.
