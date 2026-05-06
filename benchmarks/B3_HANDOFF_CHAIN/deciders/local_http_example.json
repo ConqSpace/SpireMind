@@ -1,0 +1,9 @@
+{
+  "decider_id": "local_http_example",
+  "decision_backend": "local-http",
+  "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
+  "model": "qwen3",
+  "api_key_env": "",
+  "prompt_version": "current",
+  "notes": "OpenAI 호환 chat/completions 엔드포인트를 쓰는 로컬 모델 예시입니다."
+}

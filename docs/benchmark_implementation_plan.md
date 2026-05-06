@@ -424,3 +424,65 @@ B4 stop_rule: run_finished_or_death
 - 데몬 self-test와 기존 모드 빌드가 통과한다.
 
 이 기준을 만족하면 다음 단계에서 실제 게임을 켜고 B0 1회 실행을 검증한다.
+# 현재 구현 메모
+
+이 문서는 과거 구현 계획을 포함한다. 현재 기준에서 추가로 잠긴 구현은 아래와 같다.
+
+## Decider 분리
+
+`scripts/spiremind_agent_daemon.js`는 더 이상 특정 LLM provider를 직접 다루지 않는다. 판단기는 `scripts/deciders` 아래 모듈로 분리한다.
+
+현재 backend:
+
+- `command`: 외부 프로세스에 `DecisionRequest` JSON을 전달하고 JSON 응답을 받는다.
+- `app-server`: Codex app-server 스레드로 판단을 요청한다.
+- `local-http`: OpenAI 호환 `chat/completions` 엔드포인트로 판단을 요청한다.
+
+새 provider를 추가할 때는 다음 인터페이스를 맞춘다.
+
+```js
+class Decider {
+  async start() {}
+  async decide(snapshot) {}
+  async report(request) {}
+  stop() {}
+}
+```
+
+## Handoff 연결
+
+`run_benchmark.js`는 런 종료 후 `handoff.json`을 생성한다. `scenario_config.json`에 아래 설정이 있으면 `repeat-index`가 2 이상일 때 직전 런의 `handoff.json`을 다음 런 판단 요청에 자동으로 전달한다.
+
+```json
+{
+  "handoff": {
+    "enabled": true,
+    "schema": "handoff.v1",
+    "source": "previous_run"
+  }
+}
+```
+
+전달 경로:
+
+```text
+run_benchmark.js
+-> spiremind_agent_daemon.js --handoff-file <path>
+-> deciders/request_builder.js
+-> DecisionRequest.handoff
+```
+
+## 전략 지표
+
+`computed_metrics.progress`에 아래 지표를 추가한다.
+
+- `furthest_map_row`
+- `map_choice_count`
+- `elite_action_count`
+- `rest_choice_count`
+- `smith_choice_count`
+- `shop_purchase_count`
+- `card_reward_pick_count`
+- `potion_use_count`
+
+현재 `elite_action_count`는 `action_id`에 `elite`가 포함된 경우만 세는 보수적 지표다. 지도 노드 타입 export가 안정화되면 별도 지표로 확장한다.

@@ -22,6 +22,7 @@ function parseArgs(argv) {
     bridgeUrl: process.env.SPIREMIND_BRIDGE_URL || DEFAULT_BRIDGE_URL,
     outputRoot: "",
     maxRuntimeMs: null,
+    handoffFile: "",
     allowStartInCombat: false,
     dryRun: false,
     noDaemon: false,
@@ -130,6 +131,17 @@ function parseArgs(argv) {
 
     if (token.startsWith("--max-runtime-ms=")) {
       options.maxRuntimeMs = readPositiveInteger(token.slice("--max-runtime-ms=".length), null);
+      continue;
+    }
+
+    if (token === "--handoff-file" && index + 1 < argv.length) {
+      options.handoffFile = argv[index + 1];
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--handoff-file=")) {
+      options.handoffFile = token.slice("--handoff-file=".length);
     }
   }
 
@@ -151,6 +163,7 @@ function showHelp() {
     "  --bridge-url <url>      브리지 주소. 기본값 http://127.0.0.1:17832",
     "  --output-root <dir>     실행 산출물 루트. 기본값 <benchmark-dir>/runs",
     "  --max-runtime-ms <n>    이번 실행의 최대 감시 시간. 설정 파일 값을 덮어씀",
+    "  --handoff-file <path>   이번 런 판단 요청에 붙일 handoff.v1 JSON 파일",
     "  --allow-start-in-combat 현재 전투 상태에서 시작해 전투 종료를 감시함",
     "  --dry-run               데몬과 브리지 없이 폴더와 요약만 생성",
     "  --no-daemon             브리지만 감시하고 데몬은 실행하지 않음",
@@ -312,6 +325,31 @@ function makeRunDirectory(config, options) {
   copyJsonFile(config.deciderPath, path.join(runDirectory, "decider_config.json"));
   writeJsonFile(path.join(runDirectory, "seed_config.json"), config.seed);
   return runDirectory;
+}
+
+function getRunDirectoryForIndex(config, options, repeatIndex) {
+  const outputRoot = options.outputRoot
+    ? path.resolve(options.outputRoot)
+    : path.join(config.benchmarkDir, "runs");
+  return path.join(
+    outputRoot,
+    options.seedId,
+    `${options.deciderId}_run_${String(repeatIndex).padStart(3, "0")}`);
+}
+
+function resolveHandoffFile(config, options) {
+  if (typeof options.handoffFile === "string" && options.handoffFile.trim() !== "") {
+    return path.resolve(options.handoffFile);
+  }
+
+  const handoff = isPlainObject(config.scenario.handoff) ? config.scenario.handoff : {};
+  if (handoff.enabled !== true || options.repeatIndex <= 1) {
+    return "";
+  }
+
+  const previousRunDirectory = getRunDirectoryForIndex(config, options, options.repeatIndex - 1);
+  const previousHandoff = path.join(previousRunDirectory, "handoff.json");
+  return fs.existsSync(previousHandoff) ? previousHandoff : "";
 }
 
 function normalizePhase(snapshot) {
@@ -537,6 +575,7 @@ function createInitialSummary(config, options, runDirectory, status, stopReason)
     bridge_url: options.bridgeUrl,
     run_directory: runDirectory,
     allow_start_in_combat: options.allowStartInCombat,
+    handoff_file: options.handoffFile || null,
     scenario: {
       character: config.scenario.character || null,
       ascension: config.scenario.ascension ?? null,
@@ -779,6 +818,57 @@ function summarizeAgentEvents(runDirectory) {
   return summary;
 }
 
+function computeActionProgressMetrics(selectedActionIds) {
+  const result = {
+    furthest_map_row: null,
+    map_choice_count: 0,
+    elite_action_count: 0,
+    rest_choice_count: 0,
+    smith_choice_count: 0,
+    shop_purchase_count: 0,
+    card_reward_pick_count: 0,
+    potion_use_count: 0
+  };
+
+  for (const actionId of selectedActionIds) {
+    const normalized = String(actionId || "").toLowerCase();
+    const rowMatch = normalized.match(/choose_map_r(\d+)_/);
+    if (rowMatch) {
+      result.map_choice_count += 1;
+      const row = Number.parseInt(rowMatch[1], 10);
+      if (Number.isFinite(row)) {
+        result.furthest_map_row = Math.max(result.furthest_map_row ?? 0, row);
+      }
+    }
+
+    if (normalized.includes("elite")) {
+      result.elite_action_count += 1;
+    }
+
+    if (normalized.includes("rest_site_heal")) {
+      result.rest_choice_count += 1;
+    }
+
+    if (normalized.includes("rest_site_smith")) {
+      result.smith_choice_count += 1;
+    }
+
+    if (normalized.startsWith("buy_shop_item")) {
+      result.shop_purchase_count += 1;
+    }
+
+    if (normalized.startsWith("choose_reward") && normalized.includes("card_reward")) {
+      result.card_reward_pick_count += 1;
+    }
+
+    if (normalized.startsWith("use_potion")) {
+      result.potion_use_count += 1;
+    }
+  }
+
+  return result;
+}
+
 function computeBenchmarkMetrics(runDirectory, stopState, metrics) {
   const eventSummary = summarizeAgentEvents(runDirectory);
   const metricObject = isPlainObject(metrics) ? metrics : {};
@@ -805,6 +895,7 @@ function computeBenchmarkMetrics(runDirectory, stopState, metrics) {
     final_phase: stopState.lastPhase || null,
     phase_transition_count: stopState.phaseTrace.length,
     selected_action_count: eventSummary.selected_action_ids.length,
+    progress: computeActionProgressMetrics(eventSummary.selected_action_ids),
     average_decision_ms: readNumber(metricObject.average_decision_ms, null) ?? eventSummary.average_decision_ms,
     max_decision_ms: readNumber(metricObject.max_decision_ms, null) ?? eventSummary.max_decision_ms,
     agent_event_summary: eventSummary
@@ -817,7 +908,7 @@ function buildDaemonArgs(config, options, runDirectory) {
   const args = [
     path.join("scripts", "spiremind_agent_daemon.js"),
     "--bridge-url", options.bridgeUrl,
-    "--decision-backend", decider.decision_backend || "command",
+    "--decision-backend", decider.decision_backend || decider.provider || "command",
     "--run-log-dir", runDirectory,
     "--scenario-id", scenario.benchmark_id || "benchmark",
     "--play-session-id", `${scenario.benchmark_id || "benchmark"}_${options.seedId}_${options.deciderId}_${String(options.repeatIndex).padStart(3, "0")}`,
@@ -833,6 +924,18 @@ function buildDaemonArgs(config, options, runDirectory) {
 
   if (decider.effort) {
     args.push("--effort", String(decider.effort));
+  }
+
+  if (decider.endpoint) {
+    args.push("--endpoint", String(decider.endpoint));
+  }
+
+  if (decider.api_key_env) {
+    args.push("--api-key-env", String(decider.api_key_env));
+  }
+
+  if (options.handoffFile) {
+    args.push("--handoff-file", String(options.handoffFile));
   }
 
   if (decider.codex_command) {
@@ -1009,8 +1112,100 @@ function finalizeSummary(summary, runDirectory, stopState, monitorResult, finalB
   return summary;
 }
 
+function readFinalPlayer(finalState) {
+  const state = isPlainObject(finalState && finalState.state) ? finalState.state : {};
+  return isPlainObject(state.player) ? state.player : {};
+}
+
+function createHandoff(summary) {
+  const computed = isPlainObject(summary.computed_metrics) ? summary.computed_metrics : {};
+  const progress = isPlainObject(computed.progress) ? computed.progress : {};
+  const player = readFinalPlayer(summary.final_state);
+  const finalHp = readNumber(player.hp, null);
+  const finalMaxHp = readNumber(player.max_hp, null);
+  const furthestRow = readNumber(progress.furthest_map_row, null);
+  const eliteCount = readNumber(progress.elite_action_count, 0);
+  const finalPhase = computed.final_phase || summary.stop_reason || "unknown";
+
+  const diagnosis = [];
+  if (summary.stop_reason === "game_over" || finalPhase === "game_over") {
+    diagnosis.push({
+      type: "survival",
+      evidence: `이번 런은 ${furthestRow === null ? "알 수 없는 지점" : `r${furthestRow}`} 근처에서 game_over로 끝났다.`,
+      confidence: "high"
+    });
+  }
+
+  if (eliteCount === 0 && furthestRow !== null && furthestRow >= 10) {
+    diagnosis.push({
+      type: "growth",
+      evidence: "로그에서 elite가 포함된 지도 선택이 확인되지 않았다. 후반 성장 부족 가능성을 다음 런에서 검증해야 한다.",
+      confidence: "medium"
+    });
+  }
+
+  if (readNumber(computed.stale_state_count, 0) > 0) {
+    diagnosis.push({
+      type: "execution_stability",
+      evidence: `stale_state가 ${computed.stale_state_count}회 발생했다. 전략 실패와 실행 지연을 분리해서 해석해야 한다.`,
+      confidence: "medium"
+    });
+  }
+
+  const nextRunRules = [
+    {
+      condition: "체력 35 이하이고 휴식 지점에 도착했다.",
+      action: "강화보다 회복을 우선한다.",
+      reason: "낮은 체력으로 후반 전투에 들어가면 장기전에서 사망 위험이 커진다.",
+      priority: 1
+    },
+    {
+      condition: "1막 초반 체력 55 이상이고 포션 또는 공격 카드 보강이 있다.",
+      action: "엘리트 경로를 적극적으로 고려한다.",
+      reason: "유물은 장기 승리 확률을 높이는 핵심 성장 자원이다.",
+      priority: 2
+    },
+    {
+      condition: "단일 대형 적과 싸우고 현재 체력이 30 이하이다.",
+      action: "공격 기대값보다 이번 턴 생존 가능성을 먼저 계산한다.",
+      reason: "후반 단일 적 전투에서는 한 번의 턴 종료가 사망으로 이어질 수 있다.",
+      priority: 3
+    }
+  ];
+
+  return {
+    schema_version: "handoff.v1",
+    generated_at: nowIsoString(),
+    source_run_directory: summary.run_directory,
+    run_summary: {
+      benchmark_id: summary.benchmark_id,
+      seed_id: summary.seed_id,
+      repeat_index: summary.repeat_index,
+      final_phase: finalPhase,
+      stop_reason: summary.stop_reason,
+      final_hp: finalHp,
+      final_max_hp: finalMaxHp,
+      furthest_map_row: furthestRow,
+      elite_count_observed: eliteCount,
+      relic_count: Array.isArray(summary.final_state?.state?.relics) ? summary.final_state.state.relics.length : null,
+      decision_count: computed.decision_count ?? null,
+      invalid_action_count: computed.invalid_action_count ?? null,
+      stale_state_count: computed.stale_state_count ?? null,
+      timeout_count: computed.timeout_count ?? null
+    },
+    diagnosis,
+    next_run_rules: nextRunRules,
+    experiment: {
+      hypothesis: "초반에 조건부로 엘리트 1회 이상을 선택하면 유물 성장으로 후반 전투 안정성이 올라간다.",
+      success_signal: "이전 런보다 더 높은 지도 행에 도달하거나, 같은 지점에서 더 높은 체력을 유지한다."
+    },
+    free_note: "자동 생성 handoff입니다. 사실 지표는 로그 기반이고, 진단은 다음 런의 실험 가설로 사용합니다."
+  };
+}
+
 async function runBenchmark(options) {
   const config = loadBenchmarkConfig(options);
+  options.handoffFile = resolveHandoffFile(config, options);
   const runDirectory = makeRunDirectory(config, options);
   const stopState = createStopState({
     ...options,
@@ -1074,6 +1269,15 @@ async function runBenchmark(options) {
   if (monitorResult.error) {
     finalSummary.error = monitorResult.error;
   }
+
+  const handoff = createHandoff(finalSummary);
+  writeJsonFile(path.join(runDirectory, "handoff.json"), handoff);
+  finalSummary.handoff = {
+    schema_version: handoff.schema_version,
+    path: path.join(runDirectory, "handoff.json"),
+    next_run_rule_count: handoff.next_run_rules.length,
+    diagnosis_count: handoff.diagnosis.length
+  };
 
   writeJsonFile(summaryPath, finalSummary);
   return finalSummary;
@@ -1228,6 +1432,38 @@ function runSelfTest() {
     updateStopStateFromAgentEvents(eventStopState, tempDirectory);
     if (eventStopState.stopReason !== "first_combat_finished") {
       throw new Error(`agent_events 종료 조건 판정 실패: ${JSON.stringify(eventStopState)}`);
+    }
+    const handoff = createHandoff({
+      run_directory: tempDirectory,
+      benchmark_id: "B3_HANDOFF_CHAIN",
+      seed_id: "seed_0001",
+      repeat_index: 1,
+      stop_reason: "game_over",
+      final_state: {
+        state: {
+          hp: 22,
+          max_hp: 80,
+          relics: [{ id: "Burning Blood" }]
+        }
+      },
+      computed_metrics: {
+        final_phase: "game_over",
+        decision_count: 12,
+        invalid_action_count: 0,
+        stale_state_count: 1,
+        timeout_count: 0,
+        progress: {
+          furthest_map_row: 11,
+          elite_action_count: 0
+        }
+      }
+    });
+    if (handoff.schema_version !== "handoff.v1"
+      || handoff.run_summary.furthest_map_row !== 11
+      || handoff.run_summary.elite_count_observed !== 0
+      || handoff.diagnosis.length < 2
+      || handoff.next_run_rules.length < 3) {
+      throw new Error(`handoff.v1 generation self-test failed: ${JSON.stringify(handoff)}`);
     }
   } finally {
     fs.rmSync(tempDirectory, { recursive: true, force: true });

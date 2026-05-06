@@ -1,6 +1,7 @@
 param(
     [string]$ProjectPath = "src/SpireMindMod/SpireMindMod.csproj",
     [string]$Configuration = "Release",
+    [string]$SetupConfigPath = "",
     [string]$ModsDir = "",
     [switch]$AlsoDeployAppData,
     [string]$PckPath = ""
@@ -12,6 +13,57 @@ $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $resolvedProjectPath = Resolve-Path (Join-Path $repoRoot $ProjectPath)
 $projectDir = Split-Path $resolvedProjectPath -Parent
 
+function Resolve-SetupConfigPath {
+    param(
+        [string]$RepoRootPath,
+        [string]$ExplicitPath
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
+        if ([System.IO.Path]::IsPathRooted($ExplicitPath)) {
+            return $ExplicitPath
+        }
+
+        return (Join-Path $RepoRootPath $ExplicitPath)
+    }
+
+    return (Join-Path $RepoRootPath "config\local_setup.local.json")
+}
+
+function Get-JsonValue {
+    param(
+        [object]$Object,
+        [string[]]$Names
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+
+    foreach ($name in $Names) {
+        $property = $Object.PSObject.Properties[$name]
+        if ($null -ne $property) {
+            return $property.Value
+        }
+    }
+
+    return $null
+}
+
+if ([string]::IsNullOrWhiteSpace($ModsDir)) {
+    $resolvedSetupConfigPath = Resolve-SetupConfigPath -RepoRootPath $repoRoot.Path -ExplicitPath $SetupConfigPath
+    if (Test-Path $resolvedSetupConfigPath) {
+        try {
+            $setupConfig = Get-Content -Raw $resolvedSetupConfigPath | ConvertFrom-Json
+            $sts2Config = Get-JsonValue $setupConfig @("sts2")
+            $ModsDir = [string](Get-JsonValue $sts2Config @("mods_dir", "modsDir"))
+        }
+        catch {
+            throw "Local setup config is not valid JSON: $resolvedSetupConfigPath"
+        }
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($ModsDir)) {
     $localPropsPath = Join-Path $projectDir "SpireMind.Local.props"
     if (Test-Path $localPropsPath) {
@@ -21,7 +73,7 @@ if ([string]::IsNullOrWhiteSpace($ModsDir)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($ModsDir)) {
-    throw "ModsDir is required. Pass -ModsDir or set Sts2ModsDir in SpireMind.Local.props."
+    throw "ModsDir is required. Run node .\scripts\spiremind_setup.js, pass -ModsDir, or set Sts2ModsDir in SpireMind.Local.props."
 }
 
 dotnet build $resolvedProjectPath -c $Configuration
