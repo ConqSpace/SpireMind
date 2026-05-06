@@ -21,15 +21,15 @@
 - 브리지 실행 기록: `%APPDATA%\SlayTheSpire2\SpireMind\bridge_runs`
 - Godot 로그: `%APPDATA%\SlayTheSpire2\logs\godot.log`
 
-## 2. 권장 실행 방법
+## 2. 필수 실행 방법
 
-가장 안전한 실행 방법은 Steam URI를 사용하는 것이다.
+SpireMind 자동 테스트에서 게임은 반드시 Steam URI로 실행해야 한다.
 
 ```powershell
 Start-Process "steam://rungameid/2868840"
 ```
 
-이 방법은 Steam이 게임 소유권, 런타임, 오버레이 상태를 정상적으로 준비한 뒤 게임을 실행한다. 자동 실행 중 “Steam에서 실행하라”는 오류가 뜨면 직접 exe 실행보다 이 방식을 우선 사용한다.
+이 방법은 Steam이 게임 소유권, 런타임, 오버레이 상태를 정상적으로 준비한 뒤 게임을 실행한다. `SlayTheSpire2.exe`를 직접 실행하면 STS2 클라이언트가 실행을 막을 수 있으므로 자동 테스트에서는 사용하지 않는다.
 
 ## 3. Steam 클라이언트에서 수동 실행
 
@@ -93,7 +93,7 @@ Start-Process `
   -WorkingDirectory "I:\SteamLibrary\steamapps\common\Slay the Spire 2"
 ```
 
-다만 직접 실행은 Steam 초기화가 제대로 되지 않아 오류가 날 수 있다. 테스트 자동화에서는 Steam URI 실행을 우선한다.
+다만 직접 실행은 Steam 초기화가 제대로 되지 않아 STS2 클라이언트에서 실행이 막힐 수 있다. 테스트 자동화에서는 직접 exe 실행을 사용하지 않고 Steam URI 실행만 사용한다.
 
 렌더러를 명시해야 할 때는 게임 폴더의 bat 파일을 사용할 수 있다.
 
@@ -109,7 +109,7 @@ Start-Process `
 - `launch_opengl.bat`: `--rendering-driver opengl3`
 - `launch_vulkan.bat`: `--rendering-driver vulkan`
 
-## 6. 실행 전 권장 순서
+## 6. 실행 전 필수 순서
 
 코드를 수정한 뒤 실제 게임에서 확인할 때는 아래 순서를 따른다.
 
@@ -117,7 +117,7 @@ Start-Process `
 2. 모드를 빌드한다.
 3. 모드 DLL을 배포한다.
 4. 브리지 서버를 켠다.
-5. Steam URI로 게임을 실행한다.
+5. Steam URI로 게임을 실행한다. 직접 exe 실행은 사용하지 않는다.
 6. 메인 메뉴에서 모드 초기화 오류를 확인한다.
 7. 테스트할 화면으로 이동한다.
 8. `combat_state.json`과 브리지 상태를 확인한다.
@@ -216,7 +216,7 @@ Get-Content $logPath -Tail 120 -Encoding UTF8 | Select-String "SpireMind"
 
 ### Steam에서 실행하라는 오류가 뜬다
 
-직접 exe 실행을 중단하고 Steam URI를 사용한다.
+직접 exe 실행을 중단하고 Steam URI를 사용한다. STS2 클라이언트는 exe 직접 실행을 차단할 수 있다.
 
 ```powershell
 Start-Process "steam://rungameid/2868840"

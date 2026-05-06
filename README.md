@@ -50,6 +50,12 @@ dotnet build .\src\SpireMindMod\SpireMindMod.csproj
 
 ### 4. 런타임 점검
 
+게임은 반드시 Steam URI로 실행해야 합니다. `SlayTheSpire2.exe`를 직접 실행하면 STS2 클라이언트가 실행을 막을 수 있습니다.
+
+```powershell
+Start-Process "steam://rungameid/2868840"
+```
+
 게임과 브리지를 띄운 뒤 상태 export와 브리지 연결을 확인합니다.
 
 ```powershell
