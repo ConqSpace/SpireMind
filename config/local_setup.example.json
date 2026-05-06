@@ -1,0 +1,18 @@
+{
+  "schema_version": "spiremind.local_setup.v1",
+  "sts2": {
+    "install_path": "D:\\SteamLibrary\\steamapps\\common\\Slay the Spire 2",
+    "exe_path": "D:\\SteamLibrary\\steamapps\\common\\Slay the Spire 2\\SlayTheSpire2.exe",
+    "mods_dir": "D:\\SteamLibrary\\steamapps\\common\\Slay the Spire 2\\mods",
+    "launch_mode": "Steam",
+    "pck_path": ""
+  },
+  "bridge": {
+    "host": "127.0.0.1",
+    "port": 17832
+  },
+  "defaults": {
+    "seed": "7MJCUHEB5Q",
+    "character_id": "Ironclad"
+  }
+}

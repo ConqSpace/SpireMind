@@ -8,10 +8,10 @@ godot.log and combat_state.json while the user manually enters combat, plays
 one card, and ends the turn. It never clicks, moves the mouse, or sends keys.
 
 .EXAMPLE
-.\scripts\runtime_smoke_check.ps1 -Build -Deploy -LaunchGame -ModsDir "I:\SteamLibrary\steamapps\common\Slay the Spire 2\mods"
+.\scripts\runtime_smoke_check.ps1 -Build -Deploy -LaunchGame
 
 .EXAMPLE
-.\scripts\runtime_smoke_check.ps1 -LaunchGame -LaunchMode Exe -Sts2ExePath "I:\SteamLibrary\steamapps\common\Slay the Spire 2\SlayTheSpire2.exe"
+.\scripts\runtime_smoke_check.ps1 -LaunchGame -LaunchMode Exe -Sts2ExePath "D:\SteamLibrary\steamapps\common\Slay the Spire 2\SlayTheSpire2.exe"
 
 .EXAMPLE
 .\scripts\runtime_smoke_check.ps1 -CheckSeconds 90 -PollSeconds 5
@@ -20,7 +20,7 @@ one card, and ends the turn. It never clicks, moves the mouse, or sends keys.
 .\scripts\runtime_smoke_check.ps1 -Build -Deploy -LaunchGame -WhatIf
 
 .EXAMPLE
-.\scripts\runtime_smoke_check.ps1 -Build -Deploy -StartBridge -LaunchGame -StartSeededRun -Seed "7MJCUHEB5Q" -ModsDir "I:\SteamLibrary\steamapps\common\Slay the Spire 2\mods"
+.\scripts\runtime_smoke_check.ps1 -Build -Deploy -StartBridge -LaunchGame -StartSeededRun -Seed "7MJCUHEB5Q"
 
 .EXAMPLE
 .\scripts\runtime_smoke_check.ps1 -StartBridge -StartSeededRun -ForceAbandonRun -Seed "7MJCUHEB5Q"
@@ -33,7 +33,8 @@ param(
     [switch]$LaunchGame,
     [ValidateSet("Steam", "Exe")]
     [string]$LaunchMode = "Steam",
-    [string]$Sts2Path = "I:\SteamLibrary\steamapps\common\Slay the Spire 2",
+    [string]$SetupConfigPath = "",
+    [string]$Sts2Path = "",
     [string]$Sts2ExePath = "",
     [string]$ModsDir = "",
     [string]$PckPath = "",
@@ -64,6 +65,8 @@ function Show-SmokeHelp {
     Write-Host "  -LaunchMode  Steam or Exe. Default: Steam"
     Write-Host "               Steam uses steam://rungameid/2868840"
     Write-Host "               Exe starts the executable from -Sts2ExePath or -Sts2Path"
+    Write-Host "  -SetupConfigPath <path>"
+    Write-Host "               Local setup JSON. Default: config/local_setup.local.json"
     Write-Host "  -StartBridge Start the local SpireMind bridge if it is not already healthy"
     Write-Host "  -StartSeededRun"
     Write-Host "               Write a start_new_run command for a custom seeded run"
@@ -74,15 +77,65 @@ function Show-SmokeHelp {
     Write-Host "  -WhatIf      Show build/deploy/launch actions without running them"
     Write-Host ""
     Write-Host "Examples:"
-    Write-Host '  .\scripts\runtime_smoke_check.ps1 -Build -Deploy -LaunchGame -ModsDir "I:\SteamLibrary\steamapps\common\Slay the Spire 2\mods"'
-    Write-Host '  .\scripts\runtime_smoke_check.ps1 -LaunchGame -LaunchMode Exe -Sts2ExePath "I:\SteamLibrary\steamapps\common\Slay the Spire 2\SlayTheSpire2.exe"'
-    Write-Host '  .\scripts\runtime_smoke_check.ps1 -Build -Deploy -StartBridge -LaunchGame -StartSeededRun -Seed "7MJCUHEB5Q" -ModsDir "I:\SteamLibrary\steamapps\common\Slay the Spire 2\mods"'
+    Write-Host '  node .\scripts\spiremind_setup.js'
+    Write-Host '  .\scripts\runtime_smoke_check.ps1 -Build -Deploy -LaunchGame'
+    Write-Host '  .\scripts\runtime_smoke_check.ps1 -LaunchGame -LaunchMode Exe -Sts2ExePath "D:\SteamLibrary\steamapps\common\Slay the Spire 2\SlayTheSpire2.exe"'
+    Write-Host '  .\scripts\runtime_smoke_check.ps1 -Build -Deploy -StartBridge -LaunchGame -StartSeededRun -Seed "7MJCUHEB5Q"'
     Write-Host '  .\scripts\runtime_smoke_check.ps1 -StartBridge -StartSeededRun -ForceAbandonRun -Seed "7MJCUHEB5Q"'
     Write-Host '  .\scripts\runtime_smoke_check.ps1 -CheckSeconds 90 -PollSeconds 5'
 }
 
 function Resolve-RepoRoot {
     return (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+}
+
+function Resolve-SetupConfigPath {
+    param(
+        [string]$RepoRoot,
+        [string]$ExplicitPath
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
+        if ([System.IO.Path]::IsPathRooted($ExplicitPath)) {
+            return $ExplicitPath
+        }
+
+        return (Join-Path $RepoRoot $ExplicitPath)
+    }
+
+    return (Join-Path $RepoRoot "config\local_setup.local.json")
+}
+
+function Read-SetupConfig {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path $Path)) {
+        return $null
+    }
+
+    try {
+        return (Get-Content -Raw $Path | ConvertFrom-Json)
+    }
+    catch {
+        throw "Local setup config is not valid JSON: $Path"
+    }
+}
+
+function Use-ConfigValue {
+    param(
+        [string]$CurrentValue,
+        [object]$ConfigValue
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($CurrentValue)) {
+        return $CurrentValue
+    }
+
+    if ($null -eq $ConfigValue) {
+        return ""
+    }
+
+    return [string]$ConfigValue
 }
 
 function Resolve-Sts2Exe {
@@ -108,7 +161,7 @@ function Resolve-Sts2Exe {
         }
     }
 
-    throw "STS2 executable was not found. Pass -Sts2ExePath with the exact path."
+    throw "STS2 executable was not found. Run node .\scripts\spiremind_setup.js or pass -Sts2ExePath with the exact path."
 }
 
 function Get-JsonValue {
@@ -469,6 +522,64 @@ if ($CheckSeconds -lt 1) {
 }
 
 $repoRoot = Resolve-RepoRoot
+$resolvedSetupConfigPath = Resolve-SetupConfigPath -RepoRoot $repoRoot -ExplicitPath $SetupConfigPath
+$setupConfig = Read-SetupConfig -Path $resolvedSetupConfigPath
+if ($null -ne $setupConfig) {
+    $sts2Config = Get-JsonValue $setupConfig @("sts2")
+    $bridgeConfig = Get-JsonValue $setupConfig @("bridge")
+    $defaultsConfig = Get-JsonValue $setupConfig @("defaults")
+
+    if (-not $PSBoundParameters.ContainsKey("LaunchMode")) {
+        $configuredLaunchMode = Get-JsonValue $sts2Config @("launch_mode", "launchMode")
+        if ($configuredLaunchMode -in @("Steam", "Exe")) {
+            $LaunchMode = [string]$configuredLaunchMode
+        }
+    }
+
+    if (-not $PSBoundParameters.ContainsKey("Sts2Path")) {
+        $Sts2Path = Use-ConfigValue $Sts2Path (Get-JsonValue $sts2Config @("install_path", "installPath", "path"))
+    }
+
+    if (-not $PSBoundParameters.ContainsKey("Sts2ExePath")) {
+        $Sts2ExePath = Use-ConfigValue $Sts2ExePath (Get-JsonValue $sts2Config @("exe_path", "exePath"))
+    }
+
+    if (-not $PSBoundParameters.ContainsKey("ModsDir")) {
+        $ModsDir = Use-ConfigValue $ModsDir (Get-JsonValue $sts2Config @("mods_dir", "modsDir"))
+    }
+
+    if (-not $PSBoundParameters.ContainsKey("PckPath")) {
+        $PckPath = Use-ConfigValue $PckPath (Get-JsonValue $sts2Config @("pck_path", "pckPath"))
+    }
+
+    if (-not $PSBoundParameters.ContainsKey("BridgeHost")) {
+        $configuredBridgeHost = Get-JsonValue $bridgeConfig @("host")
+        if (-not [string]::IsNullOrWhiteSpace([string]$configuredBridgeHost)) {
+            $BridgeHost = [string]$configuredBridgeHost
+        }
+    }
+
+    if (-not $PSBoundParameters.ContainsKey("BridgePort")) {
+        $configuredBridgePort = Get-JsonValue $bridgeConfig @("port")
+        if ($null -ne $configuredBridgePort) {
+            $BridgePort = [int]$configuredBridgePort
+        }
+    }
+
+    if (-not $PSBoundParameters.ContainsKey("Seed")) {
+        $configuredSeed = Get-JsonValue $defaultsConfig @("seed")
+        if (-not [string]::IsNullOrWhiteSpace([string]$configuredSeed)) {
+            $Seed = [string]$configuredSeed
+        }
+    }
+
+    if (-not $PSBoundParameters.ContainsKey("CharacterId")) {
+        $configuredCharacterId = Get-JsonValue $defaultsConfig @("character_id", "characterId")
+        if (-not [string]::IsNullOrWhiteSpace([string]$configuredCharacterId)) {
+            $CharacterId = [string]$configuredCharacterId
+        }
+    }
+}
 $buildScriptPath = Join-Path $repoRoot "scripts\build_mod.ps1"
 $deployScriptPath = Join-Path $repoRoot "scripts\deploy_mod.ps1"
 $godotLogPath = Join-Path $env:APPDATA "SlayTheSpire2\logs\godot.log"
@@ -477,7 +588,10 @@ $steamLaunchUri = "steam://rungameid/2868840"
 $bridgeUrl = "http://${BridgeHost}:$BridgePort"
 
 Write-Host "[SpireMind] Starting R2 runtime semi-manual smoke check."
-Write-Host "[SpireMind] Default STS2 path candidate: $Sts2Path"
+Write-Host "[SpireMind] Local setup config: $resolvedSetupConfigPath"
+Write-Host "[SpireMind] STS2 path candidate: $Sts2Path"
+Write-Host "[SpireMind] STS2 exe candidate: $Sts2ExePath"
+Write-Host "[SpireMind] Mods dir candidate: $ModsDir"
 Write-Host "[SpireMind] Launch mode: $LaunchMode"
 Write-Host "[SpireMind] Bridge URL: $bridgeUrl"
 Write-Host "[SpireMind] Watching godot.log: $godotLogPath"
@@ -496,6 +610,7 @@ if ($Build) {
 if ($Deploy) {
     $deployArgs = @{
         Configuration = $Configuration
+        SetupConfigPath = $resolvedSetupConfigPath
     }
 
     if (-not [string]::IsNullOrWhiteSpace($ModsDir)) {

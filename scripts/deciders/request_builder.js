@@ -1,7 +1,21 @@
 "use strict";
 
+const fs = require("fs");
+
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readOptionalJson(filePath) {
+  if (typeof filePath !== "string" || filePath.trim() === "" || !fs.existsSync(filePath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, ""));
+  } catch {
+    return null;
+  }
 }
 
 function buildDecisionRequest(options, snapshot) {
@@ -22,6 +36,7 @@ function buildDecisionRequest(options, snapshot) {
       "game_over나 run_finished 같은 종료 화면은 실행 옵션에서 허용된 경우에만 legal_actions로 전달됩니다.",
       "설명 없이 JSON 객체만 출력하세요."
     ],
+    handoff: readOptionalJson(options.handoffFile),
     state_version: snapshot.state_version,
     state_id: snapshot.state_id || null,
     state: snapshot.state
@@ -66,5 +81,6 @@ function compactStateForDecision(state) {
 
 module.exports = {
   buildDecisionRequest,
-  buildAppServerDecisionRequest
+  buildAppServerDecisionRequest,
+  readOptionalJson
 };

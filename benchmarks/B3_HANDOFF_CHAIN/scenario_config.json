@@ -1,0 +1,22 @@
+{
+  "benchmark_id": "B3_HANDOFF_CHAIN",
+  "description": "같은 시드에서 handoff.v1을 다음 런 입력으로 넘겨 실패가 전략 규칙으로 바뀌는지 확인합니다.",
+  "character": "Ironclad",
+  "ascension": 0,
+  "seed_id": "seed_0001",
+  "stop_rule": "terminal_or_max_decisions",
+  "max_decisions": 220,
+  "timeout_ms": 300000,
+  "result_timeout_ms": 60000,
+  "poll_ms": 500,
+  "max_runtime_ms": 3600000,
+  "shutdown_grace_ms": 2500,
+  "auto_trivial": false,
+  "dismiss_terminal": false,
+  "human_intervention": "setup_only",
+  "handoff": {
+    "enabled": true,
+    "schema": "handoff.v1",
+    "source": "previous_run"
+  }
+}

@@ -22,6 +22,9 @@ function parseArgs(argv) {
     codexCommand: process.env.SPIREMIND_CODEX_COMMAND || (process.platform === "win32" ? "codex.cmd" : "codex"),
     model: process.env.SPIREMIND_CODEX_MODEL || DEFAULT_CODEX_MODEL,
     effort: process.env.SPIREMIND_CODEX_EFFORT || "low",
+    endpoint: process.env.SPIREMIND_DECIDER_ENDPOINT || "",
+    apiKeyEnv: process.env.SPIREMIND_DECIDER_API_KEY_ENV || "",
+    handoffFile: process.env.SPIREMIND_HANDOFF_FILE || "",
     runLogDir: process.env.SPIREMIND_RUN_LOG_DIR || "",
     playSessionId: process.env.SPIREMIND_PLAY_SESSION_ID || "",
     scenarioId: process.env.SPIREMIND_SCENARIO_ID || "agent_daemon",
@@ -81,6 +84,24 @@ function parseArgs(argv) {
 
     if (token === "--effort" && index + 1 < argv.length) {
       options.effort = argv[index + 1];
+      index += 1;
+      continue;
+    }
+
+    if (token === "--endpoint" && index + 1 < argv.length) {
+      options.endpoint = argv[index + 1];
+      index += 1;
+      continue;
+    }
+
+    if (token === "--api-key-env" && index + 1 < argv.length) {
+      options.apiKeyEnv = argv[index + 1];
+      index += 1;
+      continue;
+    }
+
+    if (token === "--handoff-file" && index + 1 < argv.length) {
+      options.handoffFile = argv[index + 1];
       index += 1;
       continue;
     }
@@ -187,6 +208,9 @@ function showHelp() {
     "  --codex-command <program>   app-server 백엔드에서 사용할 Codex CLI. 기본값 codex.cmd",
     "  --model <model>             app-server 백엔드 모델. 기본값 gpt-5.4-mini",
     "  --effort <effort>           app-server 백엔드 추론 강도. 기본값 low",
+    "  --endpoint <url>            local-http 백엔드의 OpenAI 호환 chat/completions 주소",
+    "  --api-key-env <name>        local-http Authorization 토큰을 읽을 환경 변수 이름",
+    "  --handoff-file <path>       이전 런에서 생성한 handoff.v1 JSON 파일",
     "  --run-log-dir <dir>         agent_config.json, agent_events.jsonl, metrics.json 기록 위치",
     "  --max-decisions <n>         최대 판단 수. 기본값 20",
     "  --run-count <n>             종료 리포트 후 다음 런을 이어 실행할 횟수. 기본값 1",
@@ -596,6 +620,9 @@ function writeRunConfig(runLogDir, options) {
     codex_command: options.codexCommand,
     model: options.model,
     effort: options.effort,
+    endpoint: options.endpoint,
+    api_key_env: options.apiKeyEnv,
+    handoff_file: options.handoffFile,
     scenario_id: options.scenarioId,
     play_session_id: options.playSessionId,
     max_decisions: options.maxDecisions,

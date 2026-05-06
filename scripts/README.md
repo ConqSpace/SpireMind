@@ -2,6 +2,16 @@
 
 이 폴더에는 SpireMind의 빌드, 배포, 런타임 검증 스크립트가 들어 있다.
 
+## 초기 세팅
+
+새 PC에서는 먼저 로컬 게임 위치를 저장한다.
+
+```powershell
+node .\scripts\spiremind_setup.js
+```
+
+결과는 `config/local_setup.local.json`에 저장된다. 이 파일은 개인 경로를 담기 때문에 Git에 올리지 않는다.
+
 ## 빌드
 
 ```powershell
@@ -121,3 +131,12 @@ node .\scripts\run_benchmark.js `
 node .\scripts\run_benchmark.js --benchmark-dir .\benchmarks\B0_NEOW_FIRST_COMBAT --dry-run
 node .\scripts\run_benchmark.js --self-test
 ```
+
+`B3_HANDOFF_CHAIN`은 `repeat-index`가 2 이상일 때 직전 실행의 `handoff.json`을 자동으로 다음 판단 요청에 붙인다.
+
+```powershell
+node .\scripts\run_benchmark.js --benchmark-dir .\benchmarks\B3_HANDOFF_CHAIN --decider llm_current --repeat-index 1
+node .\scripts\run_benchmark.js --benchmark-dir .\benchmarks\B3_HANDOFF_CHAIN --decider llm_current --repeat-index 2
+```
+
+다른 LLM API는 `scripts/deciders` 아래 backend로 추가한다. 현재는 외부 명령형 `command`, Codex `app-server`, OpenAI 호환 `local-http` backend가 있다.
