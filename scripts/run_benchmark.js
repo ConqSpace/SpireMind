@@ -588,6 +588,15 @@ function updateStopState(stopState, snapshot) {
     stopState.mapSeenAfterNeow = true;
   }
 
+  if (stopState.stopRule === "first_combat_finished"
+    && !stopState.neowSeen
+    && !stopState.mapSeenAfterNeow
+    && isMapPhase(phase)) {
+    // B0 실행기는 새 런 준비를 끝낸 뒤 지도 화면에서 시작할 수 있다.
+    // 이 경우 지도 화면을 니오우 이후 첫 지도 상태로 보고 첫 전투를 추적한다.
+    stopState.mapSeenAfterNeow = true;
+  }
+
   if ((stopState.neowSeen || stopState.mapSeenAfterNeow) && isCombatPhase(phase)) {
     stopState.firstCombatSeen = true;
   }
@@ -1537,7 +1546,7 @@ function runSelfTest() {
     }
     const handoff = createHandoff({
       run_directory: tempDirectory,
-      benchmark_id: "B3_HANDOFF_CHAIN",
+      benchmark_id: "B2_HANDOFF_N_RUNS",
       seed_id: "seed_0001",
       repeat_index: 1,
       stop_reason: "game_over",

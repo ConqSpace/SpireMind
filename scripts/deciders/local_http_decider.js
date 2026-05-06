@@ -2,7 +2,7 @@
 
 const http = require("http");
 const https = require("https");
-const { buildDecisionRequest } = require("./request_builder");
+const { buildLocalHttpDecisionRequest } = require("./request_builder");
 
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -112,7 +112,7 @@ class LocalHttpDecider {
       throw new Error("local-http decider에는 endpoint가 필요합니다.");
     }
 
-    const prompt = JSON.stringify(buildDecisionRequest(this.options, snapshot), null, 2);
+    const prompt = JSON.stringify(buildLocalHttpDecisionRequest(this.options, snapshot), null, 2);
     const headers = {};
     const apiKeyEnv = this.options.apiKeyEnv || this.options.providerApiKeyEnv;
     if (apiKeyEnv && process.env[apiKeyEnv]) {

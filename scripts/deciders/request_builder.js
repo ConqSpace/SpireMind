@@ -47,14 +47,23 @@ function buildAppServerDecisionRequest(options, snapshot) {
   const baseRequest = buildDecisionRequest(options, snapshot);
   return {
     ...baseRequest,
-    state: compactStateForDecision(snapshot.state)
+    state: compactStateForDecision(snapshot.state, options)
   };
 }
 
-function compactStateForDecision(state) {
+function buildLocalHttpDecisionRequest(options, snapshot) {
+  const baseRequest = buildDecisionRequest(options, snapshot);
+  return {
+    ...baseRequest,
+    state: compactStateForDecision(snapshot.state, options)
+  };
+}
+
+function compactStateForDecision(state, options = {}) {
   const source = isPlainObject(state) ? state : {};
   const piles = isPlainObject(source.piles) ? source.piles : {};
   const map = isPlainObject(source.map) ? source.map : {};
+  const compactMap = compactMapForDecision(map, source, options);
   return {
     phase: typeof source.phase === "string" ? source.phase : null,
     state_id: typeof source.state_id === "string" ? source.state_id : null,
@@ -70,17 +79,75 @@ function compactStateForDecision(state) {
     shop: isPlainObject(source.shop) ? source.shop : null,
     card_selection: isPlainObject(source.card_selection) ? source.card_selection : null,
     event: isPlainObject(source.event) ? source.event : null,
-    map: {
-      current: isPlainObject(map.current) ? map.current : null,
-      available_next_nodes: Array.isArray(map.available_next_nodes) ? map.available_next_nodes : [],
-      path_options_summary: isPlainObject(map.path_options_summary) ? map.path_options_summary : null
-    },
-    legal_actions: Array.isArray(source.legal_actions) ? source.legal_actions : []
+    map: compactMap,
+    legal_actions: compactLegalActionsForDecision(source, compactMap, options)
   };
+}
+
+function compactMapForDecision(map, source, options) {
+  const phase = typeof source.phase === "string" ? source.phase : "";
+  const availableNextNodes = Array.isArray(map.available_next_nodes) ? map.available_next_nodes : [];
+  const pathOptionsSummary = isPlainObject(map.path_options_summary) ? map.path_options_summary : null;
+
+  if (phase === "map" && shouldUseSingleMapNode(options)) {
+    const firstNode = availableNextNodes.find(isPlainObject) || null;
+    return {
+      current: isPlainObject(map.current) ? map.current : null,
+      available_next_nodes: firstNode ? [firstNode] : [],
+      path_options_summary: summarizeSingleMapNode(pathOptionsSummary, firstNode),
+      note: "B0 테스트는 첫 전투 진입만 검증하므로 지도 후보를 하나로 제한합니다."
+    };
+  }
+
+  return {
+    current: isPlainObject(map.current) ? map.current : null,
+    available_next_nodes: availableNextNodes,
+    path_options_summary: pathOptionsSummary
+  };
+}
+
+function compactLegalActionsForDecision(source, compactMap, options) {
+  const legalActions = Array.isArray(source.legal_actions) ? source.legal_actions.filter(isPlainObject) : [];
+  const phase = typeof source.phase === "string" ? source.phase : "";
+  if (phase !== "map" || !shouldUseSingleMapNode(options)) {
+    return legalActions;
+  }
+
+  const firstNode = Array.isArray(compactMap.available_next_nodes) && isPlainObject(compactMap.available_next_nodes[0])
+    ? compactMap.available_next_nodes[0]
+    : null;
+  const nodeId = firstNode && typeof firstNode.node_id === "string" ? firstNode.node_id : "";
+  const matchingAction = legalActions.find((action) => action.node_id === nodeId)
+    || legalActions.find((action) => typeof action.action_id === "string" && action.action_id.startsWith("choose_map_"))
+    || null;
+
+  return matchingAction ? [matchingAction] : legalActions;
+}
+
+function summarizeSingleMapNode(pathOptionsSummary, firstNode) {
+  if (!isPlainObject(pathOptionsSummary)) {
+    return null;
+  }
+
+  const options = Array.isArray(pathOptionsSummary.options) ? pathOptionsSummary.options : [];
+  const nodeId = firstNode && typeof firstNode.node_id === "string" ? firstNode.node_id : "";
+  const firstOption = options.find((option) => isPlainObject(option) && option.start_node_id === nodeId)
+    || options.find(isPlainObject)
+    || null;
+
+  return {
+    options: firstOption ? [firstOption] : [],
+    note: "B0 최적화에서는 첫 전투 진입에 필요한 시작 노드 요약만 사용하므로 지도 전체 그래프를 제외합니다."
+  };
+}
+
+function shouldUseSingleMapNode(options) {
+  return options && options.scenarioId === "B0_NEOW_FIRST_COMBAT";
 }
 
 module.exports = {
   buildDecisionRequest,
   buildAppServerDecisionRequest,
+  buildLocalHttpDecisionRequest,
   readOptionalJson
 };
